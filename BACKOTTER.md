@@ -58,12 +58,14 @@ that either program restores what the other backed up.
     written (a transaction group), as it does for BackOtter's restic, which
     probes the same files.
   A file only gets an attribute when it has something the mode doesn't say
-  (flags, a project ID, a non-trivial ACL, holes, typed attributes). A
-  generic attribute rustic doesn't know at all gets a warning, once; one of
-  another system is skipped quietly. A known attribute with a value that can't be read
-  (`linux.inode_flags`, `linux.project_id`, `unix.sparse`, `*.file_flags`)
-  is skipped with a warning once per attribute name, as in BackOtter's
-  restic; it isn't an error. A project ID of 0 is left as the file has it.
+  (flags, a project ID, a non-trivial ACL, holes), except
+  `haiku.attributes`, which says that a file has no typed attributes too
+  (below). A generic attribute rustic doesn't know at all gets a warning,
+  once; one of another system is skipped quietly. A known attribute with a
+  value that can't be read (`linux.inode_flags`, `linux.project_id`,
+  `unix.sparse`, `*.file_flags`) is skipped with a warning once per
+  attribute name, as in BackOtter's restic; it isn't an error. A project ID
+  of 0 is left as the file has it.
 - On Linux, regular files and directories are opened for their flags,
   project ID and holes with `O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_NOCTTY|O_CLOEXEC`
   (and `O_DIRECTORY`), and the opened file checked: one of another type, or
@@ -123,23 +125,45 @@ that either program restores what the other backed up.
   - those of type `B_XATTR_TYPE` (`'XATR'`) are the extended attributes,
     under their names as they are: Haiku's own xattr functions
     (`getxattr(3)` in libgnu) write their attributes so, and read them so.
-    A Haiku snapshot restores them as extended attributes anywhere, and
-    another system's extended attributes come back on Haiku as attributes
-    of type `B_XATTR_TYPE`. (libgnu's names for the other attributes,
-    `user.haiku.NAME#TYPE`, are not decoded: such an extended attribute
-    comes back under that name, of type `B_XATTR_TYPE`.)
+    Another system's extended attributes come back on Haiku as attributes
+    of type `B_XATTR_TYPE`, under their names in the snapshot, and a Haiku
+    snapshot's come back elsewhere under the names that system gives them:
+    as they are on Linux and macOS, and with `user.` in front on FreeBSD
+    and NetBSD, whose snapshots keep the user namespace under bare names
+    (Haiku's `user.comment` is `user.user.comment` there, and FreeBSD's
+    `comment` an attribute `comment` on Haiku). So a name without a
+    namespace (FreeBSD's, or one a Haiku program chose) comes back only
+    where the system takes it: Linux refuses it. (libgnu's names for the
+    other attributes, `user.haiku.NAME#TYPE`, are not decoded: such an
+    extended attribute comes back under that name, of type
+    `B_XATTR_TYPE`.)
   - all the others are the generic attribute `haiku.attributes`, an object
     with an entry for each, by name: `{"type": TYPE, "value": "DATA"}`, the
     type code a number (the four characters read as a big-endian `uint32`:
-    `'MIMS'` is 1296649555) and the data in base64 (null or none for empty),
-    as in `{"BEOS:TYPE":{"type":1296649555,"value":"dGV4dC9wbGFpbgA="}}`.
-    Other systems skip it quietly.
+    `'MIMS'` is 1296649555) and the data in base64 (empty data may also be
+    null or left out), as in
+    `{"BEOS:TYPE":{"type":1296649555,"value":"dGV4dC9wbGFpbgA="}}`. A file
+    without any has `{}`, on a file system with attributes. An entry of
+    type `B_XATTR_TYPE` is skipped with a warning: those are extended
+    attributes. Other systems skip it quietly.
   A restore gives a file exactly the attributes of each kind that the
   snapshot has, as with extended attributes on other systems: one it has
-  that the snapshot doesn't is removed, and one of another type replaced.
-  An attribute whose name isn't UTF-8 is left out of a backup with a
-  warning. A FIFO's or device's attributes aren't kept. Haiku's creation
-  time (`st_crtim`) isn't kept, as rustic keeps none anywhere.
+  that the snapshot doesn't is removed, and one of another type or with
+  other data written over (not removed first, so a failed write leaves it
+  as it was). A node without `haiku.attributes` (a snapshot of another
+  system, or of a file system without attributes) leaves a file's typed
+  attributes as they are, as FreeBSD's system extended attributes. An
+  attribute whose name isn't UTF-8 is left out of a backup with a
+  warning, and left on the file by a restore. Empty attributes are
+  restored too, though BFS makes none of a write of no data: such a one
+  is written with 16 KiB of zeros first, which BFS moves out of the inode,
+  then truncated; a file system on which that doesn't work either gets a
+  warning naming the attribute. The attributes are restored before the
+  mode, not after it as on other systems, since BFS wants write access to
+  a file to write its attributes, which a user other than root wouldn't
+  have on a read-only file. A FIFO's or device's attributes aren't kept.
+  Haiku's creation time (`st_crtim`) isn't kept, as rustic keeps none
+  anywhere.
 - A file that can't have extended attributes (a FIFO on ZFS) has none,
   rather than a warning, as in restic.
 - A backup keeps the metadata of the directory it backs up (stock rustic

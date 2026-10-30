@@ -613,23 +613,34 @@ pub(crate) fn set_metadata(
             .set_user_group(path, &node.meta)
             .unwrap_or_else(|_| warn!("restore {}: setting User/Group failed.", path.display())),
     }
-    dest.set_permission(path, node)
-        .unwrap_or_else(|_| warn!("restore {}: chmod failed.", path.display()));
     // BackOtter: the attributes osattrs keeps; ACLs after the mode.
     let target = dest.path(path);
+    let set_attributes = || {
+        dest.set_extended_attributes(path, &node.meta.extended_attributes)
+            .unwrap_or_else(|err| {
+                warn!(
+                    "restore {}: setting extended attributes failed: {err}",
+                    path.display()
+                );
+            });
+        osattrs::restore_attributes(&target, node)
+            .unwrap_or_else(|err| osattrs::warn_restore(path, &err));
+    };
+    // On Haiku before the mode: BFS wants write access to the file for
+    // each attribute it writes, which a restore by a user other than root
+    // wouldn't have on a read-only file.
+    if cfg!(target_os = "haiku") {
+        set_attributes();
+    }
+    dest.set_permission(path, node)
+        .unwrap_or_else(|_| warn!("restore {}: chmod failed.", path.display()));
     if node.is_symlink() {
         osattrs::restore_symlink_mode(&target, node)
             .unwrap_or_else(|err| warn!("restore {}: {err}", path.display()));
     }
-    dest.set_extended_attributes(path, &node.meta.extended_attributes)
-        .unwrap_or_else(|_| {
-            warn!(
-                "restore {}: setting extended attributes failed.",
-                path.display()
-            );
-        });
-    osattrs::restore_attributes(&target, node)
-        .unwrap_or_else(|err| osattrs::warn_restore(path, &err));
+    if !cfg!(target_os = "haiku") {
+        set_attributes();
+    }
     osattrs::restore_acls(&target, node)
         .unwrap_or_else(|err| warn!("restore {}: {err}", path.display()));
     dest.set_times(path, &node.meta)
