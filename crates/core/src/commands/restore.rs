@@ -418,7 +418,13 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
     let mut node_streamer = without_sockets(node_streamer);
     let known_bko = opts.origin.known_bko();
     let p = repo.progress_spinner("collecting file information...");
-    let dest_path = dest.path("");
+    let dest_path = dest.path("").map_err(|err| {
+        RusticError::with_source(
+            ErrorKind::InputOutput,
+            "Failed to resolve destination base path.",
+            err,
+        )
+    })?;
 
     let mut stats = RestoreStats::default();
     let mut restore_infos = RestorePlan::default();
@@ -520,7 +526,23 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
             (next_entry(walker), removed)
         };
 
+    // A node's path in the destination; one that would leave it ("..", an
+    // absolute path) is an error. BackOtter: every path this restore
+    // touches outside LocalDestination's own calls is taken from here, so
+    // that it is checked too.
+    let target_of = |path: &PathBuf| -> RusticResult<PathBuf> {
+        dest.path(path).map_err(|err| {
+            RusticError::with_source(
+                ErrorKind::InputOutput,
+                "Invalid path in snapshot for restore destination: `{path}`.",
+                err,
+            )
+            .attach_context("path", path.display().to_string())
+        })
+    };
+
     let mut process_node = |path: &PathBuf, node: &Node, exists: bool| -> RusticResult<_> {
+        let target = target_of(path)?;
         match node.node_type {
             NodeType::Dir => {
                 if exists {
@@ -529,7 +551,6 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                     // BackOtter: an empty directory (a mount point, the
                     // destination of SNAP:subfolder) gets the flags that go
                     // on before entries as one the restore creates.
-                    let target = dest.path(path);
                     if !dry_run
                         && std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir())
                         && std::fs::read_dir(&target).is_ok_and(|mut dir| dir.next().is_none())
@@ -556,7 +577,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         // the node says it had none (a snapshot of
                         // BackOtter's); without a word on them, it keeps
                         // what it inherited.
-                        if let Err(err) = osattrs::prepare_dir(&dest.path(path), node, known_bko)
+                        if let Err(err) = osattrs::prepare_dir(&target, node, known_bko)
                         {
                             warn!("restore {}: {err}", path.display());
                         }
@@ -578,7 +599,6 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                 // metadata, its system attributes last as for any file; one
                 // warning for it, not for each of its hard links.
                 if let Some(size) = osattrs::unread_size(node) {
-                    let target = dest.path(path);
                     warn!(
                         "{}: contents were not backed up (av_quarantined at backup, {size} bytes)",
                         target.display()
@@ -602,7 +622,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                 let fresh = if dry_run {
                     !exists
                 } else {
-                    matches!(std::fs::symlink_metadata(dest.path(path)),
+                    matches!(std::fs::symlink_metadata(&target),
                         Err(err) if err.kind() == std::io::ErrorKind::NotFound)
                 };
                 let sparse = write_sparse(opts.sparse, node, fresh);
@@ -616,7 +636,6 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                     if !fills_holes(opts, node) {
                         return false;
                     }
-                    let target = dest.path(path);
                     if dry_run {
                         return osattrs::holes_to_fill(&target, node.meta.size);
                     }
@@ -669,7 +688,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         // empty file (btrfs's no-copy-on-write) go on before
                         // the contents.
                         if !dry_run
-                            && let Err(err) = osattrs::prepare_file(&dest.path(path), node)
+                            && let Err(err) = osattrs::prepare_file(&target, node)
                         {
                             warn!("restore {}: {err}", path.display());
                         }
@@ -698,7 +717,8 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                 next_dst = process_existing(&mut walker, destination)?;
             }
             (Some(destination), Some((path, node))) => {
-                match destination.path().cmp(&dest.path(path)) {
+                let target_path = target_of(path)?;
+                match destination.path().cmp(&target_path) {
                     Ordering::Less => {
                         next_dst = process_existing(&mut walker, destination)?;
                     }
@@ -857,7 +877,10 @@ fn restore_metadata(
     }
 
     for (path, node_type, late, xattrs) in file_flags {
-        let target = dest.path(&path);
+        // set_metadata made it, so its path is in the destination.
+        let Ok(target) = dest.path(&path) else {
+            continue;
+        };
         if let Some(attrs) = late.fat_attrs {
             osattrs::restore_fat_attrs(&target, &node_type, attrs)
                 .unwrap_or_else(|err| osattrs::warn_restore(&path, &err));
@@ -1013,7 +1036,11 @@ pub(crate) fn set_metadata(
     // before the mode, which a change of owner can clear the setuid bit of.
     // A change of owner refused to a restore not running as root is no
     // warning, as in restic.
-    let target = dest.path(path);
+    // create_special refused (and warned of) a path that leaves the
+    // destination, so this is one in it.
+    let Ok(target) = dest.path(path) else {
+        return false;
+    };
     let chown_failed = |what: &str, err: &local_destination::LocalDestinationErrorKind| {
         if LocalDestination::chown_refused_not_root(err) {
             debug!(

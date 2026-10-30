@@ -71,6 +71,8 @@ mod helpers {
 pub enum LocalDestinationErrorKind {
     /// directory creation failed: `{0:?}`
     DirectoryCreationFailed(std::io::Error),
+    /// item path `{0:?}` contains invalid components or escapes destination
+    ItemPathEscapesDestination(PathBuf),
     /// file `{0:?}` should have a parent
     FileDoesNotHaveParent(PathBuf),
     #[cfg(any(
@@ -206,12 +208,29 @@ impl LocalDestination {
     ///
     /// * If the destination is a file, this will return the base path.
     /// * If the destination is a directory, this will return the base path joined with the item.
-    pub(crate) fn path(&self, item: impl AsRef<Path>) -> PathBuf {
+    pub(crate) fn path(&self, item: impl AsRef<Path>) -> LocalDestinationResult<PathBuf> {
+        let item = item.as_ref();
         if self.is_file {
-            self.path.clone()
-        } else {
-            self.path.join(item)
+            return Ok(self.path.clone());
         }
+
+        let mut res = self.path.clone();
+        for comp in item.components() {
+            match comp {
+                std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::ParentDir => {
+                    return Err(LocalDestinationErrorKind::ItemPathEscapesDestination(
+                        item.to_path_buf(),
+                    ));
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::Normal(c) => {
+                    res.push(c);
+                }
+            }
+        }
+        Ok(res)
     }
 
     /// Remove the given directory (relative to the base path)
@@ -267,7 +286,7 @@ impl LocalDestination {
     ///
     /// This will create the directory structure recursively.
     pub(crate) fn create_dir(&self, item: impl AsRef<Path>) -> LocalDestinationResult<()> {
-        let dirname = self.path.join(item);
+        let dirname = self.path(item)?;
         fs::create_dir_all(dirname).map_err(LocalDestinationErrorKind::DirectoryCreationFailed)?;
         Ok(())
     }
@@ -287,7 +306,7 @@ impl LocalDestination {
         item: impl AsRef<Path>,
         meta: &Metadata,
     ) -> LocalDestinationResult<()> {
-        let filename = self.path(item);
+        let filename = self.path(item)?;
         if let Some(mtime) = meta.mtime {
             let atime = meta.atime.unwrap_or(mtime);
             // BackOtter: on DragonFly filetime takes microseconds alone.
@@ -346,7 +365,7 @@ impl LocalDestination {
         item: impl AsRef<Path>,
         meta: &Metadata,
     ) -> LocalDestinationResult<()> {
-        let filename = self.path(item);
+        let filename = self.path(item)?;
 
         let user = meta.user.clone().and_then(helpers::uid_from_name);
         // use uid from user if valid, else from saved uid (if saved)
@@ -399,7 +418,7 @@ impl LocalDestination {
         item: impl AsRef<Path>,
         meta: &Metadata,
     ) -> LocalDestinationResult<()> {
-        let filename = self.path(item);
+        let filename = self.path(item)?;
 
         let uid = meta.uid.map(Uid::from_raw);
         let gid = meta.gid.map(Gid::from_raw);
@@ -477,7 +496,7 @@ impl LocalDestination {
             return Ok(());
         }
 
-        let filename = self.path(item);
+        let filename = self.path(item)?;
 
         // BackOtter: restic leaves a mode of 0 out ("omitempty"), and a
         // regular file's Go mode is its permissions alone: a file without a
@@ -530,7 +549,7 @@ impl LocalDestination {
         extended_attributes: &[ExtendedAttribute],
         _stock_names: bool,
     ) -> LocalDestinationResult<()> {
-        osattrs::set_native_xattrs(&self.path(item), extended_attributes)
+        osattrs::set_native_xattrs(&self.path(item)?, extended_attributes)
             .map_err(LocalDestinationErrorKind::XattrsNotSet)
     }
 
@@ -561,7 +580,7 @@ impl LocalDestination {
         extended_attributes: &[ExtendedAttribute],
         stock_names: bool,
     ) -> LocalDestinationResult<()> {
-        let filename = self.path(item);
+        let filename = self.path(item)?;
         // BackOtter: nothing to do where the xattr crate has no support,
         // rather than an error for each file.
         if !xattr::SUPPORTED_PLATFORM {
@@ -601,7 +620,7 @@ impl LocalDestination {
         size: u64,
         sparse: bool,
     ) -> LocalDestinationResult<()> {
-        let filename = self.path(item);
+        let filename = self.path(item)?;
         let dir = filename
             .parent()
             .ok_or_else(|| LocalDestinationErrorKind::FileDoesNotHaveParent(filename.clone()))?;
@@ -664,7 +683,7 @@ impl LocalDestination {
         item: impl AsRef<Path>,
         node: &Node,
     ) -> LocalDestinationResult<()> {
-        let filename = self.path(item);
+        let filename = self.path(item)?;
 
         match &node.node_type {
             NodeType::Symlink { .. } => {
@@ -776,7 +795,7 @@ impl LocalDestination {
         offset: u64,
         length: u64,
     ) -> LocalDestinationResult<Bytes> {
-        let filename = self.path(item);
+        let filename = self.path(item)?;
         let mut file =
             File::open(filename).map_err(LocalDestinationErrorKind::OpeningFileFailed)?;
         _ = file
@@ -809,7 +828,7 @@ impl LocalDestination {
     /// If a file exists and size matches, this returns a `File` open for reading.
     /// In all other cases, returns `None`
     pub fn get_matching_file(&self, item: impl AsRef<Path>, size: u64) -> Option<File> {
-        let filename = self.path(item);
+        let filename = self.path(item).ok()?;
         fs::symlink_metadata(&filename).map_or_else(
             |_| None,
             |meta| {
@@ -845,7 +864,7 @@ impl LocalDestination {
         offset: u64,
         data: &[u8],
     ) -> LocalDestinationResult<()> {
-        let filename = self.path(item);
+        let filename = self.path(item)?;
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -878,7 +897,7 @@ impl LocalDestination {
         offset: u64,
         data: &[u8],
     ) -> LocalDestinationResult<()> {
-        let filename = self.path(item);
+        let filename = self.path(item)?;
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -919,8 +938,8 @@ impl LocalDestination {
         source_item: impl AsRef<Path>,
         item: impl AsRef<Path>,
     ) -> LocalDestinationResult<()> {
-        let source_path = self.path(source_item);
-        let filename = self.path(item);
+        let source_path = self.path(source_item)?;
+        let filename = self.path(item)?;
         let dir = filename
             .parent()
             .ok_or_else(|| LocalDestinationErrorKind::FileDoesNotHaveParent(filename.clone()))?;
@@ -1573,5 +1592,43 @@ mod tests {
             data_blocks * block
         );
         assert!(m.blocks() * 512 <= max, "{} > {max}", m.blocks() * 512);
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_path_sanitization() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let dest = LocalDestination::new(temp.path().to_str().unwrap(), false, false)?;
+
+        // Valid relative paths
+        assert_eq!(dest.path("foo/bar")?, temp.path().join("foo/bar"));
+        assert_eq!(dest.path("./foo")?, temp.path().join("foo"));
+        assert_eq!(dest.path("")?, temp.path());
+
+        // Path traversal attempts
+        assert!(dest.path("../escaped").is_err());
+        assert!(dest.path("../../etc/passwd").is_err());
+        assert!(dest.path("a/../../b").is_err());
+        assert!(dest.path("/absolute/path").is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_operations_reject_traversal() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let dest = LocalDestination::new(temp.path().to_str().unwrap(), false, false)?;
+
+        assert!(dest.create_dir("../escaped_dir").is_err());
+        assert!(dest.write_at("../escaped_file", 0, b"data").is_err());
+        assert!(dest.read_at("../escaped_file", 0, 4).is_err());
+        assert!(dest.get_matching_file("../escaped_file", 4).is_none());
+
+        Ok(())
     }
 }
