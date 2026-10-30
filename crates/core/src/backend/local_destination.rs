@@ -26,7 +26,6 @@ use nix::{
 use crate::backend::ignore::mapper::nix_mapper::map_mode_from_go;
 #[cfg(not(windows))]
 use crate::backend::node::NodeType;
-#[cfg(not(any(windows, target_os = "openbsd")))]
 use crate::backend::osattrs;
 use crate::{
     backend::node::{ExtendedAttribute, Metadata, Node},
@@ -628,6 +627,7 @@ impl LocalDestination {
     ///
     /// * `item` - The item to set the length for
     /// * `size` - The size to set the length to
+    /// * `sparse` - BackOtter: whether the file is restored sparse
     ///
     /// # Errors
     ///
@@ -640,10 +640,15 @@ impl LocalDestination {
     ///
     /// If the file exists, truncate it to the given length. (TODO: check if this is correct)
     /// If it doesn't exist, create a new (empty) one with given length.
+    ///
+    /// BackOtter: a file restored sparse is emptied first, so that no hole
+    /// it gets keeps old contents (it should be new, but may not be: a race);
+    /// any other is allocated in full, where the system can.
     pub(crate) fn set_length(
         &self,
         item: impl AsRef<Path>,
         size: u64,
+        sparse: bool,
     ) -> LocalDestinationResult<()> {
         let filename = self.path(item);
         let dir = filename
@@ -651,14 +656,17 @@ impl LocalDestination {
             .ok_or_else(|| LocalDestinationErrorKind::FileDoesNotHaveParent(filename.clone()))?;
         fs::create_dir_all(dir).map_err(LocalDestinationErrorKind::DirectoryCreationFailed)?;
 
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
-            .truncate(false)
+            .truncate(sparse)
             .write(true)
             .open(filename)
-            .map_err(LocalDestinationErrorKind::OpeningFileFailed)?
-            .set_len(size)
+            .map_err(LocalDestinationErrorKind::OpeningFileFailed)?;
+        file.set_len(size)
             .map_err(LocalDestinationErrorKind::SettingFileLengthFailed)?;
+        if !sparse {
+            osattrs::preallocate(&file, size);
+        }
         Ok(())
     }
 

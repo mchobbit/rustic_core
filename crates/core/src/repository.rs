@@ -1586,6 +1586,11 @@ impl<S: IndexedTree> Repository<S> {
 
     /// Restore a given [`RestorePlan`] to a local destination
     ///
+    /// BackOtter: which files are restored sparse was decided when the plan
+    /// was made, by the options given to [`Repository::prepare_restore`] and
+    /// what was at each file's path then; the options given here don't
+    /// change that.
+    ///
     /// # Arguments
     ///
     /// * `restore_infos` - The restore plan to use
@@ -1798,6 +1803,10 @@ impl<S: IndexedFull> Repository<S> {
     /// If `dry_run` is set to false, it will also:
     /// - remove existing files from the destination, if `opts.delete` is set to true
     /// - create all dirs for the restore
+    ///
+    /// BackOtter: the plan says which files are restored sparse: those
+    /// `opts.sparse` or their `unix.sparse` mark make sparse, where nothing
+    /// is at their path now.
     ///
     /// # Arguments
     ///

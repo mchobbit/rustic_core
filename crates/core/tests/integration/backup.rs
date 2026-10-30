@@ -307,3 +307,43 @@ fn test_backup_excludes_xattr_entries(set_up_repo: Result<RepoOpen>) -> Result<(
 
     Ok(())
 }
+
+/// BackOtter: a backup keeps each file's and directory's access time, and
+/// leaves them as they were in the source (on Linux, where it can read
+/// them without updating them).
+#[rstest]
+#[cfg(not(windows))]
+fn test_backup_keeps_access_times(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    use filetime::{FileTime, set_file_atime};
+
+    let source = tempfile::tempdir()?;
+    let dir = source.path().join("dir");
+    std::fs::create_dir(&dir)?;
+    std::fs::write(dir.join("file"), vec![1_u8; 100_000])?;
+    let old = FileTime::from_unix_time(1_577_836_800, 0); // 2020-01-01
+    set_file_atime(dir.join("file"), old)?;
+    set_file_atime(&dir, old)?;
+
+    let repo = set_up_repo?.to_indexed_ids()?;
+    let opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
+    let paths = PathList::from_iter(Some(source.path().to_path_buf()));
+    let _snapshot = repo.backup(&opts, &paths, SnapshotFile::default())?;
+
+    let repo = repo.to_indexed()?;
+    let atime = |path: &str| -> Result<Option<i64>> {
+        let node = repo.node_from_snapshot_path(&format!("latest:{path}"), |_| true)?;
+        Ok(node.meta.atime.map(jiff::Timestamp::as_second))
+    };
+    assert_eq!(atime("test/dir")?, Some(old.unix_seconds()));
+    assert_eq!(atime("test/dir/file")?, Some(old.unix_seconds()));
+
+    // The backup read them; on Linux it leaves their access times as they
+    // were, even on a file system that updates them (relatime).
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        for path in [dir.join("file"), dir] {
+            let m = std::fs::metadata(&path)?;
+            assert_eq!(FileTime::from_last_access_time(&m), old, "{}", path.display());
+        }
+    }
+    Ok(())
+}

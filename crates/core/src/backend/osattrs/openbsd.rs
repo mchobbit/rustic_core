@@ -2,12 +2,15 @@
 
 use std::{io, os::openbsd::fs::MetadataExt, path::Path};
 
-use super::{c_path, check, path_error, set_flags_best_effort};
-use crate::backend::node::{Node, NodeType, generic_attributes::OPENBSD_FILE_FLAGS};
+use super::{c_path, check, set_flags_best_effort};
+use crate::backend::node::{
+    ExtendedAttribute, Node, NodeType, generic_attributes::OPENBSD_FILE_FLAGS,
+};
 
 pub(super) const FILE_FLAGS: Option<&str> = Some(OPENBSD_FILE_FLAGS);
 pub(super) const FLAGS_BEFORE_DATA: u32 = 0;
 pub(super) const FLAGS_BEFORE_ENTRIES: u32 = 0;
+pub(super) const FLAGS_XATTRS: &[&str] = &[];
 
 /// From `<sys/stat.h>`: the flags an owner may set (nodump, immutable,
 /// append, opaque) and those only root may (archived, immutable, append; the
@@ -23,11 +26,29 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
-pub(super) fn file_flags(_path: &Path, _typ: &NodeType, m: &std::fs::Metadata) -> io::Result<u32> {
+/// No file is opened for its attributes ahead of them here.
+pub(super) fn open_for_attrs(
+    _path: &Path,
+    _typ: &NodeType,
+    _m: &std::fs::Metadata,
+) -> Option<std::fs::File> {
+    None
+}
+
+pub(super) fn file_flags(
+    _path: &Path,
+    _typ: &NodeType,
+    m: &std::fs::Metadata,
+    _f: Option<&std::fs::File>,
+) -> io::Result<u32> {
     Ok(m.st_flags() & KEPT_FLAGS)
 }
 
-pub(super) fn fill_attributes(_path: &Path, _node: &mut Node) -> io::Result<()> {
+pub(super) fn fill_attributes(
+    _path: &Path,
+    _node: &mut Node,
+    _f: Option<&std::fs::File>,
+) -> io::Result<()> {
     Ok(())
 }
 
@@ -39,10 +60,15 @@ pub(super) fn prepare_dir_for_flags(_path: &Path, _flags: u32) -> io::Result<()>
     Ok(())
 }
 
-pub(super) fn restore_file_flags(path: &Path, typ: &NodeType, flags: u32) -> io::Result<()> {
+pub(super) fn restore_file_flags(
+    path: &Path,
+    typ: &NodeType,
+    flags: u32,
+    _xattrs: &[ExtendedAttribute],
+) -> io::Result<()> {
     let p = c_path(path)?;
     let symlink = matches!(typ, NodeType::Symlink { .. });
-    set_flags_best_effort(flags & KEPT_FLAGS, |bits| {
+    set_flags_best_effort(OPENBSD_FILE_FLAGS, path, "chflags", flags & KEPT_FLAGS, |bits| {
         // SAFETY: p is a C string.
         let r = unsafe {
             if symlink {
@@ -53,7 +79,6 @@ pub(super) fn restore_file_flags(path: &Path, typ: &NodeType, flags: u32) -> io:
         };
         check(r).map(drop)
     })
-    .map_err(|err| path_error("chflags", path, &err))
 }
 
 pub(super) fn restore_attributes(_path: &Path, _node: &Node) -> io::Result<()> {

@@ -35,6 +35,7 @@ use crate::backend::node::{
 pub(super) const FILE_FLAGS: Option<&str> = Some(ILLUMOS_SYSTEM_ATTRIBUTES);
 pub(super) const FLAGS_BEFORE_DATA: u32 = 0;
 pub(super) const FLAGS_BEFORE_ENTRIES: u32 = 0;
+pub(super) const FLAGS_XATTRS: &[&str] = &[];
 
 const ACE_GETACL: libc::c_int = 4;
 const ACE_SETACL: libc::c_int = 5;
@@ -142,7 +143,21 @@ fn read_view(f: &mut File, path: &Path) -> io::Result<Vec<u8>> {
     Ok(view)
 }
 
-pub(super) fn file_flags(path: &Path, typ: &NodeType, _m: &std::fs::Metadata) -> io::Result<u32> {
+/// No file is opened for its attributes ahead of them here.
+pub(super) fn open_for_attrs(
+    _path: &Path,
+    _typ: &NodeType,
+    _m: &std::fs::Metadata,
+) -> Option<File> {
+    None
+}
+
+pub(super) fn file_flags(
+    path: &Path,
+    typ: &NodeType,
+    _m: &std::fs::Metadata,
+    _f: Option<&File>,
+) -> io::Result<u32> {
     if !matches!(typ, NodeType::File | NodeType::Dir) {
         return Ok(0);
     }
@@ -163,7 +178,7 @@ pub(super) fn file_flags(path: &Path, typ: &NodeType, _m: &std::fs::Metadata) ->
     Ok(mask)
 }
 
-pub(super) fn fill_attributes(path: &Path, node: &mut Node) -> io::Result<()> {
+pub(super) fn fill_attributes(path: &Path, node: &mut Node, _f: Option<&File>) -> io::Result<()> {
     if node.is_symlink() {
         return Ok(());
     }
@@ -192,13 +207,17 @@ pub(super) fn prepare_dir_for_flags(_path: &Path, _flags: u32) -> io::Result<()>
     Ok(())
 }
 
-pub(super) fn restore_file_flags(path: &Path, typ: &NodeType, flags: u32) -> io::Result<()> {
+pub(super) fn restore_file_flags(
+    path: &Path,
+    typ: &NodeType,
+    flags: u32,
+    _xattrs: &[ExtendedAttribute],
+) -> io::Result<()> {
     let mut f = sysattr_view(path, typ, true)?;
     let mut view = read_view(&mut f, path)?;
-    set_flags_best_effort(flags, |mask| {
+    set_flags_best_effort(ILLUMOS_SYSTEM_ATTRIBUTES, path, "write SUNWattr_rw", flags, |mask| {
         illumos_sysattr::set_mask(&mut view, mask)?;
         f.write_all_at(&view, 0)
-            .map_err(|err| path_error("write SUNWattr_rw", path, &err))
     })
 }
 

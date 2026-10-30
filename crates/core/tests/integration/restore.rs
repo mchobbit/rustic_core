@@ -64,30 +64,70 @@ fn test_restore_preserves_hardlinks(
     Ok(())
 }
 
+/// BackOtter: restores what the repository's latest snapshot holds into
+/// `dir`, with `opts`.
+#[cfg(not(windows))]
+fn restore_to(
+    repo: &rustic_core::Repository<impl rustic_core::IndexedFull>,
+    dir: &Path,
+    opts: RestoreOptions,
+) -> Result<()> {
+    let node = repo.node_from_snapshot_path("latest", |_| true)?;
+    let ls_opts = LsOptions::default();
+    let dest = LocalDestination::new(
+        dir.to_str().expect("restore path is valid utf-8"),
+        true,
+        !node.is_dir(),
+    )?;
+    let ls = repo.ls(&node, &ls_opts)?;
+    let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false)?;
+    repo.restore(plan, &opts, ls, &dest)?;
+    Ok(())
+}
+
+/// BackOtter: whether the file at `path` has all its blocks.
+#[cfg(not(windows))]
+fn allocated(path: &Path) -> Result<bool> {
+    let m = fs::metadata(path)?;
+    Ok(m.blocks() * 512 >= m.len())
+}
+
 /// BackOtter: a file with holes is marked (`unix.sparse`) and comes back
-/// with holes, and one with the same contents written out comes back
-/// allocated, zeros and all.
+/// with holes into a new file; any other file, or one restored over an
+/// existing file, comes back allocated, zeros and all.
 #[rstest]
 #[cfg(not(windows))]
+#[allow(clippy::too_many_lines)]
 fn test_restore_sparse(set_up_repo: Result<RepoOpen>) -> Result<()> {
-    let allocated = |path: &Path| -> Result<bool> {
-        let m = fs::metadata(path)?;
-        Ok(m.blocks() * 512 >= m.len())
-    };
+    use rustic_core::SparseRestore;
+
     // Data around 8 MiB of zeros, which the chunker cuts into zero chunks.
     let data = vec![1_u8; 1 << 20];
     let zeros = vec![0_u8; 8 << 20];
     let source = tempdir()?;
-    let mut f = File::create(source.path().join("sparse"))?;
-    f.write_all(&data)?;
-    _ = f.seek(SeekFrom::Current(i64::try_from(zeros.len())?))?;
-    f.write_all(&data)?;
-    f.sync_all()?;
-    let mut f = File::create(source.path().join("full"))?;
-    for part in [&data, &zeros, &data] {
-        f.write_all(part)?;
-    }
-    f.sync_all()?;
+    let write_sparse = |path: &Path| -> Result<()> {
+        let mut f = File::create(path)?;
+        f.write_all(&data)?;
+        _ = f.seek(SeekFrom::Current(i64::try_from(zeros.len())?))?;
+        f.write_all(&data)?;
+        f.sync_all()?;
+        Ok(())
+    };
+    let write_full = |path: &Path, parts: &[&[u8]]| -> Result<()> {
+        let mut f = File::create(path)?;
+        for part in parts {
+            f.write_all(part)?;
+        }
+        f.sync_all()?;
+        Ok(())
+    };
+    write_sparse(&source.path().join("sparse"))?;
+    write_full(&source.path().join("full"), &[&data, &zeros, &data])?;
+    write_full(&source.path().join("zeros"), &[&zeros])?;
+    write_full(&source.path().join("trailing"), &[&data, &zeros])?;
+    fs::create_dir(source.path().join("linked"))?;
+    write_sparse(&source.path().join("linked/a"))?;
+    fs::hard_link(source.path().join("linked/a"), source.path().join("linked/b"))?;
     if allocated(&source.path().join("sparse"))? || !allocated(&source.path().join("full"))? {
         // A file system without holes, or one that compresses.
         return Ok(());
@@ -111,30 +151,89 @@ fn test_restore_sparse(set_up_repo: Result<RepoOpen>) -> Result<()> {
         [
             (PathBuf::from("test"), false),
             (PathBuf::from("test/full"), false),
+            (PathBuf::from("test/linked"), false),
+            (PathBuf::from("test/linked/a"), true),
+            (PathBuf::from("test/linked/b"), true),
             (PathBuf::from("test/sparse"), true),
+            (PathBuf::from("test/trailing"), false),
+            (PathBuf::from("test/zeros"), false),
         ]
     );
+    let sparse_data = [data.as_slice(), &zeros, &data].concat();
+    let expected = |name: &str| -> Vec<u8> {
+        match name {
+            "zeros" => zeros.clone(),
+            "trailing" => [data.as_slice(), &zeros].concat(),
+            _ => sparse_data.clone(),
+        }
+    };
+    let names = ["sparse", "full", "zeros", "trailing", "linked/a", "linked/b"];
+    // Allocation is only certain where the restore can allocate (Linux).
+    // Those in neither list have holes and data.
+    let check = |dir: &Path, sparse: &[&str], dense: &[&str]| -> Result<()> {
+        for name in names {
+            let path = dir.join("test").join(name);
+            assert!(fs::read(&path)? == expected(name), "{name}: contents differ");
+            if sparse.contains(&name) {
+                assert!(!allocated(&path)?, "{name}: allocated");
+            } else if cfg!(target_os = "linux") && dense.contains(&name) {
+                assert!(allocated(&path)?, "{name}: not allocated");
+            }
+        }
+        Ok(())
+    };
 
+    // Into new files: those that had holes get them back, the hard links
+    // too, and the rest are allocated.
     let restore_dir = tempdir()?;
-    let dest = LocalDestination::new(
-        restore_dir
-            .path()
-            .to_str()
-            .expect("restore path is valid utf-8"),
-        true,
-        !node.is_dir(),
+    restore_to(&repo, restore_dir.path(), RestoreOptions::default())?;
+    check(
+        restore_dir.path(),
+        &["sparse", "linked/a", "linked/b"],
+        &["full", "zeros", "trailing"],
     )?;
-    let ls = repo.ls(&node, &ls_opts)?;
-    let restore_opts = RestoreOptions::default();
-    let plan = repo.prepare_restore(&restore_opts, ls.clone(), &dest, false)?;
-    repo.restore(plan, &restore_opts, ls, &dest)?;
+    let a = fs::metadata(restore_dir.path().join("test/linked/a"))?;
+    let b = fs::metadata(restore_dir.path().join("test/linked/b"))?;
+    assert_eq!((a.dev(), a.ino()), (b.dev(), b.ino()));
 
-    let expected = [data.as_slice(), &zeros, &data].concat();
-    for name in ["sparse", "full"] {
-        let path = restore_dir.path().join("test").join(name);
-        assert!(fs::read(&path)? == expected, "{name}: contents differ");
-        assert_eq!(allocated(&path)?, name == "full", "{name}");
-    }
+    // --sparse by-content: zeros as holes in every new file.
+    let restore_dir = tempdir()?;
+    let by_content = RestoreOptions::default().sparse(SparseRestore::ByContent);
+    restore_to(&repo, restore_dir.path(), by_content)?;
+    check(
+        restore_dir.path(),
+        &["sparse", "full", "zeros", "linked/a", "linked/b"],
+        &[],
+    )?;
+    // trailing: its zeros are a hole too, but its data takes room.
+    assert!(fs::metadata(restore_dir.path().join("test/trailing"))?.blocks() * 512 < 4 << 20);
+
+    // Over existing files: a marked file over one of another content of the
+    // same size comes back whole and allocated, and so does an unmarked one
+    // over a file of holes, of the same size, and one of the same contents
+    // (zeros) left as it is.
+    let restore_dir = tempdir()?;
+    let test = restore_dir.path().join("test");
+    fs::create_dir(&test)?;
+    fs::write(test.join("sparse"), vec![0xaa_u8; sparse_data.len()])?;
+    File::create(test.join("full"))?.set_len(u64::try_from(sparse_data.len())?)?;
+    File::create(test.join("zeros"))?.set_len(u64::try_from(zeros.len())?)?;
+    restore_to(&repo, restore_dir.path(), RestoreOptions::default())?;
+    check(
+        restore_dir.path(),
+        &["linked/a", "linked/b"],
+        &["sparse", "full", "zeros", "trailing"],
+    )?;
+
+    // Through a symlinked directory, which the walk of the destination
+    // doesn't follow: the marked file there is restored over, whole.
+    let restore_dir = tempdir()?;
+    let real = restore_dir.path().join("real");
+    fs::create_dir(&real)?;
+    fs::write(real.join("sparse"), vec![0xaa_u8; sparse_data.len()])?;
+    std::os::unix::fs::symlink("real", restore_dir.path().join("test"))?;
+    restore_to(&repo, restore_dir.path(), RestoreOptions::default())?;
+    assert!(fs::read(real.join("sparse"))? == sparse_data, "contents differ");
 
     Ok(())
 }

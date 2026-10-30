@@ -16,12 +16,19 @@
 // System calls and ioctls rustic's dependencies don't wrap.
 #![allow(unsafe_code)]
 
-use std::{collections::BTreeSet, io, path::Path, sync::Mutex};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    fs::File,
+    io,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
-use log::warn;
+use log::{debug, warn};
 
 use crate::backend::node::{
-    Node, NodeType,
+    ExtendedAttribute, Node, NodeType,
     generic_attributes::{KNOWN, UNIX_SPARSE},
 };
 
@@ -62,22 +69,24 @@ mod other;
 )))]
 use other as os;
 
-/// Records the file flags and other attributes of the file at `path` in the
-/// generic attributes of its `node`. Errors are warned about: the rest of
-/// the node is still worth saving.
+/// Records the file flags and other attributes of the file at `path`, with
+/// metadata `m` (its lstat), in the generic attributes of its `node`. Errors
+/// are warned about: the rest of the node is still worth saving.
 pub(crate) fn fill(path: &Path, node: &mut Node, m: &std::fs::Metadata) {
+    // On Linux, the one open of the file for its flags, project ID and holes.
+    let f = os::open_for_attrs(path, &node.node_type, m);
     if let Some(name) = os::FILE_FLAGS {
-        match os::file_flags(path, &node.node_type, m) {
+        match os::file_flags(path, &node.node_type, m, f.as_ref()) {
             Ok(flags) => node.meta.generic_attributes.set_number(name, flags),
             Err(err) => warn!("ignoring file flags of {}: {err}", path.display()),
         }
     }
-    if let Err(err) = os::fill_attributes(path, node) {
+    if let Err(err) = os::fill_attributes(path, node, f.as_ref()) {
         warn!("ignoring attributes of {}: {err}", path.display());
     }
     // A regular file, not a block device saved as one.
     #[cfg(unix)]
-    if node.is_file() && m.is_file() && sparse::has_holes(path, m) {
+    if node.is_file() && m.is_file() && sparse::has_holes(path, m, f.as_ref()) {
         node.meta.generic_attributes.set_true(UNIX_SPARSE);
     }
 }
@@ -109,31 +118,239 @@ pub(crate) fn prepare_file(path: &Path, node: &Node) -> io::Result<()> {
     }
 }
 
-/// Gives the new, empty directory at `path` those of `node`'s flags that a
-/// file system only takes while a directory is empty (casefolding, on ext4
-/// and f2fs), before the restore puts anything in it. Flags the file system
+/// Gives the empty directory at `path` (one the restore created, or found
+/// empty) exactly those of `node`'s flags that a file system only takes
+/// while a directory is empty (casefolding, on ext4 and f2fs), before the
+/// restore puts anything in it: it sets them where `node` has them, and
+/// clears them where it hasn't, so that a directory doesn't inherit
+/// casefolding from its parent when it had none. Flags the file system
 /// doesn't support are left for [`restore_file_flags`] to report.
 ///
 /// # Errors
 ///
 /// * If the flags couldn't be set.
 pub(crate) fn prepare_dir(path: &Path, node: &Node) -> io::Result<()> {
-    match file_flags(node) {
-        Some(flags) if flags & os::FLAGS_BEFORE_ENTRIES != 0 => {
-            os::prepare_dir_for_flags(path, flags & os::FLAGS_BEFORE_ENTRIES)
-        }
-        _ => Ok(()),
+    if os::FLAGS_BEFORE_ENTRIES == 0 {
+        return Ok(());
     }
+    os::prepare_dir_for_flags(path, file_flags(node).unwrap_or(0) & os::FLAGS_BEFORE_ENTRIES)
 }
 
-/// Sets the file flags of the file at `path`, of type `node_type`. Flags the
-/// file system doesn't support are left out, and named in the error.
+/// The extended attributes of `node` that [`restore_file_flags`] needs:
+/// btrfs's `btrfs.compression` on Linux, which setting the flags rewrites.
+pub(crate) fn flags_xattrs(node: &Node) -> Vec<ExtendedAttribute> {
+    node.meta
+        .extended_attributes
+        .iter()
+        .filter(|attr| os::FLAGS_XATTRS.contains(&attr.name.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Sets the file flags of the file at `path`, of type `node_type`, which has
+/// the extended attributes `xattrs` ([`flags_xattrs`]). Flags the file
+/// system doesn't support are left out, and named in the error.
 ///
 /// # Errors
 ///
-/// * If some or all of the flags couldn't be set.
-pub(crate) fn restore_file_flags(path: &Path, node_type: &NodeType, flags: u32) -> io::Result<()> {
-    os::restore_file_flags(path, node_type, flags)
+/// * If some or all of the flags couldn't be set: an [`Unsupported`] error
+///   if the file system has none of those it refused.
+pub(crate) fn restore_file_flags(
+    path: &Path,
+    node_type: &NodeType,
+    flags: u32,
+    xattrs: &[ExtendedAttribute],
+) -> io::Result<()> {
+    os::restore_file_flags(path, node_type, flags, xattrs)
+}
+
+/// Allocates the first `len` bytes of the file `f`, holes included, where the
+/// system can (Linux, macOS), for a file the restore doesn't restore sparse.
+/// Errors only go to the debug log: the restore writes every byte anyway.
+pub(crate) fn preallocate(f: &File, len: u64) {
+    if len == 0 {
+        return;
+    }
+    if let Err(err) = os_preallocate(f, len) {
+        debug!("not preallocated: {err}");
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn os_preallocate(f: &File, len: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let len = libc::off_t::try_from(len).map_err(io::Error::other)?;
+    loop {
+        // SAFETY: f is an open file. Mode 0 allocates holes and unwritten
+        // space, and leaves data as it is.
+        if unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, len) } == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn os_preallocate(f: &File, len: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // As restic does: contiguous first, then in any form, but all of it.
+    let mut store = libc::fstore_t {
+        fst_flags: libc::F_ALLOCATECONTIG | libc::F_ALLOCATEALL,
+        fst_posmode: libc::F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: libc::off_t::try_from(len).map_err(io::Error::other)?,
+        fst_bytesalloc: 0,
+    };
+    // SAFETY: F_PREALLOCATE reads and writes a fstore_t.
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_PREALLOCATE, &raw mut store) } == 0 {
+        return Ok(());
+    }
+    store.fst_flags = libc::F_ALLOCATEALL;
+    // SAFETY: as above.
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_PREALLOCATE, &raw mut store) } == 0 {
+        return Ok(());
+    }
+    Err(io::Error::last_os_error())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn os_preallocate(_f: &File, _len: u64) -> io::Result<()> {
+    Ok(())
+}
+
+/// Allocates the holes of the regular file at `path`, of `len` bytes, which
+/// the restore leaves as it is and doesn't restore sparse: a swap file left
+/// with holes by an interrupted restore. Only where the system can fill
+/// them (Linux, macOS); errors only go to the debug log.
+pub(crate) fn fill_holes(path: &Path, len: u64) {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        use std::{
+            fs::OpenOptions,
+            os::unix::fs::{MetadataExt, OpenOptionsExt},
+        };
+
+        let f = match OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(err) => {
+                debug!("holes of {} not filled: {err}", path.display());
+                return;
+            }
+        };
+        match f.metadata() {
+            Ok(m) if m.is_file() && m.blocks().saturating_mul(512) < len => {
+                debug!("filling the holes of {}", path.display());
+                preallocate(&f, len);
+            }
+            Ok(_) => {}
+            Err(err) => debug!("holes of {} not filled: {err}", path.display()),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        _ = (path, len);
+    }
+}
+
+/// BackOtter: an error saying that the file system doesn't support a kind
+/// of metadata (`attr`, and of file flags `bits`), rather than that setting
+/// it failed. The restore warns about each kind once
+/// ([`warn_restore`]).
+#[derive(Debug)]
+pub(crate) struct Unsupported {
+    /// The generic attribute.
+    pub(crate) attr: &'static str,
+    /// The file flags refused, or 0.
+    pub(crate) bits: u32,
+    /// The system's error.
+    pub(crate) source: io::Error,
+}
+
+impl fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} not supported by the file system: {}", self.kind(), self.source)
+    }
+}
+
+impl std::error::Error for Unsupported {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl Unsupported {
+    /// An [`io::Error`] for this.
+    #[cfg_attr(
+        not(any(
+            target_os = "freebsd",
+            target_os = "illumos",
+            target_os = "linux",
+            target_os = "openbsd"
+        )),
+        allow(dead_code)
+    )]
+    fn error(attr: &'static str, bits: u32, source: io::Error) -> io::Error {
+        io::Error::new(io::ErrorKind::Unsupported, Self { attr, bits, source })
+    }
+
+    /// What isn't supported: `linux.inode_flags 0x10`, `linux.project_id`.
+    fn kind(&self) -> String {
+        if self.bits == 0 {
+            self.attr.to_string()
+        } else {
+            format!("{} {:#x}", self.attr, self.bits)
+        }
+    }
+}
+
+/// The kinds of unsupported metadata the restore has warned about, with the
+/// first file of each and the number of files.
+static UNSUPPORTED: Mutex<BTreeMap<String, (PathBuf, u64)>> = Mutex::new(BTreeMap::new());
+
+/// Warns about an error restoring the metadata of `path`: an [`Unsupported`]
+/// one once per kind, with the first file, and [`report_unsupported`] counts
+/// the files; any other each time.
+pub(crate) fn warn_restore(path: &Path, err: &io::Error) {
+    let Some(unsupported) = err.get_ref().and_then(|e| e.downcast_ref::<Unsupported>()) else {
+        warn!("restore {}: {err}", path.display());
+        return;
+    };
+    let mut seen = UNSUPPORTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_, n) = seen
+        .entry(unsupported.kind())
+        .or_insert_with(|| (path.to_path_buf(), 0));
+    *n += 1;
+    let first = *n == 1;
+    drop(seen);
+    if first {
+        warn!("restore {}: {unsupported}", path.display());
+    }
+}
+
+/// Warns, once a restore is done, about the number of files with each kind
+/// of unsupported metadata [`warn_restore`] saw more than once, and starts
+/// counting again.
+pub(crate) fn report_unsupported() {
+    let seen = std::mem::take(
+        &mut *UNSUPPORTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    for (kind, (first, n)) in seen {
+        if n > 1 {
+            warn!(
+                "{kind} not supported by the file system: {n} files, the first {}",
+                first.display()
+            );
+        }
+    }
 }
 
 /// Restores the attributes that go along with the extended attributes
@@ -175,7 +392,7 @@ pub(crate) fn restore_symlink_mode(path: &Path, node: &Node) -> io::Result<()> {
 ///
 /// * If they can't be read.
 #[cfg(target_os = "illumos")]
-pub(crate) fn illumos_xattrs(path: &Path) -> io::Result<Vec<crate::backend::node::ExtendedAttribute>> {
+pub(crate) fn illumos_xattrs(path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
     os::xattrs(path)
 }
 
@@ -188,7 +405,7 @@ pub(crate) fn illumos_xattrs(path: &Path) -> io::Result<Vec<crate::backend::node
 #[cfg(target_os = "illumos")]
 pub(crate) fn set_illumos_xattrs(
     path: &Path,
-    attrs: &[crate::backend::node::ExtendedAttribute],
+    attrs: &[ExtendedAttribute],
 ) -> io::Result<()> {
     os::set_xattrs(path, attrs)
 }
@@ -286,9 +503,12 @@ fn path_error(op: &str, path: &Path, err: &io::Error) -> io::Error {
     io::Error::new(err.kind(), format!("{op} {}: {err}", path.display()))
 }
 
-/// Calls `set` with `want`. If that fails, sets as many of `want`'s bits as
-/// `set` accepts, one at a time, and returns an error naming the bits it
-/// refused, with `set`'s first error.
+/// Calls `set` with `want`, the flags `attr` of the file at `path`, which
+/// `op` sets. If that fails, sets as many of `want`'s bits as `set` accepts,
+/// one at a time, and returns an error naming the bits it refused, with
+/// `set`'s first error: an [`Unsupported`] one if every refusal said the
+/// file system doesn't have those flags (`EINVAL`, `ENOTSUP`, `EOPNOTSUPP`,
+/// `ENOTTY`), or else with the first error that didn't.
 #[cfg_attr(
     not(any(
         target_os = "freebsd",
@@ -299,6 +519,9 @@ fn path_error(op: &str, path: &Path, err: &io::Error) -> io::Error {
     allow(dead_code)
 )]
 fn set_flags_best_effort(
+    attr: &'static str,
+    path: &Path,
+    op: &str,
     want: u32,
     mut set: impl FnMut(u32) -> io::Result<()>,
 ) -> io::Result<()> {
@@ -306,41 +529,100 @@ fn set_flags_best_effort(
         return Ok(());
     };
     let (mut got, mut refused) = (0, 0);
+    let mut failed = (!unsupported(&first)).then_some(first);
+    let mut unsupported_err = None;
     for bit in (0..32).map(|i| 1_u32 << i).filter(|bit| want & bit != 0) {
-        if set(got | bit).is_ok() {
-            got |= bit;
-        } else {
-            refused |= bit;
+        match set(got | bit) {
+            Ok(()) => got |= bit,
+            Err(err) => {
+                refused |= bit;
+                if !unsupported(&err) {
+                    _ = failed.get_or_insert(err);
+                } else if unsupported_err.is_none() {
+                    unsupported_err = Some(err);
+                }
+            }
         }
     }
     if refused == 0 {
         return Ok(());
     }
-    Err(io::Error::new(
-        first.kind(),
-        format!("file flags {refused:#x} of {want:#x} not set: {first}"),
-    ))
+    match (failed, unsupported_err) {
+        (Some(err), _) => Err(path_error(
+            op,
+            path,
+            &io::Error::new(
+                err.kind(),
+                format!("file flags {refused:#x} of {want:#x} not set: {err}"),
+            ),
+        )),
+        (None, Some(err)) => Err(Unsupported::error(attr, refused, err)),
+        (None, None) => Err(path_error(
+            op,
+            path,
+            &io::Error::other(format!("file flags {refused:#x} of {want:#x} not set")),
+        )),
+    }
+}
+
+/// Errors that mean the file system doesn't have a kind of metadata (file
+/// flags, a project ID), rather than that setting it failed.
+#[cfg_attr(
+    not(any(
+        target_os = "freebsd",
+        target_os = "illumos",
+        target_os = "linux",
+        target_os = "openbsd"
+    )),
+    allow(dead_code)
+)]
+fn unsupported(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error().is_some_and(|code| {
+            [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOTTY].contains(&code)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        err.kind() == io::ErrorKind::Unsupported
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn set_flags_best_effort_sets_what_it_can() {
-        // A file system that refuses bit 0x4, as ZFS refuses some FreeBSD flags.
-        let mut current = 0;
+        let path = Path::new("f");
+        // A file system that refuses bit 0x4, as ZFS refuses some FreeBSD
+        // flags, and bit 0x8 to all but root.
+        let current = std::cell::Cell::new(0);
         let mut set = |f: u32| {
             if f & 0x4 != 0 {
-                return Err(io::Error::from(io::ErrorKind::Unsupported));
+                return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
             }
-            current = f;
+            if f & 0x8 != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EPERM));
+            }
+            current.set(f);
             Ok(())
         };
-        set_flags_best_effort(0x3, &mut set).unwrap();
-        let err = set_flags_best_effort(0x15, &mut set).unwrap_err();
+        set_flags_best_effort("x.flags", path, "set", 0x3, &mut set).unwrap();
+
+        // Unsupported: a warning once.
+        let err = set_flags_best_effort("x.flags", path, "set", 0x15, &mut set).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-        assert!(err.to_string().contains("0x4 of 0x15"), "{err}");
-        assert_eq!(current, 0x11);
+        let unsupported = err.get_ref().unwrap().downcast_ref::<Unsupported>().unwrap();
+        assert_eq!((unsupported.attr, unsupported.bits), ("x.flags", 0x4));
+        assert_eq!(current.get(), 0x11);
+
+        // Unsupported and not permitted: an error.
+        let err = set_flags_best_effort("x.flags", path, "set", 0x1d, &mut set).unwrap_err();
+        assert!(err.get_ref().unwrap().downcast_ref::<Unsupported>().is_none());
+        assert!(err.to_string().contains("0xc of 0x1d"), "{err}");
+        assert_eq!(current.get(), 0x11);
     }
 }

@@ -3,7 +3,11 @@
 //! each a JSON value. BackOtter's rustic writes them in the same form as
 //! BackOtter's restic, so that each restores what the other backed up.
 
-use std::{cmp::Ordering, collections::BTreeMap};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+    sync::Mutex,
+};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -12,8 +16,9 @@ pub const LINUX_INODE_FLAGS: &str = "linux.inode_flags";
 /// Linux's project ID (`FS_IOC_FSGETXATTR`'s `fsx_projid`), for project
 /// quotas: a number, when it isn't 0.
 pub const LINUX_PROJECT_ID: &str = "linux.project_id";
-/// A regular file with holes (`true`), which the restore makes sparse again;
-/// any other file it writes out in full, allocated.
+/// A regular file with holes (`true`). The restore restores it sparse into a
+/// new file; any other file, or one that exists already, it allocates in
+/// full (see `write_sparse` in the restore).
 pub const UNIX_SPARSE: &str = "unix.sparse";
 /// FreeBSD's `chflags(1)` flags (`st_flags`).
 pub const FREEBSD_FILE_FLAGS: &str = "freebsd.file_flags";
@@ -89,13 +94,14 @@ impl GenericAttributes {
     }
 
     /// The number (file flags, a project ID) in the attribute `name`, if
-    /// there is one.
+    /// there is one. One that isn't a number that fits is skipped, with a
+    /// warning once per attribute name.
     #[must_use]
     pub fn number(&self, name: &str) -> Option<u32> {
         match self.get(name)? {
             Ok(n) => Some(n),
             Err(err) => {
-                log::warn!("ignoring generic attribute {name}: {err}");
+                warn_malformed(name, &err);
                 None
             }
         }
@@ -110,14 +116,16 @@ impl GenericAttributes {
         }
     }
 
-    /// Whether the attribute `name` (`unix.sparse`) is there and `true`.
+    /// Whether the attribute `name` (`unix.sparse`) is there and `true`. One
+    /// that isn't a boolean counts as not there, with a warning once per
+    /// attribute name.
     #[must_use]
     pub fn is_true(&self, name: &str) -> bool {
         match self.get(name) {
             None => false,
             Some(Ok(b)) => b,
             Some(Err(err)) => {
-                log::warn!("ignoring generic attribute {name}: {err}");
+                warn_malformed(name, &err);
                 false
             }
         }
@@ -126,6 +134,16 @@ impl GenericAttributes {
     /// Stores `true` as the attribute `name` (`unix.sparse`).
     pub fn set_true(&mut self, name: &str) {
         _ = self.0.insert(name.to_string(), true.into());
+    }
+}
+
+/// Warns that the generic attribute `name` can't be read, once per name, as
+/// BackOtter's restic does: a snapshot could have it on every file.
+fn warn_malformed(name: &str, err: &serde_json::Error) {
+    static WARNED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    let mut warned = WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if warned.insert(name.to_string()) {
+        log::warn!("ignoring generic attribute {name}: {err}");
     }
 }
 
@@ -178,6 +196,19 @@ mod tests {
         assert!(!attrs.is_true(UNIX_SPARSE));
         let node = Node::default();
         assert!(!serde_json::to_string(&node).unwrap().contains("generic_attributes"));
+    }
+
+    #[test]
+    fn malformed_values_are_skipped() {
+        let attrs = |json: &str| -> GenericAttributes { serde_json::from_str(json).unwrap() };
+        for bad in ["-1", "1.5", r#""x""#, "4294967296", "true"] {
+            let a = attrs(&format!(r#"{{"linux.project_id":{bad},"unix.sparse":{bad}}}"#));
+            assert_eq!(a.number(LINUX_PROJECT_ID), None, "{bad}");
+            assert!(!a.is_true(UNIX_SPARSE) || bad == "true", "{bad}");
+        }
+        let a = attrs(r#"{"linux.project_id":0,"unix.sparse":false}"#);
+        assert_eq!(a.number(LINUX_PROJECT_ID), Some(0));
+        assert!(!a.is_true(UNIX_SPARSE));
     }
 
     // The JSON BackOtter's restic writes for a sparse file with a project ID.

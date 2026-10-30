@@ -61,8 +61,12 @@ pub struct RestoreOptions {
     #[cfg_attr(feature = "clap", clap(long))]
     pub numeric_id: bool,
 
+    // BackOtter: --ownership-by-name too, restic's name for it.
     /// Look the owners up by user/group name, not the saved uid/gid
-    #[cfg_attr(feature = "clap", clap(long, conflicts_with = "numeric_id"))]
+    #[cfg_attr(
+        feature = "clap",
+        clap(long, visible_alias = "ownership-by-name", conflicts_with = "numeric_id")
+    )]
     pub by_name: bool,
 
     /// Don't restore ownership (user/group)
@@ -76,18 +80,22 @@ pub struct RestoreOptions {
     #[cfg_attr(feature = "clap", clap(long))]
     pub verify_existing: bool,
 
-    // BackOtter: files that had holes ("unix.sparse") are restored sparse
-    // anyway, see write_sparse.
-    /// Restore sparse files: by-content makes the zero chunks of every file holes [default: only those of files that had holes]
+    // BackOtter: new files that had holes ("unix.sparse") are restored
+    // sparse anyway, see write_sparse.
+    /// Restore sparse files: by-content makes holes for zero runs in every new file [default: only in new files that had holes]
     #[cfg_attr(feature = "clap", clap(long))]
     pub sparse: Option<SparseRestore>,
 }
 
+/// Which files to restore sparse (BackOtter: new files that had holes are,
+/// anyway)
 #[derive(Serialize, Default, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum SparseRestore {
+    /// Only new files that had holes
     #[default]
     No,
+    /// Every new file: its zero runs as holes
     ByContent,
 }
 
@@ -264,6 +272,17 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                 if exists {
                     stats.dirs.modify += 1;
                     trace!("existing dir {}", path.display());
+                    // BackOtter: an empty directory (a mount point, the
+                    // destination of SNAP:subfolder) gets the flags that go
+                    // on before entries as one the restore creates.
+                    let target = dest.path(path);
+                    if !dry_run
+                        && std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir())
+                        && std::fs::read_dir(&target).is_ok_and(|mut dir| dir.next().is_none())
+                        && let Err(err) = osattrs::prepare_dir(&target, node)
+                    {
+                        warn!("restore {}: {err}", path.display());
+                    }
                 } else {
                     stats.dirs.restore += 1;
                     debug!("to restore: {}", path.display());
@@ -279,7 +298,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                             })?;
                         // BackOtter: flags a file system only takes on an
                         // empty directory (casefolding) go on before its
-                        // entries.
+                        // entries, or come off if it inherited them.
                         if let Err(err) = osattrs::prepare_dir(&dest.path(path), node) {
                             warn!("restore {}: {err}", path.display());
                         }
@@ -296,8 +315,30 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         std::collections::btree_map::Entry::Occupied(_) => return Ok(()), // this is a hardlink to an existing candidate, will be processed later while setting metadata
                     }
                 }
+                // BackOtter: whether the file goes into a new, empty file,
+                // which can be restored sparse (write_sparse): nothing is
+                // there now, seen by the walk of the destination or not (a
+                // file below a symlinked directory), or left there by
+                // --delete.
+                let fresh = if dry_run {
+                    !exists
+                } else {
+                    matches!(std::fs::symlink_metadata(dest.path(path)),
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound)
+                };
+                let sparse = write_sparse(opts.sparse, node, fresh);
+                // BackOtter: a file left as it is, which isn't restored
+                // sparse, gets its holes allocated (a swap file left with
+                // holes by an interrupted restore).
+                let fill_holes = || {
+                    if !(dry_run
+                        || opts.sparse == Some(SparseRestore::ByContent)
+                        || osattrs::is_sparse(node))
+                    {
+                        osattrs::fill_holes(&dest.path(path), node.meta.size);
+                    }
+                };
                 // collect blobs needed for restoring
-                let sparse = write_sparse(opts.sparse, node, exists);
                 match (
                     exists,
                     restore_infos.add_file(
@@ -314,10 +355,12 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                     (_, AddFileResult::Existing) => {
                         stats.files.unchanged += 1;
                         trace!("identical file: {}", path.display());
+                        fill_holes();
                     }
                     (_, AddFileResult::Verified) => {
                         stats.files.verified += 1;
                         trace!("verified identical file: {}", path.display());
+                        fill_holes();
                     }
                     // TODO: The differentiation between files to modify and files to create could be done only by add_file
                     // Currently, add_file never returns Modify, but always New, so we differentiate based on exists
@@ -429,7 +472,12 @@ fn restore_metadata(
         if let Some(flags) = osattrs::file_flags(node)
             && hardlink_key(node).is_none_or(|key| flags_linked.insert(key))
         {
-            file_flags.push((path.clone(), node.node_type.clone(), flags));
+            file_flags.push((
+                path.clone(),
+                node.node_type.clone(),
+                flags,
+                osattrs::flags_xattrs(node),
+            ));
         }
     };
 
@@ -478,21 +526,48 @@ fn restore_metadata(
         finish(&path, &node);
     }
 
-    for (path, node_type, flags) in file_flags {
-        osattrs::restore_file_flags(&dest.path(&path), &node_type, flags)
-            .unwrap_or_else(|err| warn!("restore {}: {err}", path.display()));
+    for (path, node_type, flags, xattrs) in file_flags {
+        osattrs::restore_file_flags(&dest.path(&path), &node_type, flags, &xattrs)
+            .unwrap_or_else(|err| osattrs::warn_restore(&path, &err));
     }
+    // BackOtter: how many files had metadata the file system doesn't
+    // support, warned about once.
+    osattrs::report_unsupported();
 
     Ok(())
 }
 
-/// BackOtter: whether to restore the file `node` sparse, its zero chunks as
-/// holes: one that had holes (`unix.sparse`), or any with `--sparse
-/// by-content`. Any other is written out in full, zeros and all, so that it
-/// is allocated (a swap file, a preallocated file). Never a file that
-/// `exists` already: a hole left in it would keep its old contents there.
-fn write_sparse(sparse: Option<SparseRestore>, node: &Node, exists: bool) -> bool {
-    !exists && (sparse == Some(SparseRestore::ByContent) || osattrs::is_sparse(node))
+/// BackOtter: whether to restore the file `node` sparse: one that had holes
+/// (`unix.sparse`), or any with `--sparse by-content`, and only into a new,
+/// empty file (`fresh`), which the restore sizes without allocating, and
+/// where it leaves each blob's longest all-zero prefix unwritten, as
+/// BackOtter's restic does. In a file that existed, a hole would keep its
+/// old contents. Any other file is allocated in full (preallocated, where
+/// the system can) and written out, zeros and all: a swap file, a
+/// preallocated file.
+fn write_sparse(sparse: Option<SparseRestore>, node: &Node, fresh: bool) -> bool {
+    fresh && (sparse == Some(SparseRestore::ByContent) || osattrs::is_sparse(node))
+}
+
+/// BackOtter: how a restore sets owners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ownership {
+    /// Not at all (`--no-ownership`).
+    None,
+    /// The saved uid and gid, as restic does (the default).
+    Numeric,
+    /// By user and group name (`--by-name`), falling back to the saved ids.
+    ByName,
+}
+
+/// BackOtter: how `opts` say to set owners: numeric ids unless names are
+/// asked for.
+const fn ownership(opts: RestoreOptions) -> Ownership {
+    match (opts.no_ownership, opts.by_name) {
+        (true, _) => Ownership::None,
+        (false, false) => Ownership::Numeric,
+        (false, true) => Ownership::ByName,
+    }
 }
 
 fn hardlink_key(node: &Node) -> Option<HardlinkKey> {
@@ -529,12 +604,12 @@ pub(crate) fn set_metadata(
     dest.create_special(path, node)
         .unwrap_or_else(|_| warn!("restore {}: creating special file failed.", path.display()));
     // BackOtter: numeric ids, unless names are asked for (--by-name).
-    match (opts.no_ownership, opts.by_name) {
-        (true, _) => {}
-        (false, false) => dest
+    match ownership(opts) {
+        Ownership::None => {}
+        Ownership::Numeric => dest
             .set_uid_gid(path, &node.meta)
             .unwrap_or_else(|_| warn!("restore {}: setting UID/GID failed.", path.display())),
-        (false, true) => dest
+        Ownership::ByName => dest
             .set_user_group(path, &node.meta)
             .unwrap_or_else(|_| warn!("restore {}: setting User/Group failed.", path.display())),
     }
@@ -554,7 +629,7 @@ pub(crate) fn set_metadata(
             );
         });
     osattrs::restore_attributes(&target, node)
-        .unwrap_or_else(|err| warn!("restore {}: {err}", path.display()));
+        .unwrap_or_else(|err| osattrs::warn_restore(path, &err));
     osattrs::restore_acls(&target, node)
         .unwrap_or_else(|err| warn!("restore {}: {err}", path.display()));
     dest.set_times(path, &node.meta)
@@ -621,7 +696,7 @@ fn restore_contents<S: Open>(
     for (i, size) in file_lengths.iter().enumerate() {
         if *size == 0 {
             let path = &filenames[i];
-            dest.set_length(path, *size).map_err(|err| {
+            dest.set_length(path, *size, sparse[i]).map_err(|err| {
                 RusticError::with_source(
                     ErrorKind::InputOutput,
                     "Failed to set the length of the file `{path}`. Please check the path and try again.",
@@ -721,27 +796,30 @@ fn restore_contents<S: Open>(
                             )
                             .unwrap()
                         };
-                        // BackOtter: a zero chunk is a hole in a file
-                        // restored sparse (write_sparse), and written to
-                        // any other, so that it is allocated.
-                        let zero = name_dests.iter().any(|(file_idx, _)| sparse[*file_idx])
-                            && data.iter().all(|&b| b == 0);
+                        // BackOtter: in a file restored sparse
+                        // (write_sparse), a blob's longest all-zero prefix
+                        // stays a hole (all of an all-zero blob), as
+                        // BackOtter's restic leaves it; any other file gets
+                        // every byte, so that it is allocated.
+                        let zeros = data.iter().position(|&b| b != 0).unwrap_or(data.len());
 
                         for (file_idx, start) in name_dests {
                             let data = data.clone();
-                            let is_sparse = zero && sparse[file_idx];
+                            let is_sparse = sparse[file_idx];
                             s1.spawn(move |_| {
                                 let path = &filenames[file_idx];
                                 // Allocate file if it is not yet allocated
                                 let mut sizes_guard = sizes.lock().unwrap();
                                 let filesize = sizes_guard[file_idx];
                                 if filesize > 0 {
-                                    dest.set_length(path, filesize).unwrap();
+                                    dest.set_length(path, filesize, is_sparse).unwrap();
                                     sizes_guard[file_idx] = 0;
                                 }
                                 drop(sizes_guard);
-                                if !is_sparse {
-                                    dest.write_at(path, start, &data).unwrap();
+                                let skip = if is_sparse { zeros } else { 0 };
+                                if skip < data.len() {
+                                    dest.write_at(path, start + skip as u64, &data[skip..])
+                                        .unwrap();
                                 }
                                 p.inc(size);
                             });
@@ -764,6 +842,10 @@ fn restore_contents<S: Open>(
 /// 2) blob within this pack
 /// 3) the actual files and position of this blob within those
 /// 4) Statistical information
+///
+/// BackOtter: it also says which files are restored sparse: those the
+/// restore options and the files' `unix.sparse` marks make sparse, and only
+/// where nothing was at their path when the plan was made.
 #[derive(Debug, Default)]
 pub struct RestorePlan {
     /// The names of the files to restore
@@ -950,16 +1032,44 @@ mod tests {
         let by_content = Some(SparseRestore::ByContent);
 
         // Without --sparse, as before: files without the mark in full, ...
-        assert!(!write_sparse(None, &plain, false));
-        assert!(!write_sparse(Some(SparseRestore::No), &plain, false));
-        // ... those with it sparse.
-        assert!(write_sparse(None, &marked, false));
-        assert!(write_sparse(Some(SparseRestore::No), &marked, false));
+        assert!(!write_sparse(None, &plain, true));
+        assert!(!write_sparse(Some(SparseRestore::No), &plain, true));
+        // ... those with it sparse; --sparse no doesn't unmark them.
+        assert!(write_sparse(None, &marked, true));
+        assert!(write_sparse(Some(SparseRestore::No), &marked, true));
         // --sparse makes every file sparse.
-        assert!(write_sparse(by_content, &plain, false));
-        assert!(write_sparse(by_content, &marked, false));
+        assert!(write_sparse(by_content, &plain, true));
+        assert!(write_sparse(by_content, &marked, true));
         // A file that exists is written in full, whatever it was.
-        assert!(!write_sparse(None, &marked, true));
-        assert!(!write_sparse(by_content, &plain, true));
+        assert!(!write_sparse(None, &marked, false));
+        assert!(!write_sparse(by_content, &plain, false));
+    }
+
+    #[test]
+    fn numeric_ids_by_default() {
+        let opts = RestoreOptions::default();
+        assert_eq!(ownership(opts), Ownership::Numeric);
+        assert_eq!(ownership(opts.numeric_id(true)), Ownership::Numeric);
+        assert_eq!(ownership(opts.by_name(true)), Ownership::ByName);
+        assert_eq!(ownership(opts.no_ownership(true)), Ownership::None);
+    }
+
+    #[cfg(feature = "clap")]
+    #[test]
+    fn ownership_options() {
+        use clap::Parser;
+
+        let parse = |args: &[&str]| {
+            RestoreOptions::try_parse_from(std::iter::once("restore").chain(args.iter().copied()))
+        };
+        assert_eq!(ownership(parse(&[]).unwrap()), Ownership::Numeric);
+        assert_eq!(ownership(parse(&["--numeric-id"]).unwrap()), Ownership::Numeric);
+        assert_eq!(ownership(parse(&["--by-name"]).unwrap()), Ownership::ByName);
+        // restic's name for it.
+        assert_eq!(ownership(parse(&["--ownership-by-name"]).unwrap()), Ownership::ByName);
+        assert_eq!(ownership(parse(&["--no-ownership"]).unwrap()), Ownership::None);
+        assert!(parse(&["--by-name", "--numeric-id"]).is_err());
+        assert!(parse(&["--by-name", "--no-ownership"]).is_err());
+        assert!(parse(&["--ownership-by-name", "--numeric-id"]).is_err());
     }
 }

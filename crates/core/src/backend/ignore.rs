@@ -234,7 +234,7 @@ impl ReadSourceOpen for OpenFile {
     /// * If the file could not be opened.
     fn open(self) -> RusticResult<Self::Reader> {
         let path = self.0;
-        File::open(&path).map_err(|err| {
+        open_noatime(&path).map_err(|err| {
             RusticError::with_source(
                 ErrorKind::InputOutput,
                 "Failed to open file at `{path}`. Please make sure the file exists and is accessible.",
@@ -243,6 +243,27 @@ impl ReadSourceOpen for OpenFile {
             .attach_context("path", path.display().to_string())
         })
     }
+}
+
+/// BackOtter: opens the file at `path` for reading. On Linux without
+/// updating its access time (`O_NOATIME`), which a backup keeps, as
+/// BackOtter's restic does; that takes owning the file (or `CAP_FOWNER`),
+/// and without it the file is opened as usual.
+fn open_noatime(path: &Path) -> std::io::Result<File> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOATIME)
+            .open(path)
+        {
+            Err(err) if err.raw_os_error() == Some(libc::EPERM) => {}
+            result => return result,
+        }
+    }
+    File::open(path)
 }
 
 impl ReadSource for LocalSource {
