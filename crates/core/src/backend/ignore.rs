@@ -298,7 +298,15 @@ impl Iterator for LocalSourceWalker {
     fn next(&mut self) -> Option<Self::Item> {
         match self.walker.next() {
             // ignore root dir, i.e. an entry with depth 0 of type dir
-            Some(Ok(entry)) if entry.depth() == 0 && entry.file_type().unwrap().is_dir() => {
+            // BackOtter: ... unless it has a name. A directory backed up keeps
+            // its own metadata, as restic keeps it, for a restore of
+            // "SNAP:path" to give the destination; "/" has no node in a
+            // snapshot, in restic either.
+            Some(Ok(entry))
+                if entry.depth() == 0
+                    && entry.file_type().unwrap().is_dir()
+                    && entry.path().file_name().is_none() =>
+            {
                 self.walker.next()
             }
             item => item,

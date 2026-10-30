@@ -16,7 +16,7 @@ use crate::{
         file_archiver::FileArchiver, parent::Parent, tree::TreeIterator,
         tree_archiver::TreeArchiver,
     },
-    backend::{ReadSource, ReadSourceEntry, decrypt::DecryptFullBackend},
+    backend::{ReadSource, ReadSourceEntry, decrypt::DecryptFullBackend, node::Node},
     blob::BlobType,
     error::RusticResult,
     index::{
@@ -156,7 +156,8 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                     warn!("ignoring error: {}", err.display_log());
                     None
                 }
-                Ok(ReadSourceEntry { path, node, open }) => {
+                Ok(ReadSourceEntry { path, mut node, open }) => {
+                    let is_backup_path = path == backup_path;
                     let snapshot_path = if let Some(as_path) = as_path {
                         as_path
                             .clone()
@@ -164,6 +165,14 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                     } else {
                         path
                     };
+                    // BackOtter: the directory backed up itself, which
+                    // LocalSourceWalker keeps for its metadata, goes by the
+                    // name it's saved as ("--as-path"), and has no node
+                    // where that is the snapshot's root ("--as-path /").
+                    if is_backup_path && node.is_dir() {
+                        let name = snapshot_path.file_name()?;
+                        node = Node::new_node(name, node.node_type, node.meta);
+                    }
                     Some(if node.is_dir() {
                         (snapshot_path, node, open)
                     } else {

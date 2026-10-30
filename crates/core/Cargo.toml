@@ -107,6 +107,10 @@ smallvec = { version = "1.15.1", features = ["union"] }
 strum = { version = "0.28.0", features = ["derive"] }
 zstd = "0.13.3"
 
+[target.'cfg(not(windows))'.dependencies]
+# BackOtter: system calls for file flags and ACLs (backend/osattrs)
+libc = "0.2.180"
+
 [target.'cfg(not(any(windows, target_os="openbsd")))'.dependencies]
 # for local source/destination
 xattr = "1"

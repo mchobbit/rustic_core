@@ -25,6 +25,9 @@ expression: result
                     size: 0,
                     links: 0,
                     extended_attributes: [],
+                    generic_attributes: GenericAttributes(
+                        {},
+                    ),
                 },
                 content: None,
                 subtree: None,
@@ -52,6 +55,9 @@ expression: result
                     size: 0,
                     links: 0,
                     extended_attributes: [],
+                    generic_attributes: GenericAttributes(
+                        {},
+                    ),
                 },
                 content: None,
                 subtree: None,
@@ -79,6 +85,9 @@ expression: result
                     size: 0,
                     links: 0,
                     extended_attributes: [],
+                    generic_attributes: GenericAttributes(
+                        {},
+                    ),
                 },
                 content: None,
                 subtree: None,
@@ -107,6 +116,9 @@ expression: result
                     size: 0,
                     links: 0,
                     extended_attributes: [],
+                    generic_attributes: GenericAttributes(
+                        {},
+                    ),
                 },
                 content: None,
                 subtree: None,
@@ -137,6 +149,9 @@ expression: result
                     size: 0,
                     links: 0,
                     extended_attributes: [],
+                    generic_attributes: GenericAttributes(
+                        {},
+                    ),
                 },
                 content: None,
                 subtree: None,

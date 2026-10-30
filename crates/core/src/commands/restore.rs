@@ -6,7 +6,12 @@ use log::{debug, error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use std::{cmp::Ordering, collections::BTreeMap, path::PathBuf, sync::Mutex};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Mutex,
+};
 
 use itertools::Itertools;
 use rayon::ThreadPoolBuilder;
@@ -18,6 +23,7 @@ use crate::{
         decrypt::DecryptReadBackend,
         local_destination::LocalDestination,
         node::{Node, NodeType},
+        osattrs,
     },
     blob::{BlobLocation, BlobLocations},
     error::{ErrorKind, RusticError, RusticResult},
@@ -296,6 +302,14 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                     (false, AddFileResult::Modify) => {
                         stats.files.restore += 1;
                         debug!("to restore: {}", path.display());
+                        // BackOtter: flags a file system only takes on an
+                        // empty file (btrfs's no-copy-on-write) go on before
+                        // the contents.
+                        if !dry_run
+                            && let Err(err) = osattrs::prepare_file(&dest.path(path), node)
+                        {
+                            warn!("restore {}: {err}", path.display());
+                        }
                     }
                 }
             }
@@ -379,6 +393,20 @@ fn restore_metadata(
     opts: RestoreOptions,
     dest: &LocalDestination,
 ) -> RusticResult<()> {
+    // BackOtter: file flags go on last of all (osattrs), once per file:
+    // they belong to the file, not each of its names, and an immutable file
+    // (on illumos) refuses having them set again.
+    let mut file_flags = Vec::new();
+    let mut flags_linked = BTreeSet::new();
+    let mut finish = |path: &PathBuf, node: &Node| {
+        set_metadata(dest, opts, path, node);
+        if let Some(flags) = osattrs::file_flags(node)
+            && hardlink_key(node).is_none_or(|key| flags_linked.insert(key))
+        {
+            file_flags.push((path.clone(), node.node_type.clone(), flags));
+        }
+    };
+
     let mut dir_stack = Vec::new();
     while let Some((path, node)) = node_streamer.next().transpose()? {
         // Create hardlink directly, if this is one.
@@ -410,18 +438,23 @@ fn restore_metadata(
                         break;
                     }
                     let (path, node) = dir_stack.pop().unwrap();
-                    set_metadata(dest, opts, &path, &node);
+                    finish(&path, &node);
                 }
                 // push current path to the stack
                 dir_stack.push((path, node));
             }
-            _ => set_metadata(dest, opts, &path, &node),
+            _ => finish(&path, &node),
         }
     }
 
     // empty dir stack and set metadata
     for (path, node) in dir_stack.into_iter().rev() {
-        set_metadata(dest, opts, &path, &node);
+        finish(&path, &node);
+    }
+
+    for (path, node_type, flags) in file_flags {
+        osattrs::restore_file_flags(&dest.path(&path), &node_type, flags)
+            .unwrap_or_else(|err| warn!("restore {}: {err}", path.display()));
     }
 
     Ok(())
@@ -471,6 +504,12 @@ pub(crate) fn set_metadata(
     }
     dest.set_permission(path, node)
         .unwrap_or_else(|_| warn!("restore {}: chmod failed.", path.display()));
+    // BackOtter: the attributes osattrs keeps; ACLs after the mode.
+    let target = dest.path(path);
+    if node.is_symlink() {
+        osattrs::restore_symlink_mode(&target, node)
+            .unwrap_or_else(|err| warn!("restore {}: {err}", path.display()));
+    }
     dest.set_extended_attributes(path, &node.meta.extended_attributes)
         .unwrap_or_else(|_| {
             warn!(
@@ -478,6 +517,10 @@ pub(crate) fn set_metadata(
                 path.display()
             );
         });
+    osattrs::restore_attributes(&target, node)
+        .unwrap_or_else(|err| warn!("restore {}: {err}", path.display()));
+    osattrs::restore_acls(&target, node)
+        .unwrap_or_else(|err| warn!("restore {}: {err}", path.display()));
     dest.set_times(path, &node.meta)
         .unwrap_or_else(|_| warn!("restore {}: setting file times failed.", path.display()));
 }

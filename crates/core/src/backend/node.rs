@@ -1,3 +1,4 @@
+pub mod generic_attributes;
 pub mod modification;
 
 use std::{borrow::Cow, cmp::Ordering, ffi::OsStr, fmt::Debug, path::Path};
@@ -21,6 +22,7 @@ use serde_with::{
 };
 
 use crate::blob::{DataId, tree::TreeId};
+use generic_attributes::GenericAttributes;
 use crate::repofile::RusticTime;
 
 #[cfg(not(windows))]
@@ -273,6 +275,10 @@ pub struct Metadata {
     /// Extended attributes of the node
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extended_attributes: Vec<ExtendedAttribute>,
+    /// restic's generic attributes: metadata only some systems have (file
+    /// flags, ACLs, ...), see [`generic_attributes`]
+    #[serde(default, skip_serializing_if = "GenericAttributes::is_empty")]
+    pub generic_attributes: GenericAttributes,
 }
 
 pub(crate) fn is_default<T: Default + PartialEq>(t: &T) -> bool {
