@@ -44,7 +44,7 @@ that either program restores what the other backed up.
 - On illumos, extended attributes are named attribute files (`runat(1)`),
   which the xattr crate doesn't support: they are read and written through
   `openat(2)` with `O_XATTR`, without the `SUNWattr_ro` and `SUNWattr_rw`
-  system attribute views. (BackOtter's restic doesn't keep them yet.)
+  system attribute views, as BackOtter's restic does.
 - A file that can't have extended attributes (a FIFO on ZFS) has none,
   rather than a warning, as in restic.
 - A backup keeps the metadata of the directory it backs up (stock rustic
