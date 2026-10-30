@@ -36,6 +36,7 @@ use crate::backend::{
 
 pub(super) const FILE_FLAGS: Option<&str> = Some(FREEBSD_FILE_FLAGS);
 pub(super) const FLAGS_BEFORE_DATA: u32 = 0;
+pub(super) const FLAGS_BEFORE_ENTRIES: u32 = 0;
 
 // From <sys/stat.h>.
 const UF_SETTABLE: u32 = 0x0000_ffff; // the flags an owner may set
@@ -340,6 +341,10 @@ fn fill_acls(path: &Path, node: &mut Node) -> io::Result<()> {
 }
 
 pub(super) fn prepare_file_for_flags(_path: &Path, _flags: u32) -> io::Result<()> {
+    Ok(())
+}
+
+pub(super) fn prepare_dir_for_flags(_path: &Path, _flags: u32) -> io::Result<()> {
     Ok(())
 }
 

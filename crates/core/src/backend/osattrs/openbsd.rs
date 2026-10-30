@@ -7,6 +7,7 @@ use crate::backend::node::{Node, NodeType, generic_attributes::OPENBSD_FILE_FLAG
 
 pub(super) const FILE_FLAGS: Option<&str> = Some(OPENBSD_FILE_FLAGS);
 pub(super) const FLAGS_BEFORE_DATA: u32 = 0;
+pub(super) const FLAGS_BEFORE_ENTRIES: u32 = 0;
 
 /// From `<sys/stat.h>`: the flags an owner may set (nodump, immutable,
 /// append, opaque) and those only root may (archived, immutable, append; the
@@ -31,6 +32,10 @@ pub(super) fn fill_attributes(_path: &Path, _node: &mut Node) -> io::Result<()> 
 }
 
 pub(super) fn prepare_file_for_flags(_path: &Path, _flags: u32) -> io::Result<()> {
+    Ok(())
+}
+
+pub(super) fn prepare_dir_for_flags(_path: &Path, _flags: u32) -> io::Result<()> {
     Ok(())
 }
 

@@ -17,7 +17,9 @@ that either program restores what the other backed up.
   (`backend/node/generic_attributes.rs`), so they survive reading and writing
   trees, and a backup records these (`backend/osattrs/`):
   - `linux.inode_flags`: the `chattr(1)` flags (`FS_IOC_GETFLAGS`), limited
-    to those a user can set.
+    to those a user can set, and casefolding (`F`).
+  - `linux.project_id`: the project ID (`FS_IOC_FSGETXATTR`) that project
+    quotas count by, of regular files and directories.
   - `freebsd.file_flags`: FreeBSD's `chflags(1)` flags (`st_flags`); `uarch`
     only along with others, since ZFS sets it on every file.
   - `freebsd.acl_access`, `freebsd.acl_default`: POSIX.1e ACLs (UFS mounted
@@ -30,9 +32,30 @@ that either program restores what the other backed up.
     `S+v...`), as a mask; `archive` and `av_modified` only along with
     others, since ZFS sets them on every file.
   - `openbsd.file_flags`: OpenBSD's `chflags(1)` flags.
+  - `unix.sparse`: `true` for a regular file with holes, on every Unix:
+    fewer 512-byte blocks than bytes and, where the system has `SEEK_HOLE`
+    (Linux, FreeBSD, illumos), a hole before its end. Both
+    tests are needed: a file on a compressing file system has fewer blocks
+    and no holes, a preallocated one (a swap file) all its blocks and, to
+    `SEEK_HOLE`, holes. Where `SEEK_HOLE` can't say (NetBSD, OpenBSD, a file
+    system without it, a file that can't be opened), the blocks decide.
   A file only gets an attribute when it has something the mode doesn't say
-  (flags, a non-trivial ACL). A generic attribute rustic doesn't know at all
-  gets a warning, once; one of another system is skipped quietly.
+  (flags, a project ID, a non-trivial ACL, holes). A generic attribute
+  rustic doesn't know at all gets a warning, once; one of another system is
+  skipped quietly.
+- A backup keeps each file's access time, as BackOtter's restic does (stock
+  rustic stores the mtime there; `backup --set-atime mtime` still does).
+- A restore gives files the uid and gid they were saved with, as restic
+  does: stock rustic looks the owners' names up in the users of the system
+  it runs on, which on a rescue system are the wrong ones. `restore
+  --by-name` looks them up by name; `--numeric-id` is still accepted.
+- A file backed up with holes (`unix.sparse`) is restored sparse, its zero
+  chunks as holes, as `restore --sparse by-content` restores every file. Any
+  other file is written out in full, zeros and all, so that a swap file or
+  a preallocated file comes back allocated; snapshots without the mark
+  restore as they did. A file that exists already is always written in
+  full: stock rustic's `--sparse by-content` left its old contents where a
+  zero chunk went.
 - On FreeBSD and NetBSD, extended attributes are named as restic names them:
   the user namespace only, under bare names (stock rustic keeps both
   namespaces, as `user.NAME` and `system.NAME`, and restores the system
@@ -55,16 +78,21 @@ that either program restores what the other backed up.
 - A regular file without a mode is restored with permissions 0000: restic
   leaves a mode of 0 out of its JSON, so stock rustic leaves such a file
   (`/etc/shadow`) with the 0644 it was created with.
-- On restore, ACLs are set after the mode, which rewrites NFSv4 ACLs, and
-  file flags after everything else (contents, hard links, ownership, xattrs,
-  timestamps, mode, ACLs), once per hard-linked file, since an immutable or
-  append-only file refuses most of those. Where the target file system
-  doesn't support a flag, the others are still set and the restore warns
-  about that one. Where it doesn't support a POSIX.1e ACL, the restore warns
-  and narrows the group bits to the owning group's own access, so a file
-  never comes back more open.
+- On restore, the project ID is set along with the extended attributes,
+  ACLs after the mode, which rewrites NFSv4 ACLs, and file flags after
+  everything else (contents, hard links, ownership, xattrs, timestamps,
+  mode, ACLs), once per hard-linked file, since an immutable or append-only
+  file refuses most of those. Where the target file system doesn't support
+  a flag, the others are still set and the restore warns about that one.
+  Where it doesn't support a POSIX.1e ACL, the restore warns and narrows the
+  group bits to the owning group's own access, so a file never comes back
+  more open. Flags a file has already aren't set again: on btrfs every
+  `FS_IOC_SETFLAGS` rewrites the `btrfs.compression` property (restored as
+  an extended attribute), or deletes it.
 - btrfs's no-copy-on-write flag is set while a new file is still empty: btrfs
-  ignores it on a file with data.
+  ignores it on a file with data. Likewise casefolding goes on a directory
+  the restore creates before anything goes in: ext4 and f2fs refuse it on a
+  directory with entries.
 - On FreeBSD a restored symlink keeps its own permissions (`lchmod(2)`).
 - The version reads `X.Y.Z+backotter.N`.
 

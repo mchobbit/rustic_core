@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Linux's `chattr(1)` flags (`FS_IOC_GETFLAGS`), those a user can set.
 pub const LINUX_INODE_FLAGS: &str = "linux.inode_flags";
+/// Linux's project ID (`FS_IOC_FSGETXATTR`'s `fsx_projid`), for project
+/// quotas: a number, when it isn't 0.
+pub const LINUX_PROJECT_ID: &str = "linux.project_id";
+/// A regular file with holes (`true`), which the restore makes sparse again;
+/// any other file it writes out in full, allocated.
+pub const UNIX_SPARSE: &str = "unix.sparse";
 /// FreeBSD's `chflags(1)` flags (`st_flags`).
 pub const FREEBSD_FILE_FLAGS: &str = "freebsd.file_flags";
 /// FreeBSD's extended attributes in the system namespace.
@@ -33,6 +39,8 @@ pub const KNOWN: &[&str] = &[
     "windows.file_attributes",
     "windows.security_descriptor",
     LINUX_INODE_FLAGS,
+    LINUX_PROJECT_ID,
+    UNIX_SPARSE,
     FREEBSD_FILE_FLAGS,
     FREEBSD_SYSTEM_EXTATTRS,
     FREEBSD_ACL_ACCESS,
@@ -80,11 +88,12 @@ impl GenericAttributes {
         Ok(())
     }
 
-    /// The file flags in the attribute `name`, if there are any.
+    /// The number (file flags, a project ID) in the attribute `name`, if
+    /// there is one.
     #[must_use]
-    pub fn file_flags(&self, name: &str) -> Option<u32> {
+    pub fn number(&self, name: &str) -> Option<u32> {
         match self.get(name)? {
-            Ok(flags) => Some(flags),
+            Ok(n) => Some(n),
             Err(err) => {
                 log::warn!("ignoring generic attribute {name}: {err}");
                 None
@@ -92,12 +101,31 @@ impl GenericAttributes {
         }
     }
 
-    /// Stores file flags as the attribute `name`. A file without flags gets
-    /// no attribute, so its node is the same as without flag support.
-    pub fn set_file_flags(&mut self, name: &str, flags: u32) {
-        if flags != 0 {
-            _ = self.0.insert(name.to_string(), flags.into());
+    /// Stores a number (file flags, a project ID) as the attribute `name`. A
+    /// file without flags gets no attribute, so its node is the same as
+    /// without flag support.
+    pub fn set_number(&mut self, name: &str, n: u32) {
+        if n != 0 {
+            _ = self.0.insert(name.to_string(), n.into());
         }
+    }
+
+    /// Whether the attribute `name` (`unix.sparse`) is there and `true`.
+    #[must_use]
+    pub fn is_true(&self, name: &str) -> bool {
+        match self.get(name) {
+            None => false,
+            Some(Ok(b)) => b,
+            Some(Err(err)) => {
+                log::warn!("ignoring generic attribute {name}: {err}");
+                false
+            }
+        }
+    }
+
+    /// Stores `true` as the attribute `name` (`unix.sparse`).
+    pub fn set_true(&mut self, name: &str) {
+        _ = self.0.insert(name.to_string(), true.into());
     }
 }
 
@@ -133,7 +161,7 @@ mod tests {
     fn restic_node_round_trips() {
         let node: Node = serde_json::from_str(RESTIC_NODE).unwrap();
         let attrs = &node.meta.generic_attributes;
-        assert_eq!(attrs.file_flags(FREEBSD_FILE_FLAGS), Some(131_072));
+        assert_eq!(attrs.number(FREEBSD_FILE_FLAGS), Some(131_072));
         let acl: serde_json::Value = attrs.get(FREEBSD_ACL_NFS4).unwrap().unwrap();
         assert_eq!(acl[0]["id"], 4_294_967_295_u32);
 
@@ -144,9 +172,35 @@ mod tests {
     #[test]
     fn no_flags_no_attribute() {
         let mut attrs = GenericAttributes::default();
-        attrs.set_file_flags(LINUX_INODE_FLAGS, 0);
+        attrs.set_number(LINUX_INODE_FLAGS, 0);
+        attrs.set_number(LINUX_PROJECT_ID, 0);
         assert!(attrs.is_empty());
+        assert!(!attrs.is_true(UNIX_SPARSE));
         let node = Node::default();
         assert!(!serde_json::to_string(&node).unwrap().contains("generic_attributes"));
+    }
+
+    // The JSON BackOtter's restic writes for a sparse file with a project ID.
+    #[test]
+    fn sparse_and_project_id_json() {
+        let mut node = Node::default();
+        let attrs = &mut node.meta.generic_attributes;
+        attrs.set_true(UNIX_SPARSE);
+        attrs.set_number(LINUX_PROJECT_ID, 4_000_000_000);
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(
+            json.contains(r#""generic_attributes":{"linux.project_id":4000000000,"unix.sparse":true}"#),
+            "{json}"
+        );
+
+        let node: Node = serde_json::from_str(&json).unwrap();
+        let attrs = &node.meta.generic_attributes;
+        assert!(attrs.is_true(UNIX_SPARSE));
+        assert_eq!(attrs.number(LINUX_PROJECT_ID), Some(4_000_000_000));
+
+        let node: Node =
+            serde_json::from_str(r#"{"name":"f","type":"file","generic_attributes":{"unix.sparse":false}}"#)
+                .unwrap();
+        assert!(!node.meta.generic_attributes.is_true(UNIX_SPARSE));
     }
 }

@@ -9,6 +9,9 @@
 //! file flags last of all, once every file has its contents, hard links and
 //! other metadata: an immutable file refuses new hard links, times and
 //! permissions, and an immutable directory new entries.
+//!
+//! Every Unix also marks regular files with holes (`unix.sparse`), for the
+//! restore to make them sparse again.
 
 // System calls and ioctls rustic's dependencies don't wrap.
 #![allow(unsafe_code)]
@@ -17,11 +20,16 @@ use std::{collections::BTreeSet, io, path::Path, sync::Mutex};
 
 use log::warn;
 
-use crate::backend::node::{Node, NodeType, generic_attributes::KNOWN};
+use crate::backend::node::{
+    Node, NodeType,
+    generic_attributes::{KNOWN, UNIX_SPARSE},
+};
 
 mod freebsd_acl;
 mod illumos_acl;
 mod illumos_sysattr;
+#[cfg(unix)]
+mod sparse;
 
 #[cfg(target_os = "freebsd")]
 mod freebsd;
@@ -60,18 +68,28 @@ use other as os;
 pub(crate) fn fill(path: &Path, node: &mut Node, m: &std::fs::Metadata) {
     if let Some(name) = os::FILE_FLAGS {
         match os::file_flags(path, &node.node_type, m) {
-            Ok(flags) => node.meta.generic_attributes.set_file_flags(name, flags),
+            Ok(flags) => node.meta.generic_attributes.set_number(name, flags),
             Err(err) => warn!("ignoring file flags of {}: {err}", path.display()),
         }
     }
     if let Err(err) = os::fill_attributes(path, node) {
         warn!("ignoring attributes of {}: {err}", path.display());
     }
+    // A regular file, not a block device saved as one.
+    #[cfg(unix)]
+    if node.is_file() && m.is_file() && sparse::has_holes(path, m) {
+        node.meta.generic_attributes.set_true(UNIX_SPARSE);
+    }
+}
+
+/// Whether the file `node` had holes when it was backed up.
+pub(crate) fn is_sparse(node: &Node) -> bool {
+    node.meta.generic_attributes.is_true(UNIX_SPARSE)
 }
 
 /// The file flags `node` holds for this system, if any.
 pub(crate) fn file_flags(node: &Node) -> Option<u32> {
-    os::FILE_FLAGS.and_then(|name| node.meta.generic_attributes.file_flags(name))
+    os::FILE_FLAGS.and_then(|name| node.meta.generic_attributes.number(name))
 }
 
 /// Creates an empty file at `path` with those of `node`'s flags that a file
@@ -86,6 +104,23 @@ pub(crate) fn prepare_file(path: &Path, node: &Node) -> io::Result<()> {
     match file_flags(node) {
         Some(flags) if flags & os::FLAGS_BEFORE_DATA != 0 => {
             os::prepare_file_for_flags(path, flags & os::FLAGS_BEFORE_DATA)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Gives the new, empty directory at `path` those of `node`'s flags that a
+/// file system only takes while a directory is empty (casefolding, on ext4
+/// and f2fs), before the restore puts anything in it. Flags the file system
+/// doesn't support are left for [`restore_file_flags`] to report.
+///
+/// # Errors
+///
+/// * If the flags couldn't be set.
+pub(crate) fn prepare_dir(path: &Path, node: &Node) -> io::Result<()> {
+    match file_flags(node) {
+        Some(flags) if flags & os::FLAGS_BEFORE_ENTRIES != 0 => {
+            os::prepare_dir_for_flags(path, flags & os::FLAGS_BEFORE_ENTRIES)
         }
         _ => Ok(()),
     }
