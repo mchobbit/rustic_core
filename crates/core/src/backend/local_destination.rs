@@ -551,7 +551,7 @@ impl LocalDestination {
         extended_attributes: &[ExtendedAttribute],
         _stock_names: bool,
     ) -> LocalDestinationResult<()> {
-        osattrs::set_native_xattrs(&self.path(item), extended_attributes)
+        osattrs::set_native_xattrs(&self.path(item)?, extended_attributes)
             .map_err(LocalDestinationErrorKind::XattrsNotSet)
     }
 
@@ -911,7 +911,7 @@ impl LocalDestination {
         offset: u64,
         data: &[u8],
     ) -> LocalDestinationResult<()> {
-        let filename = self.path(item);
+        let filename = self.path(item)?;
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
