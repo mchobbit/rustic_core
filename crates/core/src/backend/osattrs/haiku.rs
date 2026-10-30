@@ -27,6 +27,8 @@ use crate::backend::node::{
 
 pub(super) const FILE_FLAGS: Option<&str> = None;
 pub(super) const FLAGS_BEFORE_DATA: u32 = 0;
+pub(super) const FLAGS_BEFORE_ENTRIES: u32 = 0;
+pub(super) const FLAGS_XATTRS: &[&str] = &[];
 
 /// Errors that mean the file system has no attributes.
 fn unsupported(err: &io::Error) -> bool {
@@ -226,7 +228,18 @@ fn apply(path: &Path, want: &BTreeMap<String, Attr>, xattrs: bool) -> io::Result
     .map_err(|err| path_error("attributes of", path, &err))
 }
 
-pub(super) fn file_flags(_path: &Path, _typ: &NodeType, _m: &std::fs::Metadata) -> io::Result<u32> {
+/// The attributes are read by path in `fill_attributes`: no file opened for
+/// them here.
+pub(super) fn open_for_attrs(_path: &Path, _typ: &NodeType, _m: &std::fs::Metadata) -> Option<File> {
+    None
+}
+
+pub(super) fn file_flags(
+    _path: &Path,
+    _typ: &NodeType,
+    _m: &std::fs::Metadata,
+    _f: Option<&File>,
+) -> io::Result<u32> {
     Ok(0)
 }
 
@@ -234,7 +247,7 @@ pub(super) fn file_flags(_path: &Path, _typ: &NodeType, _m: &std::fs::Metadata) 
 /// types, as `haiku.attributes`: an empty object for a file that has none,
 /// so that a restore removes any it has then, as from a snapshot that
 /// doesn't know (one made on another system) it doesn't.
-pub(super) fn fill_attributes(path: &Path, node: &mut Node) -> io::Result<()> {
+pub(super) fn fill_attributes(path: &Path, node: &mut Node, _f: Option<&File>) -> io::Result<()> {
     let Some(attrs) = kept(path, false)? else {
         return Ok(());
     };
@@ -248,7 +261,16 @@ pub(super) fn prepare_file_for_flags(_path: &Path, _flags: u32) -> io::Result<()
     Ok(())
 }
 
-pub(super) fn restore_file_flags(_path: &Path, _typ: &NodeType, _flags: u32) -> io::Result<()> {
+pub(super) fn prepare_dir_for_flags(_path: &Path, _flags: u32) -> io::Result<()> {
+    Ok(())
+}
+
+pub(super) fn restore_file_flags(
+    _path: &Path,
+    _typ: &NodeType,
+    _flags: u32,
+    _xattrs: &[ExtendedAttribute],
+) -> io::Result<()> {
     Ok(())
 }
 
@@ -336,7 +358,7 @@ mod tests {
     fn round_trip(path: &Path, want: &BTreeMap<String, Attr>) {
         restore_attributes(path, &node_with(want)).unwrap();
         let mut node = Node::default();
-        fill_attributes(path, &mut node).unwrap();
+        fill_attributes(path, &mut node, None).unwrap();
         let got: Attrs = node
             .meta
             .generic_attributes
@@ -438,7 +460,7 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
         // Readable: backed up all the same.
         let mut node = Node::default();
-        fill_attributes(&file, &mut node).unwrap();
+        fill_attributes(&file, &mut node, None).unwrap();
         assert!(
             node.meta
                 .generic_attributes
@@ -457,7 +479,7 @@ mod tests {
         // SAFETY: c_fifo is a C string.
         assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o644) }, 0);
         let mut node = Node::default();
-        fill_attributes(&fifo, &mut node).unwrap();
+        fill_attributes(&fifo, &mut node, None).unwrap();
         assert!(node.meta.generic_attributes.is_empty());
         assert!(xattrs(&fifo).unwrap().is_empty());
         restore_attributes(&fifo, &node_with(&BTreeMap::new())).unwrap();
