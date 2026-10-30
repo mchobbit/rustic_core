@@ -42,7 +42,9 @@ pub enum BlockdevOption {
 #[non_exhaustive]
 /// [`LocalSourceSaveOptions`] describes how entries from a local source will be saved in the repository.
 pub struct LocalSourceSaveOptions {
-    /// Set access time [default: mtime]
+    // BackOtter: the real access time by default, as BackOtter's restic
+    // keeps it (stock rustic stores the mtime).
+    /// Set access time [default: yes]
     #[cfg_attr(feature = "clap", clap(long))]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
     pub set_atime: Option<TimeOption>,
@@ -93,7 +95,7 @@ impl LocalSourceSaveOptions {
         let atime = || m.accessed().ok().and_then(|t| Timestamp::try_from(t).ok());
         let atime = self
             .set_atime
-            .unwrap_or(TimeOption::Mtime)
+            .unwrap_or(TimeOption::Yes)
             .map_or_else(atime, mtime);
         let ctime = || Self::ctime(&m);
         let ctime = self
