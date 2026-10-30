@@ -69,6 +69,7 @@ pub enum LocalDestinationErrorKind {
     #[cfg(any(
         target_os = "macos",
         target_os = "openbsd",
+        target_os = "haiku",
         all(target_os = "android", target_pointer_width = "32")
     ))]
     /// `DeviceID` could not be converted to other type `{target}` of device `{device}`: `{source}`
@@ -730,10 +731,12 @@ impl LocalDestination {
                 #[cfg(not(any(
                     target_os = "macos",
                     target_os = "openbsd",
+                    target_os = "haiku",
                     all(target_os = "android", target_pointer_width = "32")
                 )))]
                 let device = *device;
-                #[cfg(any(target_os = "macos", target_os = "openbsd"))]
+                // BackOtter: Haiku's dev_t is an i32 too.
+                #[cfg(any(target_os = "macos", target_os = "openbsd", target_os = "haiku"))]
                 let device = i32::try_from(*device).map_err(|err| {
                     LocalDestinationErrorKind::DeviceIdConversionFailed {
                         target: "i32".to_string(),
@@ -756,10 +759,12 @@ impl LocalDestination {
                 #[cfg(not(any(
                     target_os = "macos",
                     target_os = "openbsd",
+                    target_os = "haiku",
                     all(target_os = "android", target_pointer_width = "32")
                 )))]
                 let device = *device;
-                #[cfg(any(target_os = "macos", target_os = "openbsd"))]
+                // BackOtter: Haiku's dev_t is an i32 too.
+                #[cfg(any(target_os = "macos", target_os = "openbsd", target_os = "haiku"))]
                 let device = i32::try_from(*device).map_err(|err| {
                     LocalDestinationErrorKind::DeviceIdConversionFailed {
                         target: "i32".to_string(),
