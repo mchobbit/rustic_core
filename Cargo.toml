@@ -7,6 +7,14 @@ members = [
   "examples/*",
 ]
 resolver = "3"
+# BackOtter: walkdir 2.5.0 with directories read without updating their
+# access times on Linux (vendor/walkdir/README.md); not a member.
+exclude = ["vendor/walkdir"]
+
+[patch.crates-io]
+# BackOtter: see vendor/walkdir/README.md. It reaches the ignore crate's
+# walker too, which a backup reads directories with.
+walkdir = { path = "vendor/walkdir" }
 
 [workspace.package]
 rust-version = "1.91.0"
