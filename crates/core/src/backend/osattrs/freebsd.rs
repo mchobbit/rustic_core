@@ -26,7 +26,7 @@ use super::{
 use crate::backend::{
     ignore::mapper::nix_mapper::map_mode_from_go,
     node::{
-        Node, NodeType,
+        ExtendedAttribute, Node, NodeType,
         generic_attributes::{
             FREEBSD_ACL_ACCESS, FREEBSD_ACL_DEFAULT, FREEBSD_ACL_NFS4, FREEBSD_FILE_FLAGS,
             FREEBSD_SYSTEM_EXTATTRS,
@@ -37,6 +37,7 @@ use crate::backend::{
 pub(super) const FILE_FLAGS: Option<&str> = Some(FREEBSD_FILE_FLAGS);
 pub(super) const FLAGS_BEFORE_DATA: u32 = 0;
 pub(super) const FLAGS_BEFORE_ENTRIES: u32 = 0;
+pub(super) const FLAGS_XATTRS: &[&str] = &[];
 
 // From <sys/stat.h>.
 const UF_SETTABLE: u32 = 0x0000_ffff; // the flags an owner may set
@@ -251,7 +252,21 @@ fn set_system_extattr(path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
 #[serde(transparent)]
 struct SystemExtattrs(#[serde_as(as = "BTreeMap<_, DefaultOnNull<Base64>>")] BTreeMap<String, Vec<u8>>);
 
-pub(super) fn file_flags(_path: &Path, _typ: &NodeType, m: &std::fs::Metadata) -> io::Result<u32> {
+/// No file is opened for its attributes ahead of them here.
+pub(super) fn open_for_attrs(
+    _path: &Path,
+    _typ: &NodeType,
+    _m: &std::fs::Metadata,
+) -> Option<std::fs::File> {
+    None
+}
+
+pub(super) fn file_flags(
+    _path: &Path,
+    _typ: &NodeType,
+    m: &std::fs::Metadata,
+    _f: Option<&std::fs::File>,
+) -> io::Result<u32> {
     let flags = m.st_flags() & KEPT_FLAGS;
     // ZFS sets UF_ARCHIVE on every file it writes, as Windows does its
     // archive bit. On its own it would give nearly every file an attribute,
@@ -263,7 +278,11 @@ pub(super) fn file_flags(_path: &Path, _typ: &NodeType, m: &std::fs::Metadata) -
     Ok(flags)
 }
 
-pub(super) fn fill_attributes(path: &Path, node: &mut Node) -> io::Result<()> {
+pub(super) fn fill_attributes(
+    path: &Path,
+    node: &mut Node,
+    _f: Option<&std::fs::File>,
+) -> io::Result<()> {
     let extattrs = fill_system_extattrs(path, node);
     let acls = fill_acls(path, node);
     extattrs.and(acls)
@@ -348,18 +367,22 @@ pub(super) fn prepare_dir_for_flags(_path: &Path, _flags: u32) -> io::Result<()>
     Ok(())
 }
 
-pub(super) fn restore_file_flags(path: &Path, _typ: &NodeType, flags: u32) -> io::Result<()> {
+pub(super) fn restore_file_flags(
+    path: &Path,
+    _typ: &NodeType,
+    flags: u32,
+    _xattrs: &[ExtendedAttribute],
+) -> io::Result<()> {
     // Leave the flags that aren't kept as the file has them.
     let own = std::fs::symlink_metadata(path)
         .map_err(|err| path_error("lstat", path, &err))?
         .st_flags()
         & !KEPT_FLAGS;
     let p = c_path(path)?;
-    set_flags_best_effort(flags & KEPT_FLAGS, |bits| {
+    set_flags_best_effort(FREEBSD_FILE_FLAGS, path, "lchflags", flags & KEPT_FLAGS, |bits| {
         // SAFETY: p is a C string.
         check(unsafe { libc::lchflags(p.as_ptr(), (own | bits).into()) }).map(drop)
     })
-    .map_err(|err| path_error("lchflags", path, &err))
 }
 
 /// Restores the system extended attributes.
