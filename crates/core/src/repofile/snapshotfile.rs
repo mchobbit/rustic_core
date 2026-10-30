@@ -1381,10 +1381,7 @@ mod tests {
             .sanitize()
             .unwrap_err();
 
-        assert!(
-            err.to_string()
-                .contains(&missing_path.display().to_string())
-        );
+        assert!(err.to_string().contains(&format!("{missing_path:?}")));
         assert!(matches!(
             err,
             SnapshotFileErrorKind::CanonicalizingPathFailed(path, _) if path == missing_path
