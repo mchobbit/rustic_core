@@ -32,6 +32,9 @@ that either program restores what the other backed up.
     `S+v...`), as a mask; `archive` and `av_modified` only along with
     others, since ZFS sets them on every file.
   - `openbsd.file_flags`: OpenBSD's `chflags(1)` flags.
+  - `haiku.attributes`: Haiku's file attributes (BFS, `listattr(1)`) other
+    than its extended attributes (below), with their type codes. BackOtter's
+    rustic alone writes it, since restic doesn't run on Haiku.
   - `unix.sparse`: `true` for a regular file with holes, on every Unix, by
     the rule BackOtter's restic follows too, from the file's lstat:
     1. If its size is 0, or its 512-byte blocks cover its size, it has
@@ -55,9 +58,9 @@ that either program restores what the other backed up.
     written (a transaction group), as it does for BackOtter's restic, which
     probes the same files.
   A file only gets an attribute when it has something the mode doesn't say
-  (flags, a project ID, a non-trivial ACL, holes). A generic attribute
-  rustic doesn't know at all gets a warning, once; one of another system is
-  skipped quietly. A known attribute with a value that can't be read
+  (flags, a project ID, a non-trivial ACL, holes, typed attributes). A
+  generic attribute rustic doesn't know at all gets a warning, once; one of
+  another system is skipped quietly. A known attribute with a value that can't be read
   (`linux.inode_flags`, `linux.project_id`, `unix.sparse`, `*.file_flags`)
   is skipped with a warning once per attribute name, as in BackOtter's
   restic; it isn't an error. A project ID of 0 is left as the file has it.
@@ -112,6 +115,31 @@ that either program restores what the other backed up.
   which the xattr crate doesn't support: they are read and written through
   `openat(2)` with `O_XATTR`, without the `SUNWattr_ro` and `SUNWattr_rw`
   system attribute views, as BackOtter's restic does.
+- On Haiku, every file, directory and symlink can have attributes, each
+  with a name, a type code and data, which the xattr crate doesn't support.
+  They are read and written through `fs_fopen_attr_dir(3)`,
+  `fs_read_attr(3)` and the rest, on the file itself (`O_NOTRAVERSE`, so a
+  symlink's own), and split by type, so that none is stored twice:
+  - those of type `B_XATTR_TYPE` (`'XATR'`) are the extended attributes,
+    under their names as they are: Haiku's own xattr functions
+    (`getxattr(3)` in libgnu) write their attributes so, and read them so.
+    A Haiku snapshot restores them as extended attributes anywhere, and
+    another system's extended attributes come back on Haiku as attributes
+    of type `B_XATTR_TYPE`. (libgnu's names for the other attributes,
+    `user.haiku.NAME#TYPE`, are not decoded: such an extended attribute
+    comes back under that name, of type `B_XATTR_TYPE`.)
+  - all the others are the generic attribute `haiku.attributes`, an object
+    with an entry for each, by name: `{"type": TYPE, "value": "DATA"}`, the
+    type code a number (the four characters read as a big-endian `uint32`:
+    `'MIMS'` is 1296649555) and the data in base64 (null or none for empty),
+    as in `{"BEOS:TYPE":{"type":1296649555,"value":"dGV4dC9wbGFpbgA="}}`.
+    Other systems skip it quietly.
+  A restore gives a file exactly the attributes of each kind that the
+  snapshot has, as with extended attributes on other systems: one it has
+  that the snapshot doesn't is removed, and one of another type replaced.
+  An attribute whose name isn't UTF-8 is left out of a backup with a
+  warning. A FIFO's or device's attributes aren't kept. Haiku's creation
+  time (`st_crtim`) isn't kept, as rustic keeps none anywhere.
 - A file that can't have extended attributes (a FIFO on ZFS) has none,
   rather than a warning, as in restic.
 - A backup keeps the metadata of the directory it backs up (stock rustic

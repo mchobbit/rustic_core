@@ -10,7 +10,7 @@ use std::{
 
 use bytes::Bytes;
 use filetime::{FileTime, set_symlink_file_times};
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
 use log::warn;
 #[cfg(not(windows))]
 use nix::errno::Errno;
@@ -89,7 +89,7 @@ pub enum LocalDestinationErrorKind {
     #[cfg(not(windows))]
     FromErrnoError(Errno),
     /// listing xattrs on `{path:?}`: `{source:?}`
-    #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
+    #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
     ListingXattrsFailed {
         path: PathBuf,
         source: std::io::Error,
@@ -102,7 +102,7 @@ pub enum LocalDestinationErrorKind {
         source: std::io::Error,
     },
     /// getting xattr `{name}` on `{filename:?}` with `{source:?}`
-    #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
+    #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
     GettingXattrFailed {
         name: String,
         filename: PathBuf,
@@ -490,10 +490,10 @@ impl LocalDestination {
         Ok(())
     }
 
-    #[cfg(target_os = "illumos")]
+    #[cfg(any(target_os = "illumos", target_os = "haiku"))]
     /// BackOtter: set extended attributes for `item` (relative to the base
-    /// path): on illumos, named attribute files (osattrs), which the xattr
-    /// crate doesn't support.
+    /// path): on illumos, named attribute files, and on Haiku, attributes of
+    /// type `B_XATTR_TYPE` (osattrs), which the xattr crate doesn't support.
     ///
     /// # Errors
     ///
@@ -504,7 +504,7 @@ impl LocalDestination {
         extended_attributes: &[ExtendedAttribute],
     ) -> LocalDestinationResult<()> {
         let filename = self.path(item);
-        osattrs::set_illumos_xattrs(&filename, extended_attributes).map_err(|err| {
+        osattrs::set_native_xattrs(&filename, extended_attributes).map_err(|err| {
             LocalDestinationErrorKind::SettingXattrFailed {
                 name: String::new(),
                 filename,
@@ -513,7 +513,7 @@ impl LocalDestination {
         })
     }
 
-    #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
+    #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
     /// Set extended attributes for `item` (relative to the base path)
     ///
     /// # Arguments

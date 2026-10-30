@@ -36,9 +36,14 @@ pub const ILLUMOS_ACL: &str = "illumos.acl";
 pub const ILLUMOS_SYSTEM_ATTRIBUTES: &str = "illumos.system_attributes";
 /// OpenBSD's `chflags(1)` flags (`st_flags`).
 pub const OPENBSD_FILE_FLAGS: &str = "openbsd.file_flags";
+/// Haiku's file attributes (BFS), with their type codes, other than those
+/// of type `B_XATTR_TYPE`, which are the extended attributes: an object of
+/// `{"NAME":{"type":TYPE_CODE,"value":"BASE64"}}`.
+pub const HAIKU_ATTRIBUTES: &str = "haiku.attributes";
 
-/// The generic attributes restic and BackOtter's restic know: an attribute
-/// of another system is skipped quietly, an unknown one with a warning.
+/// The generic attributes restic and BackOtter's restic know, and Haiku's
+/// (restic doesn't run on Haiku): an attribute of another system is skipped
+/// quietly, an unknown one with a warning.
 pub const KNOWN: &[&str] = &[
     "windows.creation_time",
     "windows.file_attributes",
@@ -54,6 +59,7 @@ pub const KNOWN: &[&str] = &[
     ILLUMOS_ACL,
     ILLUMOS_SYSTEM_ATTRIBUTES,
     OPENBSD_FILE_FLAGS,
+    HAIKU_ATTRIBUTES,
 ];
 
 /// A node's generic attributes, by name.

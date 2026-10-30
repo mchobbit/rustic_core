@@ -1,7 +1,8 @@
 //! BackOtter: metadata some systems keep that rustic otherwise doesn't save:
 //! file flags (Linux's `chattr(1)` flags, the BSDs' `chflags(1)` flags,
-//! illumos' system attributes), ACLs (FreeBSD's and illumos') and FreeBSD's
-//! system extended attributes. They are kept as restic generic attributes
+//! illumos' system attributes), ACLs (FreeBSD's and illumos'), FreeBSD's
+//! system extended attributes and Haiku's typed file attributes. They are
+//! kept as restic generic attributes
 //! ([`generic_attributes`](super::node::generic_attributes)), in the same
 //! form as BackOtter's restic.
 //!
@@ -33,6 +34,7 @@ use crate::backend::node::{
 };
 
 mod freebsd_acl;
+mod haiku_attrs;
 mod illumos_acl;
 mod illumos_sysattr;
 #[cfg(unix)]
@@ -42,6 +44,10 @@ mod sparse;
 mod freebsd;
 #[cfg(target_os = "freebsd")]
 use freebsd as os;
+#[cfg(target_os = "haiku")]
+mod haiku;
+#[cfg(target_os = "haiku")]
+use haiku as os;
 #[cfg(target_os = "illumos")]
 mod illumos;
 #[cfg(target_os = "illumos")]
@@ -56,6 +62,7 @@ mod openbsd;
 use openbsd as os;
 #[cfg(not(any(
     target_os = "freebsd",
+    target_os = "haiku",
     target_os = "illumos",
     target_os = "linux",
     target_os = "openbsd"
@@ -63,6 +70,7 @@ use openbsd as os;
 mod other;
 #[cfg(not(any(
     target_os = "freebsd",
+    target_os = "haiku",
     target_os = "illumos",
     target_os = "linux",
     target_os = "openbsd"
@@ -354,8 +362,8 @@ pub(crate) fn report_unsupported() {
 }
 
 /// Restores the attributes that go along with the extended attributes
-/// (FreeBSD's system extended attributes), and warns once about each generic
-/// attribute that isn't known at all.
+/// (FreeBSD's system extended attributes, Haiku's typed attributes), and
+/// warns once about each generic attribute that isn't known at all.
 ///
 /// # Errors
 ///
@@ -385,25 +393,26 @@ pub(crate) fn restore_symlink_mode(path: &Path, node: &Node) -> io::Result<()> {
     os::restore_symlink_mode(path, node)
 }
 
-/// The extended attributes of the file at `path`, on illumos: named
-/// attribute files (`runat(1)`), which the xattr crate doesn't support.
+/// The extended attributes of the file at `path`, where the xattr crate
+/// doesn't support them: on illumos, named attribute files (`runat(1)`); on
+/// Haiku, the file's attributes of type `B_XATTR_TYPE`.
 ///
 /// # Errors
 ///
 /// * If they can't be read.
-#[cfg(target_os = "illumos")]
-pub(crate) fn illumos_xattrs(path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
+#[cfg(any(target_os = "illumos", target_os = "haiku"))]
+pub(crate) fn native_xattrs(path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
     os::xattrs(path)
 }
 
 /// Gives the file at `path` exactly the extended attributes `attrs`, on
-/// illumos.
+/// illumos and Haiku.
 ///
 /// # Errors
 ///
 /// * If they can't be set, or the file system has none.
-#[cfg(target_os = "illumos")]
-pub(crate) fn set_illumos_xattrs(
+#[cfg(any(target_os = "illumos", target_os = "haiku"))]
+pub(crate) fn set_native_xattrs(
     path: &Path,
     attrs: &[ExtendedAttribute],
 ) -> io::Result<()> {
@@ -418,7 +427,7 @@ pub(crate) fn set_illumos_xattrs(
 /// # Errors
 ///
 /// * If they can't be listed.
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
 pub(crate) fn xattr_list(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
     #[cfg(target_os = "freebsd")]
     let names = os::user_extattr_names(path)?
@@ -435,7 +444,7 @@ pub(crate) fn xattr_list(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
 /// attribute. On FreeBSD and NetBSD restic keeps the user namespace only,
 /// under bare names, where the xattr crate says `user.NAME` and
 /// `system.NAME`; FreeBSD's system namespace is kept as a generic attribute.
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
 pub(crate) fn xattr_node_name(name: &std::ffi::OsStr) -> Option<String> {
     let name = name.to_string_lossy();
     if cfg!(any(target_os = "freebsd", target_os = "netbsd")) {
@@ -446,7 +455,7 @@ pub(crate) fn xattr_node_name(name: &std::ffi::OsStr) -> Option<String> {
 
 /// The name the xattr crate takes for a node's extended attribute; see
 /// [`xattr_node_name`].
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
 pub(crate) fn xattr_os_name(name: &str) -> String {
     if cfg!(any(target_os = "freebsd", target_os = "netbsd")) {
         format!("user.{name}")
@@ -480,7 +489,12 @@ fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
 
 /// The result of a C call that returns -1 (or less than 0) and sets errno
 /// when it fails.
-#[cfg(any(target_os = "freebsd", target_os = "illumos", target_os = "openbsd"))]
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "haiku",
+    target_os = "illumos",
+    target_os = "openbsd"
+))]
 fn check<T: Copy + Default + PartialOrd>(r: T) -> io::Result<T> {
     if r < T::default() {
         Err(io::Error::last_os_error())
@@ -493,6 +507,7 @@ fn check<T: Copy + Default + PartialOrd>(r: T) -> io::Result<T> {
 #[cfg_attr(
     not(any(
         target_os = "freebsd",
+        target_os = "haiku",
         target_os = "illumos",
         target_os = "linux",
         target_os = "openbsd"
