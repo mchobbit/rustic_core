@@ -10,7 +10,7 @@ use std::{
 
 use bytes::Bytes;
 use filetime::{FileTime, set_symlink_file_times};
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
 use log::warn;
 #[cfg(not(windows))]
 use nix::errno::Errno;
@@ -27,6 +27,8 @@ use same_file::is_same_file;
 use crate::backend::ignore::mapper::nix_mapper::map_mode_from_go;
 #[cfg(not(windows))]
 use crate::backend::node::NodeType;
+#[cfg(not(any(windows, target_os = "openbsd")))]
+use crate::backend::osattrs;
 use crate::{
     backend::node::{ExtendedAttribute, Metadata, Node},
     error::{ErrorKind, RusticError, RusticResult},
@@ -91,7 +93,7 @@ pub enum LocalDestinationErrorKind {
     #[cfg(not(windows))]
     FromErrnoError(Errno),
     /// listing xattrs on `{path:?}`: `{source:?}`
-    #[cfg(not(any(windows, target_os = "openbsd")))]
+    #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
     ListingXattrsFailed {
         path: PathBuf,
         source: std::io::Error,
@@ -104,7 +106,7 @@ pub enum LocalDestinationErrorKind {
         source: std::io::Error,
     },
     /// getting xattr `{name}` on `{filename:?}` with `{source:?}`
-    #[cfg(not(any(windows, target_os = "openbsd")))]
+    #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
     GettingXattrFailed {
         name: String,
         filename: PathBuf,
@@ -475,7 +477,11 @@ impl LocalDestination {
 
         let filename = self.path(item)?;
 
-        if let Some(mode) = node.meta.mode {
+        // BackOtter: restic leaves a mode of 0 out ("omitempty"), and a
+        // regular file's Go mode is its permissions alone: a file without a
+        // mode has 0000 (/etc/shadow, say), rather than keep the 0644 it was
+        // created with.
+        if let Some(mode) = node.meta.mode.or_else(|| node.is_file().then_some(0)) {
             let mode = map_mode_from_go(mode);
             fs::set_permissions(filename, fs::Permissions::from_mode(mode))
                 .map_err(LocalDestinationErrorKind::SettingFilePermissionsFailed)?;
@@ -505,7 +511,30 @@ impl LocalDestination {
         Ok(())
     }
 
-    #[cfg(not(any(windows, target_os = "openbsd")))]
+    #[cfg(target_os = "illumos")]
+    /// BackOtter: set extended attributes for `item` (relative to the base
+    /// path): on illumos, named attribute files (osattrs), which the xattr
+    /// crate doesn't support.
+    ///
+    /// # Errors
+    ///
+    /// * If the extended attributes could not be set.
+    pub(crate) fn set_extended_attributes(
+        &self,
+        item: impl AsRef<Path>,
+        extended_attributes: &[ExtendedAttribute],
+    ) -> LocalDestinationResult<()> {
+        let filename = self.path(item);
+        osattrs::set_illumos_xattrs(&filename, extended_attributes).map_err(|err| {
+            LocalDestinationErrorKind::SettingXattrFailed {
+                name: String::new(),
+                filename,
+                source: err,
+            }
+        })
+    }
+
+    #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
     /// Set extended attributes for `item` (relative to the base path)
     ///
     /// # Arguments
@@ -532,19 +561,44 @@ impl LocalDestination {
         extended_attributes: &[ExtendedAttribute],
     ) -> LocalDestinationResult<()> {
         let filename = self.path(item)?;
+        // BackOtter: nothing to do where the xattr crate has no support,
+        // rather than an error for each file.
+        if !xattr::SUPPORTED_PLATFORM {
+            return Ok(());
+        }
         let mut done = vec![false; extended_attributes.len()];
 
-        for curr_name in xattr::list(&filename).map_err(|err| {
-            LocalDestinationErrorKind::ListingXattrsFailed {
-                source: err,
-                path: filename.clone(),
+        // BackOtter: osattrs::xattr_list, as the xattr crate's list misnames
+        // one on FreeBSD; and a file that can't have any (a FIFO on ZFS)
+        // needs none.
+        let curr_names = match osattrs::xattr_list(&filename) {
+            Ok(names) => names,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::Unsupported
+                    && extended_attributes.is_empty() =>
+            {
+                return Ok(());
             }
-        })? {
-            match extended_attributes.iter().enumerate().find(
-                |(_, ExtendedAttribute { name, .. })| name == curr_name.to_string_lossy().as_ref(),
-            ) {
+            Err(err) => {
+                return Err(LocalDestinationErrorKind::ListingXattrsFailed {
+                    source: err,
+                    path: filename.clone(),
+                });
+            }
+        };
+        for curr_name in curr_names {
+            // BackOtter: restic's names; FreeBSD's system namespace is
+            // restored from a generic attribute (osattrs), and left alone.
+            let Some(curr_node_name) = osattrs::xattr_node_name(&curr_name) else {
+                continue;
+            };
+            match extended_attributes
+                .iter()
+                .enumerate()
+                .find(|(_, ExtendedAttribute { name, .. })| name == &curr_node_name)
+            {
                 Some((index, ExtendedAttribute { name, value })) => {
-                    let curr_value = xattr::get(&filename, name).map_err(|err| {
+                    let curr_value = xattr::get(&filename, &curr_name).map_err(|err| {
                         LocalDestinationErrorKind::GettingXattrFailed {
                             name: name.clone(),
                             filename: filename.clone(),
@@ -552,7 +606,7 @@ impl LocalDestination {
                         }
                     })?;
                     if value != &curr_value {
-                        xattr::set(&filename, name, value.as_ref().unwrap_or(&Vec::new()))
+                        xattr::set(&filename, &curr_name, value.as_ref().unwrap_or(&Vec::new()))
                             .map_err(|err| LocalDestinationErrorKind::SettingXattrFailed {
                                 name: name.clone(),
                                 filename: filename.clone(),
@@ -575,7 +629,8 @@ impl LocalDestination {
 
         for (index, ExtendedAttribute { name, value }) in extended_attributes.iter().enumerate() {
             if !done[index] {
-                xattr::set(&filename, name, value.as_ref().unwrap_or(&Vec::new())).map_err(
+                let os_name = osattrs::xattr_os_name(name);
+                xattr::set(&filename, os_name, value.as_ref().unwrap_or(&Vec::new())).map_err(
                     |err| LocalDestinationErrorKind::SettingXattrFailed {
                         name: name.clone(),
                         filename: filename.clone(),

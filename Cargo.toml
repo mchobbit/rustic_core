@@ -71,7 +71,8 @@ debug-assertions = false
 codegen-units = 1
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# deny, not forbid: BackOtter's osattrs module allows it for system calls
+unsafe_code = "deny"
 missing_docs = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
 bad_style = { level = "warn", priority = -1 }

@@ -13,8 +13,10 @@ use serde_with::serde_as;
 use super::{IgnoreErrorKind, IgnoreResult, OpenFile};
 use crate::backend::{
     ReadSourceEntry,
+    osattrs,
     node::{
         ExtendedAttribute, Metadata, Node, NodeType,
+        generic_attributes::GenericAttributes,
         modification::{DevIdOption, TimeOption, XattrOption},
     },
 };
@@ -127,9 +129,11 @@ impl LocalSourceSaveOptions {
             size,
             links,
             extended_attributes,
+            generic_attributes: GenericAttributes::default(),
         };
 
-        let node = self.to_node(&entry, &m, meta)?;
+        let mut node = self.to_node(&entry, &m, meta)?;
+        osattrs::fill(entry.path(), &mut node, &m);
         let path = entry.into_path();
         let open = Some(OpenFile(path.clone()));
         Ok(ReadSourceEntry { path, node, open })
@@ -191,6 +195,21 @@ impl LocalSourceSaveOptions {
         (Some(mode), inode, links)
     }
 
+    /// BackOtter: list [`ExtendedAttribute`] for a [`Node`] located at
+    /// `path`: on illumos, named attribute files (osattrs), which the xattr
+    /// crate doesn't support.
+    ///
+    /// # Errors
+    ///
+    /// * If they couldn't be listed or read
+    #[cfg(target_os = "illumos")]
+    fn xattrs(path: &Path) -> IgnoreResult<Vec<ExtendedAttribute>> {
+        osattrs::illumos_xattrs(path).map_err(|err| IgnoreErrorKind::ErrorXattr {
+            path: path.to_path_buf(),
+            source: err,
+        })
+    }
+
     /// List [`ExtendedAttribute`] for a [`Node`] located at `path`
     ///
     /// # Argument
@@ -200,16 +219,29 @@ impl LocalSourceSaveOptions {
     /// # Errors
     ///
     /// * If Xattr couldn't be listed or couldn't be read
-    #[cfg(not(target_os = "openbsd"))]
+    #[cfg(not(any(target_os = "openbsd", target_os = "illumos")))]
     fn xattrs(path: &Path) -> IgnoreResult<Vec<ExtendedAttribute>> {
-        xattr::list(path)
-            .map_err(|err| IgnoreErrorKind::ErrorXattr {
+        // BackOtter: no warning for each file where the xattr crate has no
+        // support.
+        if !xattr::SUPPORTED_PLATFORM {
+            return Ok(Vec::new());
+        }
+        // BackOtter: osattrs::xattr_list, as the xattr crate's list misnames
+        // one on FreeBSD; none where there can be none (a FIFO on ZFS), as
+        // restic does; and restic's names (osattrs::xattr_node_name).
+        let names = match osattrs::xattr_list(path) {
+            Err(err) if err.kind() == std::io::ErrorKind::Unsupported => Vec::new(),
+            names => names.map_err(|err| IgnoreErrorKind::ErrorXattr {
                 path: path.to_path_buf(),
                 source: err,
-            })?
-            .map(|name| {
+            })?,
+        };
+        names
+            .into_iter()
+            .filter_map(|name| Some((osattrs::xattr_node_name(&name)?, name)))
+            .map(|(node_name, name)| {
                 Ok(ExtendedAttribute {
-                    name: name.to_string_lossy().to_string(),
+                    name: node_name,
                     value: xattr::get(path, name).map_err(|err| IgnoreErrorKind::ErrorXattr {
                         path: path.to_path_buf(),
                         source: err,
