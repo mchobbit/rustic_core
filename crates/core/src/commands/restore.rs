@@ -358,10 +358,21 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                 // metadata, its system attributes last as for any file; one
                 // warning for it, not for each of its hard links.
                 if let Some(size) = osattrs::unread_size(node) {
+                    let target = dest.path(path);
                     warn!(
                         "{}: contents were not backed up (av_quarantined at backup, {size} bytes)",
-                        dest.path(path).display()
+                        target.display()
                     );
+                    // It goes into a new, empty file, as in BackOtter's
+                    // restic: a file there may be quarantined, which keeps
+                    // its contents and extended attributes closed to the
+                    // restore too.
+                    if !dry_run
+                        && std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_file())
+                        && let Err(err) = std::fs::remove_file(&target)
+                    {
+                        warn!("restore {}: {err}", path.display());
+                    }
                 }
                 // BackOtter: whether the file goes into a new, empty file,
                 // which can be restored sparse (write_sparse): nothing is
