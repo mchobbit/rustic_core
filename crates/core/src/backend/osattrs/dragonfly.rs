@@ -3,6 +3,8 @@
 
 use std::{io, os::dragonfly::fs::MetadataExt, path::Path};
 
+use jiff::Timestamp;
+
 use super::{bsd_flags::DRAGONFLY_KEPT_FLAGS, c_path, check, chmod_symlink, set_flags_best_effort};
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType, generic_attributes::DRAGONFLY_FILE_FLAGS,
@@ -81,4 +83,9 @@ pub(super) fn restore_acls(_path: &Path, _node: &Node) -> io::Result<()> {
 
 pub(super) fn restore_symlink_mode(path: &Path, node: &Node) -> io::Result<()> {
     chmod_symlink(path, node)
+}
+
+/// The `struct stat` here has no birth time.
+pub(super) fn restore_birthtime(_path: &Path, _node: &Node, _birth: Timestamp) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "DragonFly keeps no birth times"))
 }

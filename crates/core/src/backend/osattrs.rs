@@ -14,7 +14,9 @@
 //! and every write sets the archive flag again.
 //!
 //! Every Unix also marks regular files with holes (`unix.sparse`), for the
-//! restore to make them sparse again.
+//! restore to make them sparse again, and FreeBSD, NetBSD and illumos keep
+//! birth times (`unix.birthtime`), which the restore sets just before the
+//! atime and mtime.
 
 // System calls and ioctls rustic's dependencies don't wrap.
 #![allow(unsafe_code)]
@@ -28,11 +30,12 @@ use std::{
     sync::Mutex,
 };
 
+use jiff::Timestamp;
 use log::{debug, warn};
 
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType,
-    generic_attributes::{KNOWN, UNIX_SPARSE},
+    generic_attributes::{KNOWN, UNIX_BIRTHTIME, UNIX_SPARSE},
 };
 
 mod bsd_flags;
@@ -91,7 +94,8 @@ use other as os;
 /// metadata `m` (its lstat), in the generic attributes of its `node`. Errors
 /// are warned about: the rest of the node is still worth saving.
 pub(crate) fn fill(path: &Path, node: &mut Node, m: &std::fs::Metadata) {
-    // On Linux, the one open of the file for its flags, project ID and holes.
+    // On Linux, the one open of the file for its flags, project ID and holes;
+    // on illumos, of its system attribute view.
     let f = os::open_for_attrs(path, &node.node_type, m);
     if let Some(name) = os::FILE_FLAGS {
         match os::file_flags(path, &node.node_type, m, f.as_ref()) {
@@ -101,6 +105,14 @@ pub(crate) fn fill(path: &Path, node: &mut Node, m: &std::fs::Metadata) {
     }
     if let Err(err) = os::fill_attributes(path, node, f.as_ref()) {
         warn!("ignoring attributes of {}: {err}", path.display());
+    }
+    // The birth time of every type of file, where the lstat has one (on
+    // illumos it is in the system attribute view, which `fill_attributes`
+    // reads). Not on Linux, which can't set one back, nor OpenBSD or
+    // DragonFly, which keep none.
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+    if let Some(birth) = m.created().ok().and_then(|t| Timestamp::try_from(t).ok()) {
+        node.meta.generic_attributes.set_timestamp(UNIX_BIRTHTIME, birth);
     }
     // A regular file, not a block device saved as one.
     #[cfg(unix)]
@@ -418,6 +430,103 @@ pub(crate) fn restore_acls(path: &Path, node: &Node) -> io::Result<()> {
     os::restore_acls(path, node)
 }
 
+/// Sets the birth time of the file at `path`, where the system keeps one
+/// (FreeBSD, NetBSD, illumos), just before the restore sets its atime and
+/// mtime: on FreeBSD and NetBSD it is set as an earlier mtime, which they
+/// replace. Elsewhere, and where the file system has none, it is skipped,
+/// with a note in the debug log.
+///
+/// # Errors
+///
+/// * If the birth time couldn't be set.
+pub(crate) fn restore_birthtime(path: &Path, node: &Node) -> io::Result<()> {
+    let Some(birth) = node.meta.generic_attributes.timestamp(UNIX_BIRTHTIME) else {
+        return Ok(());
+    };
+    match os::restore_birthtime(path, node, birth) {
+        Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+            debug!("birth time of {} not restored: {err}", path.display());
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+/// The mtime to set before `node`'s final atime and mtime on FreeBSD and
+/// NetBSD, for its birth time `birth` to come back, if there is one to set:
+/// the birth time, when it is earlier than the mtime.
+///
+/// The kernels of FreeBSD and NetBSD have no call that sets a birth time,
+/// but they lower it to any mtime set earlier than it (UFS2, NetBSD's FFS
+/// and ZFS alike; files, directories and symlinks; owners too). The final
+/// atime and mtime then leave it. A birth time that isn't earlier needs
+/// nothing: the final times lower the new file's, the time of the restore,
+/// to the mtime, the closest they can get.
+#[cfg_attr(
+    not(any(target_os = "freebsd", target_os = "netbsd")),
+    allow(dead_code)
+)]
+fn birthtime_first(node: &Node, birth: Timestamp) -> Option<Timestamp> {
+    node.meta.mtime.filter(|&mtime| birth < mtime).map(|_| birth)
+}
+
+/// Sets `node`'s birth time `birth`, when it is earlier than its mtime, as
+/// the mtime of the file at `path` (see [`birthtime_first`]), with
+/// `utimensat(2)`, leaving the atime: filetime goes through `utimes(2)` on
+/// some systems, which drops the nanoseconds. A symlink is not followed;
+/// where that can't be done, its times are left as they are, as the
+/// restore leaves them.
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+fn lower_birthtime(path: &Path, node: &Node, birth: Timestamp) -> io::Result<()> {
+    let Some(birth) = birthtime_first(node, birth) else {
+        return Ok(());
+    };
+    let p = c_path(path)?;
+    let (sec, nsec) = unix_time(birth);
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: sec,
+            tv_nsec: nsec.into(),
+        },
+    ];
+    // SAFETY: p is a C string, times two timespecs.
+    let r = unsafe {
+        libc::utimensat(libc::AT_FDCWD, p.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+    };
+    match check(r) {
+        Ok(_) => Ok(()),
+        Err(err)
+            if node.is_symlink()
+                && matches!(
+                    err.raw_os_error(),
+                    Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL)
+                ) =>
+        {
+            Err(io::Error::new(io::ErrorKind::Unsupported, err))
+        }
+        Err(err) => Err(path_error("utimensat (birth time)", path, &err)),
+    }
+}
+
+/// `t` as C's `time_t` and nanoseconds, which are never negative: the
+/// seconds rounded down.
+#[cfg_attr(
+    not(any(target_os = "freebsd", target_os = "illumos", target_os = "netbsd")),
+    allow(dead_code)
+)]
+fn unix_time(t: Timestamp) -> (i64, u32) {
+    let nsec = t.subsec_nanosecond();
+    if nsec < 0 {
+        (t.as_second() - 1, (nsec + 1_000_000_000).unsigned_abs())
+    } else {
+        (t.as_second(), nsec.unsigned_abs())
+    }
+}
+
 /// Gives a symlink its own permissions back, where the system keeps them
 /// (FreeBSD, NetBSD, OpenBSD, DragonFly).
 ///
@@ -695,6 +804,40 @@ fn unsupported(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn birthtime_first_only_when_earlier() {
+        let t = |sec, nsec| Timestamp::new(sec, nsec).unwrap();
+        let mut node = Node::default();
+        node.meta.mtime = Some(t(1_200_000_000, 222_222_222));
+        // Earlier: set first (two utimensat calls), else not (one).
+        for (birth, first) in [
+            (t(1_000_000_000, 111_111_111), true),
+            (t(1_200_000_000, 222_222_221), true),
+            (t(1_200_000_000, 222_222_222), false),
+            (t(1_300_000_000, 0), false),
+        ] {
+            assert_eq!(birthtime_first(&node, birth), first.then_some(birth), "{birth}");
+        }
+        // Without an mtime, which the restore then doesn't set.
+        node.meta.mtime = None;
+        assert_eq!(birthtime_first(&node, t(1_000_000_000, 0)), None);
+    }
+
+    #[test]
+    fn restore_birthtime_without_attribute() {
+        // No attribute: nothing to do, and no system call either.
+        restore_birthtime(Path::new("/nonexistent"), &Node::default()).unwrap();
+    }
+
+    #[test]
+    fn unix_time_rounds_down() {
+        let t = |sec, nsec| Timestamp::new(sec, nsec).unwrap();
+        assert_eq!(unix_time(t(1_000_000_000, 123_456_789)), (1_000_000_000, 123_456_789));
+        assert_eq!(unix_time(t(0, 0)), (0, 0));
+        assert_eq!(unix_time(t(0, -1)), (-1, 999_999_999));
+        assert_eq!(unix_time(t(-2, 500_000_000)), (-2, 500_000_000));
+    }
 
     #[cfg(unix)]
     #[test]

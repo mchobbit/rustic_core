@@ -4,9 +4,11 @@
 
 use std::{io, os::netbsd::fs::MetadataExt, path::Path};
 
+use jiff::Timestamp;
+
 use super::{
-    bsd_flags::NETBSD_KEPT_FLAGS, c_path, check, chmod_symlink, freebsd_netbsd, path_error,
-    set_flags_best_effort,
+    bsd_flags::NETBSD_KEPT_FLAGS, c_path, check, chmod_symlink, freebsd_netbsd, lower_birthtime,
+    path_error, set_flags_best_effort,
 };
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType, generic_attributes::NETBSD_FILE_FLAGS,
@@ -92,4 +94,10 @@ pub(super) fn restore_acls(path: &Path, node: &Node) -> io::Result<()> {
 
 pub(super) fn restore_symlink_mode(path: &Path, node: &Node) -> io::Result<()> {
     chmod_symlink(path, node)
+}
+
+/// Sets the birth time as an earlier mtime, which the final times replace
+/// (`osattrs.rs`).
+pub(super) fn restore_birthtime(path: &Path, node: &Node, birth: Timestamp) -> io::Result<()> {
+    lower_birthtime(path, node, birth)
 }

@@ -2,6 +2,8 @@
 
 use std::{io, os::openbsd::fs::MetadataExt, path::Path};
 
+use jiff::Timestamp;
+
 use super::{c_path, check, chmod_symlink, set_flags_best_effort};
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType, generic_attributes::OPENBSD_FILE_FLAGS,
@@ -96,4 +98,9 @@ pub(super) fn restore_acls(_path: &Path, _node: &Node) -> io::Result<()> {
 
 pub(super) fn restore_symlink_mode(path: &Path, node: &Node) -> io::Result<()> {
     chmod_symlink(path, node)
+}
+
+/// OpenBSD's FFS2 reports a birth time of 0.
+pub(super) fn restore_birthtime(_path: &Path, _node: &Node, _birth: Timestamp) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "OpenBSD keeps no birth times"))
 }
