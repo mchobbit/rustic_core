@@ -1,8 +1,8 @@
-//! OpenBSD: file flags (`st_flags`).
+//! OpenBSD: file flags (`st_flags`) and symlinks' own permissions.
 
 use std::{io, os::openbsd::fs::MetadataExt, path::Path};
 
-use super::{c_path, check, set_flags_best_effort};
+use super::{c_path, check, chmod_symlink, set_flags_best_effort};
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType, generic_attributes::OPENBSD_FILE_FLAGS,
 };
@@ -89,6 +89,6 @@ pub(super) fn restore_acls(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn restore_symlink_mode(_path: &Path, _node: &Node) -> io::Result<()> {
-    Ok(())
+pub(super) fn restore_symlink_mode(path: &Path, node: &Node) -> io::Result<()> {
+    chmod_symlink(path, node)
 }

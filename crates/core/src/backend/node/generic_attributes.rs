@@ -36,6 +36,18 @@ pub const ILLUMOS_ACL: &str = "illumos.acl";
 pub const ILLUMOS_SYSTEM_ATTRIBUTES: &str = "illumos.system_attributes";
 /// OpenBSD's `chflags(1)` flags (`st_flags`).
 pub const OPENBSD_FILE_FLAGS: &str = "openbsd.file_flags";
+/// NetBSD's `chflags(1)` flags (`st_flags`).
+pub const NETBSD_FILE_FLAGS: &str = "netbsd.file_flags";
+/// NetBSD's extended attributes in the system namespace.
+pub const NETBSD_SYSTEM_EXTATTRS: &str = "netbsd.system_extattrs";
+/// NetBSD's POSIX.1e access ACL.
+pub const NETBSD_ACL_ACCESS: &str = "netbsd.acl_access";
+/// NetBSD's POSIX.1e default ACL, of a directory.
+pub const NETBSD_ACL_DEFAULT: &str = "netbsd.acl_default";
+/// NetBSD's NFSv4 ACL.
+pub const NETBSD_ACL_NFS4: &str = "netbsd.acl_nfs4";
+/// DragonFly's `chflags(1)` flags (`st_flags`).
+pub const DRAGONFLY_FILE_FLAGS: &str = "dragonfly.file_flags";
 
 /// The generic attributes restic and BackOtter's restic know: an attribute
 /// of another system is skipped quietly, an unknown one with a warning.
@@ -54,6 +66,12 @@ pub const KNOWN: &[&str] = &[
     ILLUMOS_ACL,
     ILLUMOS_SYSTEM_ATTRIBUTES,
     OPENBSD_FILE_FLAGS,
+    NETBSD_FILE_FLAGS,
+    NETBSD_SYSTEM_EXTATTRS,
+    NETBSD_ACL_ACCESS,
+    NETBSD_ACL_DEFAULT,
+    NETBSD_ACL_NFS4,
+    DRAGONFLY_FILE_FLAGS,
 ];
 
 /// A node's generic attributes, by name.
