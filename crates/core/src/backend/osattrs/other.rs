@@ -21,8 +21,8 @@ pub(super) fn file_flags(
     _typ: &NodeType,
     _m: &std::fs::Metadata,
     _f: Option<&File>,
-) -> io::Result<u32> {
-    Ok(0)
+) -> io::Result<Option<u32>> {
+    Ok(None)
 }
 
 pub(super) fn fill_attributes(_path: &Path, _node: &mut Node, _f: Option<&File>) -> io::Result<()> {
@@ -68,4 +68,17 @@ pub(super) fn restore_symlink_mode(_path: &Path, _node: &Node) -> io::Result<()>
 
 pub(super) fn restore_birthtime(_path: &Path, _node: &Node, _birth: Timestamp) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "no birth times on this system"))
+}
+
+/// Extended attributes have no metadata of their own here.
+pub(super) fn fill_xattr_meta(_path: &Path, _node: &mut Node) {}
+
+/// Extended attributes go through the xattr crate here.
+pub(super) fn xattrs(_path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr"))
+}
+
+/// Extended attributes go through the xattr crate here.
+pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr"))
 }

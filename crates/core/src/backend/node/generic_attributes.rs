@@ -173,8 +173,8 @@ impl GenericAttributes {
         }
     }
 
-    /// Stores a 64-bit number (ZFS's DOS flags) as the attribute `name`, 0
-    /// too: the caller decides when there is none.
+    /// Stores a 64-bit number (ZFS's DOS flags, file flags) as the attribute
+    /// `name`, 0 too: the caller decides when there is none.
     pub fn set_u64(&mut self, name: &str, n: u64) {
         _ = self.0.insert(name.to_string(), n.into());
     }

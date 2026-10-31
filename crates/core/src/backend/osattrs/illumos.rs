@@ -244,12 +244,12 @@ pub(super) fn file_flags(
     _typ: &NodeType,
     _m: &std::fs::Metadata,
     f: Option<&File>,
-) -> io::Result<u32> {
+) -> io::Result<Option<u32>> {
     let Some(f) = f else {
-        return Ok(0);
+        return Ok(None);
     };
-    // A mask of 0 is kept too (fill_attributes), which set_number leaves out.
-    Ok(parse_view(&read_view(f, path)?, path)?.kept_mask().unwrap_or(0))
+    // A mask of 0 too: a file whose archive and av_modified were cleared.
+    Ok(parse_view(&read_view(f, path)?, path)?.kept_mask())
 }
 
 /// Records the SIDs of an owner and group that are SIDs, the creation time
@@ -263,13 +263,6 @@ pub(super) fn fill_attributes(path: &Path, node: &mut Node, f: Option<&File>) ->
         let view = parse_view(&buf, path)?;
         if let Some(crtime) = view.crtime() {
             node.meta.generic_attributes.set_timestamp(UNIX_BIRTHTIME, crtime);
-        }
-        // A file whose archive and av_modified were cleared.
-        if view.kept_mask() == Some(0) {
-            node.meta
-                .generic_attributes
-                .set(ILLUMOS_SYSTEM_ATTRIBUTES, &0_u32)
-                .map_err(io::Error::other)?;
         }
         Ok(())
     });

@@ -9,6 +9,7 @@ use std::{
 };
 
 use bytes::Bytes;
+#[cfg(not(target_os = "dragonfly"))]
 use filetime::{FileTime, set_symlink_file_times};
 #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
 use log::warn;
@@ -297,12 +298,16 @@ impl LocalDestination {
         let filename = self.path(item);
         if let Some(mtime) = meta.mtime {
             let atime = meta.atime.unwrap_or(mtime);
-            set_symlink_file_times(
+            // BackOtter: on DragonFly filetime takes microseconds alone.
+            #[cfg(target_os = "dragonfly")]
+            let set = osattrs::set_times(&filename, atime, mtime);
+            #[cfg(not(target_os = "dragonfly"))]
+            let set = set_symlink_file_times(
                 filename,
                 FileTime::from_system_time(atime.into()),
                 FileTime::from_system_time(mtime.into()),
-            )
-            .map_err(LocalDestinationErrorKind::SettingTimeMetadataFailed)?;
+            );
+            set.map_err(LocalDestinationErrorKind::SettingTimeMetadataFailed)?;
         }
 
         Ok(())

@@ -248,16 +248,19 @@ pub(super) fn file_flags(
     _typ: &NodeType,
     _m: &Metadata,
     f: Option<&File>,
-) -> io::Result<u32> {
+) -> io::Result<Option<u32>> {
     let Some(f) = f else {
-        return Ok(0);
+        return Ok(None);
     };
     // A file system without inode flags (ENOTTY, EOPNOTSUPP, ...).
     let flags = get_flags(f);
-    Ok(flags
-        .inspect_err(|err| debug!("no file flags for {}: {err}", path.display()))
-        .unwrap_or_default()
-        & INODE_FLAGS)
+    Ok(Some(
+        flags
+            .inspect_err(|err| debug!("no file flags for {}: {err}", path.display()))
+            .unwrap_or_default()
+            & INODE_FLAGS,
+    )
+    .filter(|&flags| flags != 0))
 }
 
 /// Records the project ID of a regular file or directory, unless it is 0,
@@ -559,6 +562,19 @@ pub(super) fn restore_symlink_mode(_path: &Path, _node: &Node) -> io::Result<()>
 /// Linux reads birth times (`statx(2)`), but has no call that sets one.
 pub(super) fn restore_birthtime(_path: &Path, _node: &Node, _birth: Timestamp) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "Linux can't set birth times"))
+}
+
+/// Extended attributes have no metadata of their own here.
+pub(super) fn fill_xattr_meta(_path: &Path, _node: &mut Node) {}
+
+/// Extended attributes go through the xattr crate here.
+pub(super) fn xattrs(_path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr"))
+}
+
+/// Extended attributes go through the xattr crate here.
+pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr"))
 }
 
 #[cfg(test)]

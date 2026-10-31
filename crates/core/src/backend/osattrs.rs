@@ -111,20 +111,20 @@ pub(crate) fn fill(path: &Path, node: &mut Node, m: &std::fs::Metadata, xattrs: 
     // on illumos, of its system attribute view.
     let f = os::open_for_attrs(path, &node.node_type, m);
     if let Some(name) = os::FILE_FLAGS {
+        // The system's module says when there are none worth an attribute:
+        // a 0 can say something (a cleared archive flag on ZFS).
         match os::file_flags(path, &node.node_type, m, f.as_ref()) {
-            Ok(flags) => node.meta.generic_attributes.set_number(name, flags),
+            Ok(Some(flags)) => node.meta.generic_attributes.set_u64(name, flags.into()),
+            Ok(None) => {}
             Err(err) => warn!("ignoring file flags of {}: {err}", path.display()),
         }
     }
     if let Err(err) = os::fill_attributes(path, node, f.as_ref()) {
         warn!("ignoring attributes of {}: {err}", path.display());
     }
-    #[cfg(target_os = "illumos")]
     if xattrs {
         os::fill_xattr_meta(path, node);
     }
-    #[cfg(not(target_os = "illumos"))]
-    let _ = xattrs;
     // The birth time of every type of file, where the lstat has one (on
     // illumos it is in the system attribute view, which `fill_attributes`
     // reads). Not on Linux, which can't set one back, nor OpenBSD or
@@ -558,24 +558,8 @@ fn lower_birthtime(path: &Path, node: &Node, birth: Timestamp) -> io::Result<()>
     let Some(birth) = birthtime_first(node, birth) else {
         return Ok(());
     };
-    let p = c_path(path)?;
-    let (sec, nsec) = unix_time(birth);
-    let times = [
-        libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
-        },
-        libc::timespec {
-            tv_sec: sec,
-            tv_nsec: nsec.into(),
-        },
-    ];
-    // SAFETY: p is a C string, times two timespecs.
-    let r = unsafe {
-        libc::utimensat(libc::AT_FDCWD, p.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW)
-    };
-    match check(r) {
-        Ok(_) => Ok(()),
+    match utimensat_nofollow(path, None, birth) {
+        Ok(()) => Ok(()),
         Err(err)
             if node.is_symlink()
                 && matches!(
@@ -589,10 +573,57 @@ fn lower_birthtime(path: &Path, node: &Node, birth: Timestamp) -> io::Result<()>
     }
 }
 
+/// Sets the atime and mtime of the file at `path`, not following a symlink,
+/// to the nanosecond, with `utimensat(2)`: on DragonFly, where the filetime
+/// crate goes through `utimes(2)` and `lutimes(2)`, which take microseconds
+/// (on the other systems it goes through `utimensat(2)` too).
+///
+/// # Errors
+///
+/// * If the times can't be set.
+#[cfg(target_os = "dragonfly")]
+pub(crate) fn set_times(path: &Path, atime: Timestamp, mtime: Timestamp) -> io::Result<()> {
+    utimensat_nofollow(path, Some(atime), mtime)
+}
+
+/// Sets the mtime of the file at `path` and its atime, unless that is
+/// `None` (`UTIME_OMIT`), with `utimensat(2)` and `AT_SYMLINK_NOFOLLOW`, to
+/// the nanosecond.
+#[cfg(any(target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd"))]
+fn utimensat_nofollow(path: &Path, atime: Option<Timestamp>, mtime: Timestamp) -> io::Result<()> {
+    let spec = |t: Option<Timestamp>| {
+        t.map_or(
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            |t| {
+                let (sec, nsec) = unix_time(t);
+                libc::timespec {
+                    tv_sec: sec,
+                    tv_nsec: nsec.into(),
+                }
+            },
+        )
+    };
+    let p = c_path(path)?;
+    let times = [spec(atime), spec(Some(mtime))];
+    // SAFETY: p is a C string, times two timespecs.
+    let r = unsafe {
+        libc::utimensat(libc::AT_FDCWD, p.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+    };
+    check(r).map(drop)
+}
+
 /// `t` as C's `time_t` and nanoseconds, which are never negative: the
 /// seconds rounded down.
 #[cfg_attr(
-    not(any(target_os = "freebsd", target_os = "illumos", target_os = "netbsd")),
+    not(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "illumos",
+        target_os = "netbsd"
+    )),
     allow(dead_code)
 )]
 fn unix_time(t: Timestamp) -> (i64, u32) {
@@ -616,11 +647,12 @@ pub(crate) fn restore_symlink_mode(path: &Path, node: &Node) -> io::Result<()> {
 
 /// The extended attributes of the file at `path`, on illumos: named
 /// attribute files (`runat(1)`), which the xattr crate doesn't support.
+/// Elsewhere they go through the xattr crate.
 ///
 /// # Errors
 ///
-/// * If they can't be read.
-#[cfg(target_os = "illumos")]
+/// * If they can't be read, or this isn't illumos.
+#[cfg_attr(not(target_os = "illumos"), allow(dead_code))]
 pub(crate) fn illumos_xattrs(path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
     os::xattrs(path)
 }
@@ -630,8 +662,8 @@ pub(crate) fn illumos_xattrs(path: &Path) -> io::Result<Vec<ExtendedAttribute>> 
 ///
 /// # Errors
 ///
-/// * If they can't be set, or the file system has none.
-#[cfg(target_os = "illumos")]
+/// * If they can't be set, the file system has none, or this isn't illumos.
+#[cfg_attr(not(target_os = "illumos"), allow(dead_code))]
 pub(crate) fn set_illumos_xattrs(
     path: &Path,
     attrs: &[ExtendedAttribute],

@@ -20,8 +20,14 @@ that either program restores what the other backed up.
     to those a user can set, and casefolding (`F`).
   - `linux.project_id`: the project ID (`FS_IOC_FSGETXATTR`) that project
     quotas count by, of regular files and directories.
-  - `freebsd.file_flags`: FreeBSD's `chflags(1)` flags (`st_flags`); `uarch`
-    only along with others, since ZFS sets it on every file.
+  - `freebsd.file_flags`: FreeBSD's `chflags(1)` flags (`st_flags`). ZFS
+    (`statfs(2)`'s `f_fstypename` `zfs`, looked up once per file system; a
+    symlink's is its directory's) sets `uarch` on every file it writes, as
+    Linux's ZFS its archive DOS flag, so there a file with `uarch` alone gets
+    no attribute, and one with no flags at all gets 0 (archive cleared),
+    which the restore sets, as any value it finds. On other file systems
+    `uarch` is kept only along with other flags, and no flags get no
+    attribute.
   - `freebsd.acl_access`, `freebsd.acl_default`: POSIX.1e ACLs (UFS mounted
     `acls`), access and directories' default.
   - `freebsd.acl_nfs4`: NFSv4 ACLs (ZFS, UFS mounted `nfsv4acls`).
@@ -113,6 +119,13 @@ that either program restores what the other backed up.
        file has none. Elsewhere the file is opened for the probe, with
        `O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_NOCTTY|O_CLOEXEC`, and must still
        be the file the lstat saw.
+    On DragonFly's HAMMER2 the blocks mark more than files with holes, in
+    both tools alike: a file of up to 512 bytes, kept in its inode (0
+    blocks), a compressed one (LZ4 by default) and runs of zeros, which
+    HAMMER2 doesn't store. That does no harm: such a file is restored sparse,
+    which writes every byte of it but each blob's leading zeros, so it comes
+    back the same, only with holes where those zeros were (HAMMER2 itself
+    stores no zeros anyway).
     On ZFS a probe of a file with unwritten changes waits for them to be
     written (a transaction group), as it does for BackOtter's restic, which
     probes the same files.
@@ -321,6 +334,12 @@ that either program restores what the other backed up.
   `AT_SYMLINK_NOFOLLOW`; OpenBSD has no `lchmod`), where stock rustic
   leaves the 0755 a new symlink gets. A file system that refuses
   (`EOPNOTSUPP`, `EINVAL`) is only noted in the debug log.
+- On DragonFly the restore sets atimes and mtimes with `utimensat(2)`
+  (`AT_SYMLINK_NOFOLLOW`), to the nanosecond, as BackOtter's restic does:
+  the filetime crate goes through `utimes(2)` and `lutimes(2)` there, which
+  take microseconds. DragonFly's UFS keeps the nanoseconds; HAMMER2 keeps
+  microseconds anyway. Elsewhere filetime goes through `utimensat(2)`
+  already (Linux, the other BSDs, illumos; macOS from 10.13).
 - On DragonFly, where `dev_t` is 32 bits, a device number that doesn't fit
   is an error for that device node, as on 32-bit Android, rather than a
   build failure: rustic_core builds for x86_64-unknown-dragonfly (a tier 3
@@ -328,7 +347,11 @@ that either program restores what the other backed up.
 - The version reads `X.Y.Z+backotter.N`.
 
 The system calls need `unsafe`, which the workspace lints now deny (not
-forbid), so that `backend/osattrs.rs` can allow it there alone.
+forbid), so that `backend/osattrs.rs` can allow it there alone. Each
+system's module (`osattrs/linux.rs`, `freebsd.rs`, `netbsd.rs`,
+`openbsd.rs`, `dragonfly.rs`, `illumos.rs`, and `other.rs` for the rest)
+defines the same functions and constants, those of `other.rs`, which does
+nothing; `osattrs.rs` calls them without `cfg`s.
 
 Not handled, as no BackOtter build needs them: on a 32-bit glibc system,
 `SEEK_HOLE` fails (`EOVERFLOW`) on a file over 2 GiB, which then isn't
