@@ -42,8 +42,10 @@ const fn is_zero(v: &u16) -> bool {
 }
 
 /// One ACE of an illumos ACL (`ace_t`), as BackOtter's restic keeps it: ids
-/// are numeric, as the file's owner and group are.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// are numeric, as the file's owner and group are, but an ACE for a SID (an
+/// ephemeral id, [`names_sid`]) has the SID too, which a restore maps to the
+/// id it has there. Readers that don't know `sid` ignore it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct AceEntry {
     pub who: u32,
     pub mask: u32,
@@ -51,6 +53,38 @@ pub(super) struct AceEntry {
     pub flags: u16,
     #[serde(rename = "type", default, skip_serializing_if = "is_zero")]
     pub ace_type: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+}
+
+/// `MAXUID`: the uids and gids above it are ephemeral, those idmap(8) hands
+/// out for SIDs (Windows users and groups, as the SMB server and ZFS keep
+/// them), and only for as long as it runs: after a reboot the same SID can
+/// get another one.
+pub(super) const MAX_UID: u32 = 2_147_483_647;
+
+/// `UID_NOBODY` and `GID_NOBODY`, what an id idmap can't map becomes.
+pub(super) const NOBODY: u32 = 60001;
+
+/// Whether `e` is for a user or group (`ACE_IDENTIFIER_GROUP`) that is a
+/// SID: not owner@, group@ or everyone@, and an ephemeral id.
+pub(super) const fn names_sid(e: &AceEntry) -> bool {
+    e.flags & (OWNER | GROUP | EVERYONE) == 0 && e.who > MAX_UID
+}
+
+/// Whether `e` is for a group, rather than a user.
+pub(super) const fn is_group(e: &AceEntry) -> bool {
+    e.flags & IDENTIFIER_GROUP != 0
+}
+
+/// Splits a SID, such as `S-1-5-21-1111-2222-3333-1001`, at its last dash
+/// into what idmap calls its prefix and its RID.
+pub(super) fn split_sid(sid: &str) -> Option<(&str, u32)> {
+    let (prefix, rid) = sid.rsplit_once('-')?;
+    if prefix.is_empty() || !sid.starts_with("S-") || !rid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((prefix, rid.parse().ok()?))
 }
 
 /// `ace_trivial_common()` from illumos' `acl_common.c`: whether an ACL says
@@ -96,6 +130,7 @@ mod tests {
             mask,
             flags,
             ace_type,
+            sid: None,
         };
         let trivial = vec![
             ace(
@@ -110,11 +145,11 @@ mod tests {
         assert!(is_trivial(&trivial), "ZFS's trivial ACL for 0644 not trivial");
 
         let mut named = vec![ace(60001, read, 0, ACCESS_ALLOWED)];
-        named.extend(&trivial);
+        named.extend(trivial.iter().cloned());
         assert!(!is_trivial(&named), "ACL with a named user is trivial");
 
         let mut deny = vec![ace(10, read, IDENTIFIER_GROUP, ACCESS_DENIED)];
-        deny.extend(&trivial);
+        deny.extend(trivial.iter().cloned());
         assert!(!is_trivial(&deny), "ACL with a named group's deny entry is trivial");
 
         let mut inherit = trivial.clone();
@@ -124,5 +159,98 @@ mod tests {
         let mut write_acl = trivial;
         write_acl[2].mask |= WRITE_ACL;
         assert!(!is_trivial(&write_acl), "everyone@ allowed write_acl is trivial");
+    }
+
+    #[test]
+    fn ace_sid_json() {
+        // An entry as a reader without "sid" (rustic-bko before it) has it.
+        #[derive(Deserialize)]
+        struct OldAceEntry {
+            who: u32,
+            #[serde(default)]
+            flags: u16,
+        }
+
+        // The ACL of a file with usersid: and groupsid: entries (ls -V), as
+        // illumos.acl keeps it.
+        let sid = |s: &str| Some(s.to_string());
+        let entries = vec![
+            AceEntry {
+                who: 2_147_483_650,
+                mask: 1,
+                sid: sid("S-1-5-21-1111-2222-3333-1004"),
+                ..AceEntry::default()
+            },
+            AceEntry {
+                who: 2_147_483_651,
+                mask: 2,
+                flags: IDENTIFIER_GROUP,
+                ace_type: ACCESS_DENIED,
+                sid: sid("S-1-5-21-1111-2222-3333-1005"),
+            },
+            AceEntry {
+                who: 0xffff_ffff,
+                mask: 0x001e_019f,
+                flags: OWNER,
+                ..AceEntry::default()
+            },
+            AceEntry {
+                who: 60001,
+                mask: 1,
+                ..AceEntry::default()
+            },
+        ];
+        let want = concat!(
+            r#"[{"who":2147483650,"mask":1,"sid":"S-1-5-21-1111-2222-3333-1004"},"#,
+            r#"{"who":2147483651,"mask":2,"flags":64,"type":1,"sid":"S-1-5-21-1111-2222-3333-1005"},"#,
+            r#"{"who":4294967295,"mask":1966495,"flags":4096},{"who":60001,"mask":1}]"#
+        );
+        let json = serde_json::to_string(&entries).unwrap();
+        assert_eq!(json, want);
+        assert_eq!(serde_json::from_str::<Vec<AceEntry>>(&json).unwrap(), entries);
+
+        // A reader without "sid" gets the numbers.
+        let old: Vec<OldAceEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.len(), 4);
+        assert_eq!((old[1].who, old[1].flags), (2_147_483_651, IDENTIFIER_GROUP));
+
+        // Which entries get a SID: ephemeral ids, not owner@, group@ or
+        // everyone@ (whose who is -1).
+        let named: Vec<_> = entries.iter().map(names_sid).collect();
+        assert_eq!(named, [true, true, false, false]);
+        assert!(is_group(&entries[1]) && !is_group(&entries[0]));
+        let group = AceEntry {
+            who: 0xffff_ffff,
+            flags: GROUP | IDENTIFIER_GROUP,
+            ..AceEntry::default()
+        };
+        assert!(!names_sid(&group), "group@ names a SID");
+        let max = AceEntry {
+            who: MAX_UID,
+            ..AceEntry::default()
+        };
+        assert!(!names_sid(&max), "MAXUID names a SID");
+    }
+
+    #[test]
+    fn split_sids() {
+        assert_eq!(
+            split_sid("S-1-5-21-1111-2222-3333-1001"),
+            Some(("S-1-5-21-1111-2222-3333", 1001))
+        );
+        assert_eq!(split_sid("S-1-5-32-544"), Some(("S-1-5-32", 544)));
+        for sid in [
+            "",
+            "S",
+            "1001",
+            "-1001",
+            "S-1-5-21-",
+            "S-1-5-21-x",
+            "S-1-5-21-+5",
+            "S-1-5-21-4294967296",
+            "X-1-5-1",
+        ] {
+            assert_eq!(split_sid(sid), None, "malformed SID {sid:?} split");
+        }
     }
 }

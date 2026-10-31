@@ -613,7 +613,10 @@ pub(crate) fn set_metadata(
     debug!("setting metadata for {}", path.display());
     dest.create_special(path, node)
         .unwrap_or_else(|_| warn!("restore {}: creating special file failed.", path.display()));
-    // BackOtter: numeric ids, unless names are asked for (--by-name).
+    // BackOtter: numeric ids, unless names are asked for (--by-name); then
+    // on illumos the ids an owner and group that are SIDs have here, before
+    // the mode, which a change of owner can clear the setuid bit of.
+    let target = dest.path(path);
     match ownership(opts) {
         Ownership::None => {}
         Ownership::Numeric => dest
@@ -623,10 +626,13 @@ pub(crate) fn set_metadata(
             .set_user_group(path, &node.meta)
             .unwrap_or_else(|_| warn!("restore {}: setting User/Group failed.", path.display())),
     }
+    if ownership(opts) != Ownership::None {
+        osattrs::restore_owner(&target, node)
+            .unwrap_or_else(|err| osattrs::warn_restore(path, &err));
+    }
     dest.set_permission(path, node)
         .unwrap_or_else(|_| warn!("restore {}: chmod failed.", path.display()));
     // BackOtter: the attributes osattrs keeps; ACLs after the mode.
-    let target = dest.path(path);
     if node.is_symlink() {
         osattrs::restore_symlink_mode(&target, node)
             .unwrap_or_else(|err| warn!("restore {}: {err}", path.display()));
@@ -641,7 +647,7 @@ pub(crate) fn set_metadata(
     osattrs::restore_attributes(&target, node)
         .unwrap_or_else(|err| osattrs::warn_restore(path, &err));
     osattrs::restore_acls(&target, node)
-        .unwrap_or_else(|err| warn!("restore {}: {err}", path.display()));
+        .unwrap_or_else(|err| osattrs::warn_restore(path, &err));
     // BackOtter: the birth time just before the times, which on FreeBSD and
     // NetBSD replace the earlier mtime it is set as.
     osattrs::restore_birthtime(&target, node)

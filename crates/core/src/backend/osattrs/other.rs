@@ -50,6 +50,10 @@ pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) 
     Ok(())
 }
 
+pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
+    Ok(())
+}
+
 pub(super) fn restore_attributes(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }

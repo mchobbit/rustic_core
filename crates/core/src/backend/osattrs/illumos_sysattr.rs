@@ -31,8 +31,9 @@ const BITS: [(&str, u32); 12] = [
     ("sparse", 1 << 11),
 ];
 
-/// ZFS sets these two on every file it writes, as Windows does its archive
-/// bit; on their own they're no reason to keep a file's attributes.
+/// ZFS sets these two on every file it creates or writes to, as Windows does
+/// its archive bit; on their own they're no reason to keep a file's
+/// attributes.
 pub(super) const AUTOMATIC: u32 = 1 << 3 | 1 << 9; // archive, av_modified
 
 const NV_ENCODE_XDR: u8 = 1;
@@ -138,6 +139,19 @@ impl<'a> View<'a> {
         BITS.iter()
             .filter(|(name, _)| self.has_boolean(name) && be32(self.0[*name].value, 0) != 0)
             .fold(0, |mask, (_, bit)| mask | bit)
+    }
+
+    /// The system attributes in the view, as a mask, if they are worth
+    /// keeping: unless they are what a new file gets, the automatic ones the
+    /// view has. So a mask of 0 is kept where the view has them, for a file
+    /// whose archive and av_modified were cleared, which ZFS would set again.
+    pub(super) fn kept_mask(&self) -> Option<u32> {
+        let automatic = BITS
+            .iter()
+            .filter(|(name, bit)| bit & AUTOMATIC != 0 && self.has_boolean(name))
+            .fold(0, |mask, (_, bit)| mask | bit);
+        let mask = self.mask();
+        (mask != automatic).then_some(mask)
     }
 
     /// The nvlist that sets the system attributes to those in `mask`: a
@@ -370,6 +384,33 @@ mod tests {
         assert_eq!(written.crtime(), None);
 
         assert!(View::parse(&[0, 1, 0, 0]).is_err(), "a native-encoded nvlist was accepted");
+    }
+
+    #[test]
+    fn kept_masks() {
+        let plain = unhex(SUNWATTR_PLAIN);
+        let plain = View::parse(&plain).unwrap();
+        // The plain view with every attribute cleared, archive and
+        // av_modified too (chmod S-varchive,av_modified), and with
+        // av_modified alone cleared.
+        let cleared = plain.mask_nvlist(0);
+        let no_av_modified = plain.mask_nvlist(bit("archive"));
+        let immutable = unhex(SUNWATTR_RW);
+        let crtime_only = unhex(NVLIST_CRTIME);
+        for (what, buf, kept) in [
+            ("new file", &plain.mask_nvlist(AUTOMATIC), None),
+            (
+                "immutable, nodump",
+                &immutable,
+                Some(bit("immutable") | bit("nodump") | AUTOMATIC),
+            ),
+            ("archive and av_modified cleared", &cleared, Some(0)),
+            ("av_modified cleared", &no_av_modified, Some(bit("archive"))),
+            ("no attributes in the view", &crtime_only, None),
+        ] {
+            assert_eq!(View::parse(buf).unwrap().kept_mask(), kept, "{what}");
+        }
+        assert_eq!(plain.kept_mask(), None);
     }
 
     #[test]

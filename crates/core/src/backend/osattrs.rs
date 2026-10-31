@@ -17,6 +17,10 @@
 //! restore to make them sparse again, and FreeBSD, NetBSD and illumos keep
 //! birth times (`unix.birthtime`), which the restore sets just before the
 //! atime and mtime.
+//!
+//! illumos also keeps the SIDs of owners and ACL entries that are SIDs, the
+//! owner, mode, times and ACL of each extended attribute, and ZFS project
+//! IDs.
 
 // System calls and ioctls rustic's dependencies don't wrap.
 #![allow(unsafe_code)]
@@ -43,7 +47,11 @@ mod freebsd_acl;
 #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
 mod freebsd_netbsd;
 mod illumos_acl;
+#[cfg(target_os = "illumos")]
+mod illumos_idmap;
+mod illumos_project;
 mod illumos_sysattr;
+mod illumos_xattrmeta;
 #[cfg(unix)]
 mod sparse;
 
@@ -93,7 +101,12 @@ use other as os;
 /// Records the file flags and other attributes of the file at `path`, with
 /// metadata `m` (its lstat), in the generic attributes of its `node`. Errors
 /// are warned about: the rest of the node is still worth saving.
-pub(crate) fn fill(path: &Path, node: &mut Node, m: &std::fs::Metadata) {
+///
+/// `xattrs` says whether the backup keeps extended attributes; on illumos
+/// this records their metadata then, which must come before their values
+/// are read (illumos has no `O_NOATIME`, and a read moves an attribute's
+/// atime).
+pub(crate) fn fill(path: &Path, node: &mut Node, m: &std::fs::Metadata, xattrs: bool) {
     // On Linux, the one open of the file for its flags, project ID and holes;
     // on illumos, of its system attribute view.
     let f = os::open_for_attrs(path, &node.node_type, m);
@@ -106,6 +119,12 @@ pub(crate) fn fill(path: &Path, node: &mut Node, m: &std::fs::Metadata) {
     if let Err(err) = os::fill_attributes(path, node, f.as_ref()) {
         warn!("ignoring attributes of {}: {err}", path.display());
     }
+    #[cfg(target_os = "illumos")]
+    if xattrs {
+        os::fill_xattr_meta(path, node);
+    }
+    #[cfg(not(target_os = "illumos"))]
+    let _ = xattrs;
     // The birth time of every type of file, where the lstat has one (on
     // illumos it is in the system attribute view, which `fill_attributes`
     // reads). Not on Linux, which can't set one back, nor OpenBSD or
@@ -367,50 +386,108 @@ impl Unsupported {
     }
 }
 
-/// The kinds of unsupported metadata the restore has warned about, with the
-/// first file of each and the number of files.
+/// BackOtter: a SID on illumos that idmap couldn't map to an id here
+/// (idmapd isn't running, say): the owner or group of a file
+/// (`illumos.owner_sid`, `illumos.group_sid`), or the user or group of an
+/// ACL entry (`illumos.acl`, `illumos.xattr_meta`), which got nobody (60001)
+/// instead, not the number the backup saw: that may be another SID's by now.
+/// The restore warns about each attribute once ([`warn_restore`]).
+#[derive(Debug)]
+pub(crate) struct SidUnmapped {
+    /// The generic attribute.
+    pub(crate) attr: &'static str,
+    /// The SID.
+    pub(crate) sid: String,
+    /// idmap's error.
+    pub(crate) source: io::Error,
+}
+
+impl fmt::Display for SidUnmapped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} {} not mapped by idmap, nobody (60001) used: {}",
+            self.attr, self.sid, self.source
+        )
+    }
+}
+
+impl std::error::Error for SidUnmapped {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl SidUnmapped {
+    /// An [`io::Error`] for this.
+    #[cfg_attr(not(target_os = "illumos"), allow(dead_code))]
+    fn error(attr: &'static str, sid: &str, source: io::Error) -> io::Error {
+        io::Error::other(Self {
+            attr,
+            sid: sid.to_string(),
+            source,
+        })
+    }
+}
+
+/// The kinds of metadata the restore has warned about once (unsupported
+/// metadata, unmapped SIDs), each with the first file and the number of
+/// files.
 static UNSUPPORTED: Mutex<BTreeMap<String, (PathBuf, u64)>> = Mutex::new(BTreeMap::new());
 
 /// Warns about an error restoring the metadata of `path`: an [`Unsupported`]
-/// one once per kind, with the first file, and [`report_unsupported`] counts
-/// the files; any other each time.
+/// or [`SidUnmapped`] one once per kind, with the first file, and
+/// [`report_unsupported`] counts the files; any other each time.
 pub(crate) fn warn_restore(path: &Path, err: &io::Error) {
-    let Some(unsupported) = err.get_ref().and_then(|e| e.downcast_ref::<Unsupported>()) else {
+    let inner = err.get_ref();
+    let (kind, msg) = if let Some(e) = inner.and_then(|e| e.downcast_ref::<Unsupported>()) {
+        (format!("{} not supported by the file system", e.kind()), e.to_string())
+    } else if let Some(e) = inner.and_then(|e| e.downcast_ref::<SidUnmapped>()) {
+        (format!("{}: SIDs not mapped by idmap, nobody (60001) used", e.attr), e.to_string())
+    } else {
         warn!("restore {}: {err}", path.display());
         return;
     };
     let mut seen = UNSUPPORTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (_, n) = seen
-        .entry(unsupported.kind())
-        .or_insert_with(|| (path.to_path_buf(), 0));
+    let (_, n) = seen.entry(kind).or_insert_with(|| (path.to_path_buf(), 0));
     *n += 1;
     let first = *n == 1;
     drop(seen);
     if first {
-        warn!("restore {}: {unsupported}", path.display());
+        warn!("restore {}: {msg}", path.display());
     }
 }
 
 /// Warns, once a restore is done, about the number of files with each kind
-/// of unsupported metadata [`warn_restore`] saw more than once, and starts
-/// counting again.
+/// of metadata [`warn_restore`] saw more than once, and starts counting
+/// again.
 pub(crate) fn report_unsupported() {
     let seen = std::mem::take(
         &mut *UNSUPPORTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
     );
     for (kind, (first, n)) in seen {
         if n > 1 {
-            warn!(
-                "{kind} not supported by the file system: {n} files, the first {}",
-                first.display()
-            );
+            warn!("{kind}: {n} files, the first {}", first.display());
         }
     }
 }
 
+/// Gives the file at `path` the owner and group that `node` keeps as SIDs
+/// (illumos), as the ids they have here, after the restore gave it its
+/// numbers. Elsewhere, nothing.
+///
+/// # Errors
+///
+/// * If the owner couldn't be set, or a SID couldn't be mapped (a
+///   [`SidUnmapped`] error: the file got nobody instead).
+pub(crate) fn restore_owner(path: &Path, node: &Node) -> io::Result<()> {
+    os::restore_owner(path, node)
+}
+
 /// Restores the attributes that go along with the extended attributes
-/// (FreeBSD's and NetBSD's system extended attributes), and warns once about
-/// each generic attribute that isn't known at all.
+/// (FreeBSD's and NetBSD's system extended attributes, illumos' extended
+/// attributes' own metadata and ZFS project IDs), and warns once about each
+/// generic attribute that isn't known at all.
 ///
 /// # Errors
 ///

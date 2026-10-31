@@ -27,14 +27,40 @@ that either program restores what the other backed up.
   - `freebsd.acl_nfs4`: NFSv4 ACLs (ZFS, UFS mounted `nfsv4acls`).
   - `freebsd.system_extattrs`: extended attributes in the system namespace,
     except those UFS stores ACLs in.
-  - `illumos.acl`: ZFS's ACLs on illumos (NFSv4-style ACEs).
+  - `illumos.acl`: ZFS's ACLs on illumos (NFSv4-style ACEs). An entry for
+    a SID (a user or group with an ephemeral id, above 2147483647, and not
+    `owner@`, `group@` or `everyone@`) has the SID too, in `"sid"`, which
+    older readers ignore:
+    `{"who":2147483650,"mask":1,"sid":"S-1-5-21-1111-2222-3333-1004"}`.
+  - `illumos.owner_sid`, `illumos.group_sid`: the SID a file's owner or
+    group is, as a string (`"S-1-5-21-1111-2222-3333-1001"`), when its uid
+    or gid is ephemeral. See "SIDs on illumos" below.
   - `illumos.system_attributes`: illumos' system attributes (`chmod(1)`'s
-    `S+v...`), as a mask; `archive` and `av_modified` only along with
-    others, since ZFS sets them on every file. They are read and written
-    through each file's `SUNWattr_rw` view, a packed nvlist; a restore
-    writes an nvlist of the attributes' booleans alone, never the view it
-    read, which would set the creation time too (refused on an immutable
-    file).
+    `S+v...`), as a mask, whenever they aren't what ZFS gives a new file
+    (`archive` and `av_modified`), 0 included: a file whose archive or
+    av_modified was cleared keeps that. They are read and written through
+    each file's `SUNWattr_rw` view, a packed nvlist, read in one `read(2)`
+    (illumos packs the view afresh for each read, from its start, whatever
+    the offset); a restore writes an nvlist of the attributes' booleans
+    alone, never the view it read, which would set the creation time too
+    (refused on an immutable file).
+  - `illumos.xattr_meta`: the owner, group, mode, times and ACL of each of
+    a file's extended attributes (attribute files, `runat(1)`), by name:
+    `{"note":{"uid":1500,"gid":1501,"mode":416,"mtime":"2001-09-09T01:46:40.123456789Z","atime":"2001-09-09T01:46:40Z","acl":[...]}}`,
+    the times in the form of the node's, `"acl"` only when the ACL says
+    more than the mode, in `illumos.acl`'s form, SIDs included. Written for
+    every file with extended attributes (unless `--set-xattrs no`), read
+    with `fstatat(2)` and `facl(2)` on the attribute directory before the
+    values: reading a value moves the attribute's atime (illumos has no
+    `O_NOATIME`), so the next backup keeps the time of this one's read, and
+    a file with extended attributes gets a new node in each snapshot, as
+    with BackOtter's restic. For this the backup reads every file's
+    extended attributes after its other metadata (stock rustic reads them
+    first).
+  - `illumos.zfs_project`: a file's ZFS project ID and whether it hands it
+    down (`zfs project -p 77 -s`), as `{"id":77,"inherit":true}`
+    (`"inherit"` left out when false), when it has either; regular files
+    and directories.
   - `openbsd.file_flags`: OpenBSD's `chflags(1)` flags.
   - `netbsd.file_flags`: NetBSD's `chflags(1)` flags, all but the three
     the kernel manages (`SF_SNAPSHOT`, `SF_SNAPINVAL`, and `SF_LOG`, which
@@ -103,8 +129,9 @@ that either program restores what the other backed up.
     it, nor OpenBSD or DragonFly, which keep none. (`windows.creation_time`
     is a FILETIME, in 100 ns ticks, and restic on Windows would apply it.)
   A file only gets an attribute when it has something the mode doesn't say
-  (flags, a project ID, a non-trivial ACL, holes), except for its birth
-  time on FreeBSD, NetBSD and illumos. A generic attribute
+  (flags, a project ID, a non-trivial ACL, holes, a SID), except for its
+  birth time on FreeBSD, NetBSD and illumos and its extended attributes'
+  metadata on illumos. A generic attribute
   rustic doesn't know at all gets a warning, once; one of another system is
   skipped quietly. A known attribute with a value that can't be read
   (`linux.inode_flags`, `linux.project_id`, `unix.sparse`,
@@ -161,7 +188,46 @@ that either program restores what the other backed up.
 - On illumos, extended attributes are named attribute files (`runat(1)`),
   which the xattr crate doesn't support: they are read and written through
   `openat(2)` with `O_XATTR`, without the `SUNWattr_ro` and `SUNWattr_rw`
-  system attribute views, as BackOtter's restic does.
+  system attribute views, as BackOtter's restic does. A restore creates an
+  attribute file with mode 0600, so that it is never readable by others
+  before it gets its own owner, mode, ACL and times (`illumos.xattr_meta`),
+  with `fchownat(2)`, `fchmodat(2)`, `facl(2)` and `utimensat(2)` on the
+  attribute directory, in that order, once the values are written (in
+  `osattrs::restore_attributes`); an attribute the restore left out is left
+  alone. This goes before the file's own times (writing an attribute file
+  leaves them) and flags. A snapshot without the attribute restores as
+  before.
+- illumos ZFS project IDs are restored with the extended attributes'
+  metadata, before the flags, as each node's own ID and inheritance,
+  whatever a file got from the directory it was created in; on another file
+  system than ZFS (`ENOTTY`) they get one warning per restore, as other
+  unsupported metadata. ZFS on illumos has no `FS_IOC_FSGETXATTR`, but
+  ioctls `'X'` 31 and 32 (`0x4008581f`, `0x80085820`) with an 8-byte struct
+  of the flags, of which only inheritance (`0x20000000`) is used, and the
+  project ID (checked on OmniOS r151058, with `truss` and `zfs project`).
+- **SIDs on illumos.** A file owned by a SID (a Windows user or group, as
+  the SMB server and ZFS keep them) has an ephemeral uid or gid, which
+  idmapd hands out when asked and forgets at a reboot: restored as a number
+  after a reboot, it becomes another SID's or nobody (60001). So a backup
+  asks libidmap for the SID of every ephemeral owner, group and ACL entry
+  and keeps it, and a restore asks it for the id the SID has now, and gives
+  the file that (a second `lchown(2)`, right after the one with the numbers,
+  before the mode: `osattrs::restore_owner`, a no-op elsewhere) and the ACL
+  entry that. A SID idmap can't map gets nobody (60001), never the number
+  the backup saw, which may be another SID's by now, with a warning once
+  per attribute and the number of files at the end; it isn't an error. A
+  backup where idmap gives no SID warns once (`idmap offline: SID owners
+  not kept`); with idmapd not running at all, `stat(2)` already gives every
+  ephemeral id as 60001, and nothing can be kept. So **svc:/system/idmap
+  must be online** at backup and at restore: BackOtter's illumos rescue
+  system runs `svcadm enable -s idmap`. libidmap is private to illumos (no
+  header installed), so rustic opens `libidmap.so.1` with `dlopen(3C)` the
+  first time it needs it rather than link with it: the binary doesn't
+  depend on it, and where it can't be opened, that is treated as idmap
+  failing. The calls are `idmap_get_create`,
+  `idmap_get_sidbyuid`/`_sidbygid`, `idmap_get_uidbysid`/`_gidbysid`,
+  `idmap_get_mappings` and `idmap_get_destroy`; their answers are kept
+  for the run.
 - A file that can't have extended attributes (a FIFO on ZFS) has none,
   rather than a warning, as in restic.
 - A backup keeps the metadata of the directory it backs up (stock rustic
@@ -193,7 +259,8 @@ that either program restores what the other backed up.
 - Metadata the target file system doesn't support (flags, casefolding or a
   project ID it refuses with `ENOTTY`, `EOPNOTSUPP`/`ENOTSUP` or `EINVAL`)
   gets one warning per kind (attribute and refused flags) per restore,
-  naming the first file, and the number of files at the end. Any other
+  naming the first file, and the number of files at the end, as do SIDs
+  idmap can't map on illumos (per attribute). Any other
   failure (`EPERM`, `EDQUOT`, `EIO`, ...) is warned about for each file.
   Neither changes the exit status: like stock rustic's, the restore only
   warns about metadata it can't set, where BackOtter's restic fails (exit

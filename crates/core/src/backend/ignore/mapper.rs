@@ -114,7 +114,6 @@ impl LocalSourceSaveOptions {
                 .inspect_err(|err| warn!("ignoring error obtaining xargs: {err}"))
                 .unwrap_or_default()
         };
-        let extended_attributes = self.set_xattrs.unwrap_or_default().map_or_else(xattr);
         let (mode, inode, links) = Self::nix_infos(&m);
 
         let meta = Metadata {
@@ -130,12 +129,16 @@ impl LocalSourceSaveOptions {
             device_id,
             size,
             links,
-            extended_attributes,
+            extended_attributes: Vec::new(),
             generic_attributes: GenericAttributes::default(),
         };
 
         let mut node = self.to_node(&entry, &m, meta)?;
-        osattrs::fill(entry.path(), &mut node, &m);
+        // BackOtter: the extended attributes' values after osattrs, which on
+        // illumos reads their metadata first: reading a value moves its atime.
+        let set_xattrs = self.set_xattrs.unwrap_or_default();
+        osattrs::fill(entry.path(), &mut node, &m, set_xattrs == XattrOption::Yes);
+        node.meta.extended_attributes = set_xattrs.map_or_else(xattr);
         let path = entry.into_path();
         let open = Some(OpenFile(path.clone()));
         Ok(ReadSourceEntry { path, node, open })
