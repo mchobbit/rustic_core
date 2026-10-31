@@ -116,15 +116,22 @@ pub(super) fn restore_file_flags(
     _xattrs: &[ExtendedAttribute],
 ) -> io::Result<()> {
     // Leave the flags that aren't kept as the file has them.
-    let own = std::fs::symlink_metadata(path)
+    let current = std::fs::symlink_metadata(path)
         .map_err(|err| path_error("lstat", path, &err))?
-        .st_flags()
-        & !KEPT_FLAGS;
+        .st_flags();
+    let own = current & !KEPT_FLAGS;
     let p = c_path(path)?;
-    set_flags_best_effort(FREEBSD_FILE_FLAGS, path, "lchflags", flags & KEPT_FLAGS, |bits| {
-        // SAFETY: p is a C string.
-        check(unsafe { libc::lchflags(p.as_ptr(), (own | bits).into()) }).map(drop)
-    })
+    set_flags_best_effort(
+        FREEBSD_FILE_FLAGS,
+        path,
+        "lchflags",
+        Some(current & KEPT_FLAGS),
+        flags & KEPT_FLAGS,
+        |bits| {
+            // SAFETY: p is a C string.
+            check(unsafe { libc::lchflags(p.as_ptr(), (own | bits).into()) }).map(drop)
+        },
+    )
 }
 
 pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) -> io::Result<()> {

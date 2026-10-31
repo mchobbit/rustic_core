@@ -71,7 +71,7 @@ pub(super) fn restore_file_flags(
 ) -> io::Result<()> {
     let p = c_path(path)?;
     let symlink = matches!(typ, NodeType::Symlink { .. });
-    set_flags_best_effort(OPENBSD_FILE_FLAGS, path, "chflags", flags & KEPT_FLAGS, |bits| {
+    set_flags_best_effort(OPENBSD_FILE_FLAGS, path, "chflags", None, flags & KEPT_FLAGS, |bits| {
         // SAFETY: p is a C string.
         let r = unsafe {
             if symlink {

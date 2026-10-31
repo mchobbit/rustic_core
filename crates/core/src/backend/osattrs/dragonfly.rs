@@ -64,6 +64,7 @@ pub(super) fn restore_file_flags(
         DRAGONFLY_FILE_FLAGS,
         path,
         "lchflags",
+        None,
         flags & DRAGONFLY_KEPT_FLAGS,
         |bits| {
             // SAFETY: p is a C string.

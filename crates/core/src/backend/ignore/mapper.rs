@@ -241,7 +241,9 @@ impl LocalSourceSaveOptions {
         }
         // BackOtter: osattrs::xattr_list, as the xattr crate's list misnames
         // one on FreeBSD; none where there can be none (a FIFO on ZFS), as
-        // restic does; and restic's names (osattrs::xattr_node_name).
+        // restic does; restic's names (osattrs::xattr_node_name); and in the
+        // byte order of those names, as BackOtter's restic stores them, not
+        // in the order the file system lists them.
         let names = match osattrs::xattr_list(path) {
             Err(err) if err.kind() == std::io::ErrorKind::Unsupported => Vec::new(),
             names => names.map_err(|err| IgnoreErrorKind::ErrorXattr {
@@ -249,9 +251,13 @@ impl LocalSourceSaveOptions {
                 source: err,
             })?,
         };
-        names
+        let mut names: Vec<_> = names
             .into_iter()
             .filter_map(|name| Some((osattrs::xattr_node_name(&name)?, name)))
+            .collect();
+        names.sort_unstable();
+        names
+            .into_iter()
             .map(|(node_name, name)| {
                 Ok(ExtendedAttribute {
                     name: node_name,
@@ -318,5 +324,37 @@ impl LocalSourceSaveOptions {
 
     fn to_node_other(self, name: &OsStr, _m: &std::fs::Metadata, meta: Metadata) -> Node {
         Node::new_node(name, NodeType::File, meta)
+    }
+}
+
+#[cfg(all(test, not(any(windows, target_os = "openbsd", target_os = "illumos"))))]
+mod tests {
+    use super::*;
+
+    /// BackOtter: extended attributes are stored in the byte order of their
+    /// names, whatever order the file system lists them in, as BackOtter's
+    /// restic stores them.
+    #[test]
+    fn xattrs_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, b"hello world").unwrap();
+        for name in ["user.zeta", "user.alpha", "user.mid", "user.Beta"] {
+            if xattr::set(&path, name, name.as_bytes()).is_err() {
+                // A file system without user extended attributes.
+                return;
+            }
+        }
+        let names: Vec<_> = LocalSourceSaveOptions::xattrs(&path)
+            .unwrap()
+            .into_iter()
+            .map(|attr| attr.name)
+            .collect();
+        let want = ["user.Beta", "user.alpha", "user.mid", "user.zeta"];
+        let want: Vec<_> = want
+            .iter()
+            .filter_map(|name| osattrs::xattr_node_name(name.as_ref()))
+            .collect();
+        assert_eq!(names, want);
     }
 }

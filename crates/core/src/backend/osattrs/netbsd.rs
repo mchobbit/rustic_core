@@ -61,15 +61,16 @@ pub(super) fn restore_file_flags(
     _xattrs: &[ExtendedAttribute],
 ) -> io::Result<()> {
     // Leave the flags that aren't kept as the file has them.
-    let own = std::fs::symlink_metadata(path)
+    let current = std::fs::symlink_metadata(path)
         .map_err(|err| path_error("lstat", path, &err))?
-        .st_flags()
-        & !NETBSD_KEPT_FLAGS;
+        .st_flags();
+    let own = current & !NETBSD_KEPT_FLAGS;
     let p = c_path(path)?;
     set_flags_best_effort(
         NETBSD_FILE_FLAGS,
         path,
         "lchflags",
+        Some(current & NETBSD_KEPT_FLAGS),
         flags & NETBSD_KEPT_FLAGS,
         |bits| {
             // SAFETY: p is a C string.

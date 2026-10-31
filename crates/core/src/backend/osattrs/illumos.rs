@@ -32,7 +32,7 @@ use jiff::Timestamp;
 use log::{debug, warn};
 
 use super::{
-    SidUnmapped, Unsupported, XattrErrors, c_path, check,
+    RestoreErrors, SidUnmapped, Unsupported, XattrErrors, c_path, check,
     illumos_acl::{self, AceEntry, NOBODY},
     illumos_idmap,
     illumos_project::ZfsProject,
@@ -483,7 +483,11 @@ pub(super) fn prepare_dir_for_flags(_path: &Path, _flags: u32) -> io::Result<()>
 
 /// Sets the system attributes the view has to those in `flags`, writing
 /// their booleans alone: the whole view would set the creation time too,
-/// which an immutable file refuses.
+/// which an immutable file refuses. Each write names every boolean, so as
+/// not the owner, where one of them only root may set, the others are set
+/// and cleared one at a time from what the file has
+/// ([`set_flags_best_effort`]): `av_modified`, which the owner may set but
+/// not clear, stays as it is meanwhile (naming it unchanged is allowed).
 pub(super) fn restore_file_flags(
     path: &Path,
     typ: &NodeType,
@@ -493,9 +497,14 @@ pub(super) fn restore_file_flags(
     let f = sysattr_view(path, typ, true).map_err(|err| path_error("open SUNWattr_rw", path, &err))?;
     let buf = read_view(&f, path)?;
     let view = parse_view(&buf, path)?;
-    set_flags_best_effort(ILLUMOS_SYSTEM_ATTRIBUTES, path, "write SUNWattr_rw", flags, |mask| {
-        f.write_all_at(&view.mask_nvlist(mask), 0)
-    })
+    set_flags_best_effort(
+        ILLUMOS_SYSTEM_ATTRIBUTES,
+        path,
+        "write SUNWattr_rw",
+        Some(view.mask()),
+        flags,
+        |mask| f.write_all_at(&view.mask_nvlist(mask), 0),
+    )
 }
 
 pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) -> io::Result<()> {
@@ -506,17 +515,20 @@ pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) 
 /// the restore has given it its numbers, which may now be another SID's or
 /// none (nobody). A SID idmap can't map gives nobody (60001), with a
 /// [`SidUnmapped`] error: not the number, which may belong to another SID.
+/// The owner and the group unmapped both give both errors
+/// ([`RestoreErrors`]), a warning for each attribute.
 pub(super) fn restore_owner(path: &Path, node: &Node) -> io::Result<()> {
-    let mut unmapped = None;
-    let mut id = |attr: &'static str, group| {
+    let id = |attr: &'static str, group, unmapped: &mut Option<io::Error>| {
         node.meta
             .generic_attributes
             .get::<String>(attr)
             .transpose()
-            .map(|sid| sid.map(|sid| map_sid(attr, &sid, group, &mut unmapped)))
+            .map(|sid| sid.map(|sid| map_sid(attr, &sid, group, unmapped)))
             .map_err(io::Error::other)
     };
-    let (uid, gid) = (id(ILLUMOS_OWNER_SID, false)?, id(ILLUMOS_GROUP_SID, true)?);
+    let (mut owner_unmapped, mut group_unmapped) = (None, None);
+    let uid = id(ILLUMOS_OWNER_SID, false, &mut owner_unmapped)?;
+    let gid = id(ILLUMOS_GROUP_SID, true, &mut group_unmapped)?;
     if uid.is_none() && gid.is_none() {
         return Ok(());
     }
@@ -524,7 +536,7 @@ pub(super) fn restore_owner(path: &Path, node: &Node) -> io::Result<()> {
     // SAFETY: p is a C string; an id of -1 is left as it is.
     _ = check(unsafe { libc::lchown(p.as_ptr(), uid.unwrap_or(u32::MAX), gid.unwrap_or(u32::MAX)) })
         .map_err(|err| path_error("lchown", path, &err))?;
-    unmapped.map_or(Ok(()), Err)
+    RestoreErrors::result(owner_unmapped.into_iter().chain(group_unmapped).collect())
 }
 
 /// Restores the metadata of the extended attributes, whose values are
@@ -676,14 +688,18 @@ pub(super) fn xattrs(path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
 /// removed, as in BackOtter's restic: each failure is returned, by name.
 pub(super) fn set_xattrs(path: &Path, attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
     let Some(dir) = attr_dir(path)? else {
-        if attrs.is_empty() {
-            return Ok(());
+        // Each one named, as those that can't be set are.
+        let mut errors = XattrErrors::default();
+        for attr in attrs {
+            errors.push(
+                attr.name.as_str(),
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "no extended attributes on this file system",
+                ),
+            );
         }
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "no extended attributes on this file system",
-        )
-        .into());
+        return errors.into_result();
     };
     let mut errors = XattrErrors::default();
     match attr_names(&dir) {
