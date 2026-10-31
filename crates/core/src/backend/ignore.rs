@@ -18,7 +18,7 @@ use std::num::TryFromIntError;
 
 use crate::{
     Excludes,
-    backend::{ReadSource, ReadSourceEntry, ReadSourceOpen},
+    backend::{ReadSource, ReadSourceEntry, ReadSourceOpen, osattrs},
     error::{ErrorKind, RusticError, RusticResult},
 };
 
@@ -218,10 +218,25 @@ impl LocalSource {
 
 #[derive(Debug)]
 /// Describes an open file from the local backend.
-pub struct OpenFile(PathBuf);
+pub struct OpenFile {
+    /// The path of the file.
+    path: PathBuf,
+    /// BackOtter: whether it has holes (`unix.sparse`), and is read by its
+    /// data extents (`osattrs::backup_reader`).
+    sparse: bool,
+}
+
+impl OpenFile {
+    /// BackOtter: the file at `path`, which `sparse` says has holes.
+    pub(crate) const fn new(path: PathBuf, sparse: bool) -> Self {
+        Self { path, sparse }
+    }
+}
 
 impl ReadSourceOpen for OpenFile {
-    type Reader = File;
+    // BackOtter: a file with holes is read by its data extents, and its
+    // holes given as zeros without being read: the same bytes as the file.
+    type Reader = Box<dyn std::io::Read + Send>;
 
     /// Open the file from the local backend.
     ///
@@ -233,15 +248,16 @@ impl ReadSourceOpen for OpenFile {
     ///
     /// * If the file could not be opened.
     fn open(self) -> RusticResult<Self::Reader> {
-        let path = self.0;
-        open_noatime(&path).map_err(|err| {
+        let path = self.path;
+        let f = open_noatime(&path).map_err(|err| {
             RusticError::with_source(
                 ErrorKind::InputOutput,
                 "Failed to open file at `{path}`. Please make sure the file exists and is accessible.",
                 err,
             )
             .attach_context("path", path.display().to_string())
-        })
+        })?;
+        Ok(osattrs::backup_reader(f, self.sparse))
     }
 }
 

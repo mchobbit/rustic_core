@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::{collections::BTreeMap, io::Read};
 
 use crate::{
     archiver::{
@@ -18,6 +18,7 @@ use crate::{
     chunker::ChunkIter,
     crypto::hasher::hash,
     error::{ErrorKind, RusticError, RusticResult},
+    id::Id,
     index::{ReadGlobalIndex, indexer::SharedIndexer},
     progress::Progress,
     repofile::configfile::ConfigFile,
@@ -145,6 +146,7 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
         node: Node,
         p: &Progress,
     ) -> RusticResult<(Node, u64)> {
+        let mut zero_ids = BTreeMap::new();
         let chunks: Vec<_> = ChunkIter::from_config(
             &self.config,
             r,
@@ -152,7 +154,7 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
         )?
         .map(|chunk| {
             let chunk = chunk?;
-            let id = hash(&chunk);
+            let id = chunk_id(&chunk, &mut zero_ids);
             let size = chunk.len() as u64;
 
             if !self.index.has_data(&DataId::from(id)) {
@@ -182,5 +184,42 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
     /// * If the channel could not be dropped
     pub(crate) fn finalize(self) -> RusticResult<PackerStats> {
         self.data_packer.finalize()
+    }
+}
+
+/// The ID of `chunk`, its hash. BackOtter: all-zero chunks (a file's holes
+/// give many, all of the chunker's minimum size) are hashed once for each
+/// length, and their IDs kept in `zero_ids`: the same bytes, the same ID.
+fn chunk_id(chunk: &[u8], zero_ids: &mut BTreeMap<usize, Id>) -> Id {
+    if chunk.iter().all(|&b| b == 0) {
+        *zero_ids
+            .entry(chunk.len())
+            .or_insert_with(|| hash(chunk))
+    } else {
+        hash(chunk)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The IDs of all-zero chunks, kept, are their hashes all the same.
+    #[test]
+    fn chunk_id_is_the_hash() {
+        let mut zero_ids = BTreeMap::new();
+        let mut chunks = vec![Vec::new(), vec![0], vec![1], vec![0; 4096], vec![0; 512 << 10]];
+        let mut almost = vec![0; 4096];
+        almost[4095] = 1;
+        chunks.push(almost);
+        let mut almost = vec![0; 4096];
+        almost[0] = 1;
+        chunks.push(almost);
+        for _ in 0..2 {
+            for chunk in &chunks {
+                assert_eq!(chunk_id(chunk, &mut zero_ids), hash(chunk), "{}", chunk.len());
+            }
+        }
+        assert_eq!(zero_ids.len(), 4);
     }
 }
