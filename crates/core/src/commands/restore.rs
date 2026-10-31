@@ -464,18 +464,21 @@ fn restore_metadata(
 ) -> RusticResult<()> {
     // BackOtter: file flags go on last of all (osattrs), once per file:
     // they belong to the file, not each of its names, and an immutable file
-    // (on illumos) refuses having them set again.
+    // (on illumos) refuses having them set again. ZFS's DOS flags (Linux)
+    // just before them.
     let mut file_flags = Vec::new();
     let mut flags_linked = BTreeSet::new();
     let mut finish = |path: &PathBuf, node: &Node| {
         set_metadata(dest, opts, path, node);
-        if let Some(flags) = osattrs::file_flags(node)
+        let (flags, dos_flags) = (osattrs::file_flags(node), osattrs::zfs_dos_flags(node));
+        if (flags.is_some() || dos_flags.is_some())
             && hardlink_key(node).is_none_or(|key| flags_linked.insert(key))
         {
             file_flags.push((
                 path.clone(),
                 node.node_type.clone(),
                 flags,
+                dos_flags,
                 osattrs::flags_xattrs(node),
             ));
         }
@@ -526,9 +529,16 @@ fn restore_metadata(
         finish(&path, &node);
     }
 
-    for (path, node_type, flags, xattrs) in file_flags {
-        osattrs::restore_file_flags(&dest.path(&path), &node_type, flags, &xattrs)
-            .unwrap_or_else(|err| osattrs::warn_restore(&path, &err));
+    for (path, node_type, flags, dos_flags, xattrs) in file_flags {
+        let target = dest.path(&path);
+        if let Some(dos_flags) = dos_flags {
+            osattrs::restore_zfs_dos_flags(&target, &node_type, dos_flags)
+                .unwrap_or_else(|err| osattrs::warn_restore(&path, &err));
+        }
+        if let Some(flags) = flags {
+            osattrs::restore_file_flags(&target, &node_type, flags, &xattrs)
+                .unwrap_or_else(|err| osattrs::warn_restore(&path, &err));
+        }
     }
     // BackOtter: how many files had metadata the file system doesn't
     // support, warned about once.

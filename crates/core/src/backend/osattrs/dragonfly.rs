@@ -12,6 +12,7 @@ pub(super) const FILE_FLAGS: Option<&str> = Some(DRAGONFLY_FILE_FLAGS);
 pub(super) const FLAGS_BEFORE_DATA: u32 = 0;
 pub(super) const FLAGS_BEFORE_ENTRIES: u32 = 0;
 pub(super) const FLAGS_XATTRS: &[&str] = &[];
+pub(super) const ZFS_DOS_FLAGS: Option<&str> = None;
 
 /// No file is opened for its attributes ahead of them here.
 pub(super) fn open_for_attrs(
@@ -64,6 +65,10 @@ pub(super) fn restore_file_flags(
             check(unsafe { libc::lchflags(p.as_ptr(), bits.into()) }).map(drop)
         },
     )
+}
+
+pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) -> io::Result<()> {
+    Ok(())
 }
 
 pub(super) fn restore_attributes(_path: &Path, _node: &Node) -> io::Result<()> {

@@ -8,6 +8,7 @@ pub(super) const FILE_FLAGS: Option<&str> = None;
 pub(super) const FLAGS_BEFORE_DATA: u32 = 0;
 pub(super) const FLAGS_BEFORE_ENTRIES: u32 = 0;
 pub(super) const FLAGS_XATTRS: &[&str] = &[];
+pub(super) const ZFS_DOS_FLAGS: Option<&str> = None;
 
 pub(super) fn open_for_attrs(_path: &Path, _typ: &NodeType, _m: &std::fs::Metadata) -> Option<File> {
     None
@@ -40,6 +41,10 @@ pub(super) fn restore_file_flags(
     _flags: u32,
     _xattrs: &[ExtendedAttribute],
 ) -> io::Result<()> {
+    Ok(())
+}
+
+pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) -> io::Result<()> {
     Ok(())
 }
 
