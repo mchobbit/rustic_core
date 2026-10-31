@@ -10,7 +10,7 @@ use std::{
 use bytesize::ByteSize;
 use derive_setters::Setters;
 use ignore::{Walk, WalkBuilder};
-use log::warn;
+use log::{debug, warn};
 use serde_with::{DisplayFromStr, serde_as};
 
 #[cfg(not(windows))]
@@ -317,7 +317,20 @@ impl Iterator for LocalSourceWalker {
     type Item = RusticResult<ReadSourceEntry<OpenFile>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.walker.next() {
+        let mut next = self.walker.next();
+        // BackOtter: sockets are skipped, as restic skips them: a socket is
+        // only the name a running program listens on, made again when it
+        // starts, and a restored one has nobody listening.
+        #[cfg(unix)]
+        while let Some(Ok(entry)) = &next
+            && entry
+                .file_type()
+                .is_some_and(|tpe| std::os::unix::fs::FileTypeExt::is_socket(&tpe))
+        {
+            debug!("{} is a socket, ignoring", entry.path().display());
+            next = self.walker.next();
+        }
+        match next {
             // ignore root dir, i.e. an entry with depth 0 of type dir
             // BackOtter: ... unless it has a name. A directory backed up keeps
             // its own metadata, as restic keeps it, for a restore of
@@ -351,5 +364,46 @@ impl Iterator for LocalSourceWalker {
                     .ask_report()
                 })
         })
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::net::UnixListener;
+
+    use super::*;
+    use crate::backend::ReadSource;
+
+    #[test]
+    fn sockets_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a-file"), b"data").unwrap();
+        let _socket = UnixListener::bind(dir.path().join("b-socket")).unwrap();
+        nix::unistd::mkfifo(&dir.path().join("c-fifo"), nix::sys::stat::Mode::S_IRWXU).unwrap();
+
+        let source = LocalSource::new(
+            LocalSourceSaveOptions::default(),
+            &Excludes::default(),
+            &LocalSourceFilterOptions::default(),
+            &[dir.path()],
+        )
+        .unwrap();
+        let mut names: Vec<_> = source
+            .entries()
+            .map(|entry| entry.unwrap().node.name().into_owned())
+            .collect();
+        names.sort();
+        let dir_name = dir.path().file_name().unwrap().to_owned();
+        assert_eq!(names, [dir_name, "a-file".into(), "c-fifo".into()]);
+
+        // A socket given as the path to back up is skipped too.
+        let source = LocalSource::new(
+            LocalSourceSaveOptions::default(),
+            &Excludes::default(),
+            &LocalSourceFilterOptions::default(),
+            &[dir.path().join("b-socket")],
+        )
+        .unwrap();
+        assert_eq!(source.entries().count(), 0);
     }
 }

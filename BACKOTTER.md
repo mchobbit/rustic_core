@@ -376,7 +376,13 @@ that either program restores what the other backed up.
   device's mode has Go's `ModeDevice` and `ModeCharDevice` (stock rustic
   ANDs the two bits, which gives none), only a regular file has a size
   (stock rustic stores a symlink's target length), and a FIFO or a socket
-  has no link count. Sockets are still kept, which restic skips.
+  has no link count.
+- Sockets are skipped, as restic skips them: a backup leaves them out
+  (stock rustic stored them), and a restore leaves out the socket nodes
+  of older snapshots (stock rustic made them with `mknod`, which works on
+  Linux only). A socket is only the name a running program listens on;
+  the program makes it again when it starts, and a restored one has
+  nobody listening.
 - Directories above the backed-up path (`/home` in a backup of
   `/home/m`) get nodes of rustic's own making, as in stock rustic
   (`archiver/tree.rs`): a directory with mode `0o755`, without Go's

@@ -168,7 +168,12 @@ pub(crate) fn restore_repository<S: IndexedTree>(
     )?;
 
     let p = repo.progress_spinner("setting metadata...");
-    restore_metadata(node_streamer, &file_infos.hardlink_candidates, opts, dest)?;
+    restore_metadata(
+        without_sockets(node_streamer),
+        &file_infos.hardlink_candidates,
+        opts,
+        dest,
+    )?;
     p.finish();
 
     Ok(())
@@ -196,10 +201,11 @@ pub(crate) fn restore_repository<S: IndexedTree>(
 pub(crate) fn collect_and_prepare<S: IndexedFull>(
     repo: &Repository<S>,
     opts: RestoreOptions,
-    mut node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
+    node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
     dest: &LocalDestination,
     dry_run: bool,
 ) -> RusticResult<RestorePlan> {
+    let mut node_streamer = without_sockets(node_streamer);
     let p = repo.progress_spinner("collecting file information...");
     let dest_path = dest.path("");
 
@@ -477,6 +483,21 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
     p.finish();
 
     Ok(restore_infos)
+}
+
+/// BackOtter: the nodes to restore, without sockets, which restic doesn't
+/// restore either. A backup skips them now; older rustic snapshots have them.
+fn without_sockets(
+    node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
+) -> impl Iterator<Item = RusticResult<(PathBuf, Node)>> {
+    node_streamer.filter(|item| {
+        let Ok((path, node)) = item else { return true };
+        let socket = matches!(node.node_type, NodeType::Socket);
+        if socket {
+            debug!("{} is a socket, not restored", path.display());
+        }
+        !socket
+    })
 }
 
 /// Restore the metadata of the files and directories.
@@ -1111,6 +1132,23 @@ mod tests {
         // A file that exists is written in full, whatever it was.
         assert!(!write_sparse(None, &marked, false));
         assert!(!write_sparse(by_content, &plain, false));
+    }
+
+    #[test]
+    fn sockets_not_restored() {
+        let node = |name: &str, node_type| {
+            Node::new_node(name.as_ref(), node_type, crate::backend::node::Metadata::default())
+        };
+        let nodes = vec![
+            Ok((PathBuf::from("dir"), node("dir", NodeType::Dir))),
+            Ok((PathBuf::from("dir/file"), node("file", NodeType::File))),
+            Ok((PathBuf::from("dir/socket"), node("socket", NodeType::Socket))),
+            Ok((PathBuf::from("dir/fifo"), node("fifo", NodeType::Fifo))),
+        ];
+        let paths: Vec<_> = without_sockets(nodes.into_iter())
+            .map(|item| item.unwrap().0)
+            .collect();
+        assert_eq!(paths, ["dir", "dir/file", "dir/fifo"].map(PathBuf::from));
     }
 
     #[test]
