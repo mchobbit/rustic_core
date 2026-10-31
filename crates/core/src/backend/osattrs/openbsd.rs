@@ -43,8 +43,8 @@ pub(super) fn file_flags(
     _typ: &NodeType,
     m: &std::fs::Metadata,
     _f: Option<&std::fs::File>,
-) -> io::Result<u32> {
-    Ok(m.st_flags() & KEPT_FLAGS)
+) -> io::Result<Option<u32>> {
+    Ok(Some(m.st_flags() & KEPT_FLAGS).filter(|&flags| flags != 0))
 }
 
 pub(super) fn fill_attributes(
@@ -107,4 +107,17 @@ pub(super) fn restore_symlink_mode(path: &Path, node: &Node) -> io::Result<()> {
 /// OpenBSD's FFS2 reports a birth time of 0.
 pub(super) fn restore_birthtime(_path: &Path, _node: &Node, _birth: Timestamp) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "OpenBSD keeps no birth times"))
+}
+
+/// Extended attributes have no metadata of their own here.
+pub(super) fn fill_xattr_meta(_path: &Path, _node: &mut Node) {}
+
+/// Extended attributes go through the xattr crate here.
+pub(super) fn xattrs(_path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr"))
+}
+
+/// Extended attributes go through the xattr crate here.
+pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr"))
 }
