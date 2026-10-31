@@ -14,9 +14,10 @@
 //! and every write sets the archive flag again.
 //!
 //! Every Unix also marks regular files with holes (`unix.sparse`), for the
-//! restore to make them sparse again, and FreeBSD, NetBSD and illumos keep
-//! birth times (`unix.birthtime`), which the restore sets just before the
-//! atime and mtime.
+//! backup to read them by their data extents and the restore to make them
+//! sparse again, and FreeBSD, NetBSD and illumos keep birth times
+//! (`unix.birthtime`), which the restore sets just before the atime and
+//! mtime.
 //!
 //! illumos also keeps the SIDs of owners and ACL entries that are SIDs, the
 //! owner, mode, times and ACL of each extended attribute, and ZFS project
@@ -145,6 +146,38 @@ pub(crate) fn fill(path: &Path, node: &mut Node, m: &std::fs::Metadata, xattrs: 
 /// Whether the file `node` had holes when it was backed up.
 pub(crate) fn is_sparse(node: &Node) -> bool {
     node.meta.generic_attributes.is_true(UNIX_SPARSE)
+}
+
+/// The reader the backup gives the chunker for the regular file `f`, whose
+/// node is `sparse` (marked `unix.sparse`): where the backup probes for holes
+/// with `SEEK_HOLE` (Linux and Android, FreeBSD, macOS, illumos), a file
+/// with holes is read by its data extents, and its holes given as zeros
+/// without being read. The bytes are those plain reading gives, so the
+/// chunks, blobs and trees are the same.
+#[cfg(unix)]
+pub(crate) fn backup_reader(f: File, sparse: bool) -> Box<dyn io::Read + Send> {
+    sparse::backup_reader(f, sparse)
+}
+
+/// The reader the backup gives the chunker for the file `f`: `f` itself.
+#[cfg(not(unix))]
+pub(crate) fn backup_reader(f: File, _sparse: bool) -> Box<dyn io::Read + Send> {
+    Box::new(f)
+}
+
+/// The size of the blocks a file restored sparse, `f`, has its holes in:
+/// its file system's block size (else its `st_blksize`), at least 4096
+/// bytes, as BackOtter's restic.
+#[cfg(unix)]
+pub(crate) fn hole_block_size(f: &File) -> u64 {
+    sparse::hole_block_size(f)
+}
+
+/// The size of the blocks a file restored sparse, `f`, has its holes in:
+/// 4096 bytes.
+#[cfg(not(unix))]
+pub(crate) const fn hole_block_size(_f: &File) -> u64 {
+    4096
 }
 
 /// The file flags `node` holds for this system, if any.

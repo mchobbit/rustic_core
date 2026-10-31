@@ -156,7 +156,8 @@ impl LocalSourceSaveOptions {
             node.meta.extended_attributes = set_xattrs.map_or_else(xattr);
         }
         let path = entry.into_path();
-        let open = Some(OpenFile(path.clone()));
+        // BackOtter: a file with holes is read by its data extents.
+        let open = Some(OpenFile::new(path.clone(), osattrs::is_sparse(&node)));
         Ok(ReadSourceEntry { path, node, open })
     }
 

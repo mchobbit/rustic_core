@@ -133,9 +133,9 @@ that either program restores what the other backed up.
     both tools alike: a file of up to 512 bytes, kept in its inode (0
     blocks), a compressed one (LZ4 by default) and runs of zeros, which
     HAMMER2 doesn't store. That does no harm: such a file is restored sparse,
-    which writes every byte of it but each blob's leading zeros, so it comes
-    back the same, only with holes where those zeros were (HAMMER2 itself
-    stores no zeros anyway).
+    which writes every byte of it but its all-zero blocks, so it comes back
+    the same, only with holes where those zeros were (HAMMER2 itself stores
+    no zeros anyway).
     On ZFS a probe of a file with unwritten changes waits for them to be
     written (a transaction group), as it does for BackOtter's restic, which
     probes the same files.
@@ -187,17 +187,47 @@ that either program restores what the other backed up.
   it runs on, which on a rescue system are the wrong ones. `restore
   --by-name` (or `--ownership-by-name`, restic's name for it) looks them up
   by name; `--numeric-id` is still accepted.
+- A backup reads a regular file marked `unix.sparse` on a probing system
+  (Linux and Android, FreeBSD, macOS, illumos) by its data extents, as
+  BackOtter's restic does: from where it is, `lseek(SEEK_DATA)` finds the
+  next data and `lseek(SEEK_HOLE)` the next hole, only the data is read
+  (`pread(2)`), and the chunker is given zeros for the holes without their
+  being read. Once a seek fails (`EINVAL`, `ENOTSUP`, ...), or nothing but
+  a hole is left (`ENXIO`; the hole ends at the size `fstat` gives before
+  `SEEK_DATA`, or after it if smaller, so that data appended meanwhile
+  isn't taken for a hole), the rest is read plainly, up to whatever end of
+  file a read finds. Each read fills the chunker's buffer across extents,
+  as a read of a regular file does: rustic's chunker reads on with a buffer
+  no longer than the last read gave, which reads short at every extent's
+  end would shrink to a byte. The chunker gets the
+  same bytes as from plain reading, so the chunks, blob IDs, trees and
+  snapshots are the same bit for bit; a file that grows or shrinks while
+  it is read is read as plain reading reads it, but for a hole already
+  found, which gives zeros even if data was written there since (as if it
+  had been read before the write). Other files, and every file elsewhere,
+  are read plainly. Each all-zero chunk (holes give many, all of the
+  chunker's minimum size) is hashed once per file and length: the same
+  bytes give the same ID. The rolling hash isn't skipped over long zero
+  runs: all-zero data already gives a boundary at the minimum chunk size,
+  with no rolling over its bytes.
 - A file is restored sparse if, and only if, it is marked `unix.sparse` (or
   `restore --sparse by-content` asks for every file; `--sparse no` doesn't
   unmark one), and it goes into a new, empty file: nothing was at its path
   when the restore planned it (after `--delete` removed what was there).
   That is checked on disk, not by what the walk of the destination saw (a
   file below a symlinked directory). A file restored sparse is sized
-  without being allocated, and each blob's longest all-zero prefix is left
-  unwritten (an all-zero blob not written at all), as BackOtter's restic
-  does; if it turns out not to be empty after all (a race), it is emptied
-  first, so that no hole keeps old contents. Stock rustic's `--sparse
-  by-content` left old contents where a zero chunk went.
+  without being allocated (`ftruncate`), and each blob is written but for
+  its all-zero blocks, as BackOtter's restic does: blocks of the
+  destination file system's block size (`f_bsize` of `fstatfs(2)`, of
+  `fstatvfs(2)` on NetBSD and illumos, else the file's `st_blksize`; at
+  least 4096 bytes, 4096 where none is known), aligned to the offsets in
+  the file, that lie wholly inside the blob and are all zeros stay holes;
+  everything else is written, the partial blocks at a blob's ends too,
+  zeros or not (the rest of their block belongs to the next blob). So a
+  file comes back with at most a block more than its data for each blob
+  boundary. If it turns out not to be empty after all (a race), it is
+  emptied first, so that no hole keeps old contents. Stock rustic's
+  `--sparse by-content` left old contents where a zero chunk went.
 - Every other file is allocated in full: a new file, or an existing one the
   restore writes into (cut to length first, if longer), is preallocated
   when it is sized (`fallocate(2)` on Linux, `F_PREALLOCATE` on macOS, as
