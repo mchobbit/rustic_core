@@ -1386,7 +1386,6 @@ expression: snap
     "user": "[user]",
     "group": "[group]",
     "inode": "[inode]",
-    "size": 8,
     "links": 1,
     "content": None,
   },

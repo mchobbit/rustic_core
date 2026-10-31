@@ -43,7 +43,8 @@ pub const fn map_mode_to_go(mode: u32) -> u32 {
         S_IFLNK => go_mode |= GO_MODE_SYMLINK,
         S_IFBLK => go_mode |= GO_MODE_DEVICE,
         S_IFDIR => go_mode |= GO_MODE_DIR,
-        S_IFCHR => go_mode |= GO_MODE_CHARDEV & GO_MODE_DEVICE, // no idea why go sets both for char devices...
+        // BackOtter: both bits, as Go sets them (stock rustic ANDs them, to 0)
+        S_IFCHR => go_mode |= GO_MODE_CHARDEV | GO_MODE_DEVICE,
         S_IFIFO => go_mode |= GO_MODE_FIFO,
         // note that POSIX specifies regular files, whereas golang specifies irregular files
         S_IFREG => {}
@@ -138,5 +139,20 @@ pub fn get_user_by_uid(uid: u32) -> Option<String> {
             warn!("error getting user from uid {uid}: {err}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_modes_as_go() {
+        // BackOtter: a character device has Go's ModeDevice and
+        // ModeCharDevice, as restic stores it (0x42001a4 for 0644).
+        assert_eq!(map_mode_to_go(S_IFCHR | 0o644), 0x0420_01a4);
+        assert_eq!(map_mode_from_go(0x0420_01a4), S_IFCHR | 0o644);
+        assert_eq!(map_mode_to_go(S_IFBLK | 0o600), GO_MODE_DEVICE | 0o600);
+        assert_eq!(map_mode_from_go(GO_MODE_DEVICE | 0o600), S_IFBLK | 0o600);
     }
 }
