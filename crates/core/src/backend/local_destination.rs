@@ -946,9 +946,11 @@ impl LocalDestination {
     ///
     /// # Notes
     ///
-    /// BackOtter: whatever is at `item` already (the same link, left by an
-    /// earlier restore, or another file) is removed first, as BackOtter's
-    /// restic does: the link can't be made over it (`EEXIST`).
+    /// BackOtter: as in BackOtter's restic, what is at `item` already
+    /// (another file, a symlink) is replaced, as the link can't be made over
+    /// it (`EEXIST`); the same link, left by an earlier restore, is left as
+    /// it is (upstream's #634), which also keeps the file when a symlinked
+    /// directory makes both names one. A directory there is an error.
     pub(crate) fn hard_link(
         &self,
         source_item: impl AsRef<Path>,
