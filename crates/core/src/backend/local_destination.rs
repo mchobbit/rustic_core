@@ -890,11 +890,11 @@ impl LocalDestination {
     }
 
     /// BackOtter: write `data` to the given item (relative to the base
-    /// path), a file restored sparse, at `offset`, leaving holes: the blocks
-    /// of the file system ([`osattrs::hole_block_size`]) that lie wholly
-    /// inside `data` and are all zeros aren't written ([`sparse_writes`]).
-    /// The file must be new, sized without being allocated: its holes read
-    /// as zeros.
+    /// path), a file restored sparse, at `offset`, leaving holes: of each
+    /// block of the file system ([`osattrs::hole_block_size`]) that `data`
+    /// reaches into, the part inside `data` isn't written if it is all
+    /// zeros ([`sparse_writes`]). The file must be new, sized without being
+    /// allocated: what isn't written reads as zeros.
     ///
     /// # Errors
     ///
@@ -972,31 +972,37 @@ impl LocalDestination {
 }
 
 /// BackOtter: the ranges of `data`, written at `offset` of a file restored
-/// sparse, that are written: all but the blocks of `block` bytes, aligned
-/// to the file's offsets, that lie wholly inside `data` and are all zeros,
-/// which stay holes. Partial blocks at either end are written, zeros or
-/// not: the rest of their block belongs to another blob.
+/// sparse, that are written, as BackOtter's restic writes them: of each
+/// block of `block` bytes, aligned to the file's offsets, that `data`
+/// reaches into, the part inside `data`, unless it is all zeros. Nothing
+/// outside `data` is written: the file is new and sized without being
+/// allocated, so what no blob writes reads as zeros, and a block is
+/// allocated only if some blob puts a byte other than zero in it. Adjacent
+/// parts are one range.
 fn sparse_writes(offset: u64, data: &[u8], block: u64) -> Vec<std::ops::Range<usize>> {
-    let len = data.len();
-    let block = usize::try_from(block.max(1)).unwrap_or(usize::MAX);
-    // The first block boundary in data.
-    let first = usize::try_from(offset % block as u64).map_or(0, |rem| (block - rem) % block);
-    let mut writes = Vec::new();
-    let mut start = 0;
-    let mut pos = first;
-    while pos.checked_add(block).is_some_and(|end| end <= len) {
-        if data[pos..pos + block].iter().all(|&b| b == 0) {
-            if start < pos {
-                writes.push(start..pos);
+    let block = block.max(1);
+    let mut writes: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        // The end of the block data[pos] is in, or of data.
+        let rest = block - (offset + pos as u64) % block;
+        let next = usize::try_from(rest).map_or(data.len(), |n| n.min(data.len() - pos) + pos);
+        if !is_zero(&data[pos..next]) {
+            match writes.last_mut() {
+                Some(last) if last.end == pos => last.end = next,
+                _ => writes.push(pos..next),
             }
-            start = pos + block;
         }
-        pos += block;
-    }
-    if start < len {
-        writes.push(start..len);
+        pos = next;
     }
     writes
+}
+
+/// Whether `data` is all zeros: by pieces the compiler vectorizes, which
+/// a check byte by byte with an early stop isn't.
+pub(crate) fn is_zero(data: &[u8]) -> bool {
+    data.chunks(1024)
+        .all(|piece| piece.iter().fold(0, |acc, &b| acc | b) == 0)
 }
 
 #[cfg(test)]
@@ -1005,73 +1011,107 @@ mod sparse_tests {
 
     use super::*;
 
-    /// The writes, applied to zeros, give `data`; what they leave out are
-    /// whole aligned blocks of zeros inside `data`.
+    /// The writes are in order, apart, and inside `data`; applied to zeros
+    /// they give `data`; they start and end at `data`'s ends or at block
+    /// boundaries; and of the blocks `data` reaches into, they touch those
+    /// whose part in `data` has a byte other than zero, and no other.
     fn check(offset: u64, data: &[u8], block: u64) -> Vec<std::ops::Range<usize>> {
         let writes = sparse_writes(offset, data, block);
         let mut out = vec![0; data.len()];
-        let mut end = 0;
+        let mut end = None;
         for range in &writes {
-            assert!(range.start >= end && range.start < range.end, "{writes:?}");
-            let skipped = end..range.start;
-            check_skipped(offset, data, block, &skipped);
+            assert!(end.is_none_or(|end| range.start > end), "{writes:?}");
+            assert!(range.start < range.end && range.end <= data.len(), "{writes:?}");
+            for at in [range.start, range.end] {
+                assert!(
+                    at == 0 || at == data.len() || (offset + at as u64).is_multiple_of(block),
+                    "{writes:?}"
+                );
+            }
             out[range.clone()].copy_from_slice(&data[range.clone()]);
-            end = range.end;
+            end = Some(range.end);
         }
-        check_skipped(offset, data, block, &(end..data.len()));
         assert_eq!(out, data);
-        writes
-    }
-
-    fn check_skipped(offset: u64, data: &[u8], block: u64, skipped: &std::ops::Range<usize>) {
-        if skipped.is_empty() {
-            return;
+        let mut pos = 0;
+        while pos < data.len() {
+            let next = usize::try_from(block - (offset + pos as u64) % block)
+                .unwrap()
+                .min(data.len() - pos)
+                + pos;
+            let touched = writes.iter().any(|w| w.start < next && pos < w.end);
+            let nonzero = data[pos..next].iter().any(|&b| b != 0);
+            assert_eq!(touched, nonzero, "block part {pos}..{next}: {writes:?}");
+            pos = next;
         }
-        let block = usize::try_from(block).unwrap();
-        assert_eq!((offset + skipped.start as u64) % block as u64, 0, "{skipped:?}");
-        assert_eq!(skipped.len() % block, 0, "{skipped:?}");
-        assert!(data[skipped.clone()].iter().all(|&b| b == 0), "{skipped:?}");
+        writes
     }
 
     #[test]
     fn sparse_writes_cases() {
         const B: u64 = 4096;
-        let zeros = vec![0_u8; 4 * 4096];
-        // All zeros, aligned: nothing written.
+        const K: usize = 4096;
+        let zeros = vec![0_u8; 4 * K];
+        // All zeros, aligned or not, longer or shorter than a block:
+        // nothing written.
         assert!(check(0, &zeros, B).is_empty());
         assert!(check(8192, &zeros, B).is_empty());
-        // Unaligned: the partial blocks at either end are written.
-        assert_eq!(check(100, &zeros, B), vec![0..3996, 3996 + 3 * 4096..4 * 4096]);
-        // Shorter than a block: all of it.
-        assert_eq!(check(0, &zeros[..4095], B), vec![0..4095]);
-        assert_eq!(check(1, &zeros[..4096], B), vec![0..4096]);
+        assert!(check(100, &zeros, B).is_empty());
+        assert!(check(0, &zeros[..4095], B).is_empty());
+        assert!(check(1, &zeros[..4096], B).is_empty());
         assert!(check(0, &[], B).is_empty());
-        // Data in the second block.
-        let mut data = zeros;
+        // Data in the second block: that block.
+        let mut data = zeros.clone();
         data[5000] = 1;
-        assert_eq!(check(0, &data, B), vec![4096..8192]);
-        // A block from the end of one zero run to the start of the next.
-        data[4 * 4096 - 1] = 1;
-        assert_eq!(check(0, &data, B), vec![4096..8192, 3 * 4096..4 * 4096]);
-        // No zeros: one write.
+        assert_eq!(check(0, &data, B), vec![K..2 * K]);
+        // And at the end of the last.
+        data[4 * K - 1] = 1;
+        assert_eq!(check(0, &data, B), vec![K..2 * K, 3 * K..4 * K]);
+        // Unaligned: a partial block at either end is written only if it
+        // has data, and only its part in the blob.
+        let mut data = zeros.clone();
+        data[0] = 1;
+        assert_eq!(check(100, &data, B), vec![0..3996]);
+        let mut data = zeros.clone();
+        data[4 * K - 1] = 1;
+        assert_eq!(check(100, &data, B), vec![3996 + 3 * K..4 * K]);
+        let mut data = zeros.clone();
+        data[4000] = 1;
+        assert_eq!(check(100, &data, B), vec![3996..3996 + K]);
+        // A blob inside one block, with data: all of it.
+        assert_eq!(check(10, &[0, 0, 5, 0], B), vec![0..4]);
+        // Data blocks side by side: one write.
         assert_eq!(check(7, &[1; 10000], B), vec![0..10000]);
+        let mut data = zeros;
+        data[K - 1] = 1;
+        data[K] = 1;
+        assert_eq!(check(0, &data, B), vec![0..2 * K]);
         // Larger blocks (ZFS's records).
-        assert_eq!(check(0, &vec![0; 300 << 10], 128 << 10), vec![256 << 10..300 << 10]);
+        assert!(check(0, &vec![0; 300 << 10], 128 << 10).is_empty());
+        let mut data = vec![0; 300 << 10];
+        data[260 << 10] = 1;
+        assert_eq!(check(0, &data, 128 << 10), vec![256 << 10..300 << 10]);
     }
 
     proptest! {
         #[test]
         fn sparse_writes_give_the_data(
             offset in 0_u64..20_000,
-            runs in prop::collection::vec((any::<bool>(), 1_usize..12_000), 0..12),
+            runs in prop::collection::vec((0_u8..3, 1_usize..12_000), 0..12),
             block in prop::sample::select(vec![1_u64, 512, 4096, 16384]),
         ) {
+            // Runs of zeros, of data, and of zeros with a byte of data here
+            // and there.
             let mut data = Vec::new();
-            for (i, (zero, len)) in runs.into_iter().enumerate() {
-                let byte = if zero { 0 } else { u8::try_from(i % 255 + 1).unwrap() };
-                data.extend(std::iter::repeat_n(byte, len));
+            for (i, (kind, len)) in runs.into_iter().enumerate() {
+                let byte = u8::try_from(i % 255 + 1).unwrap();
+                data.extend((0..len).map(|j| match kind {
+                    0 => 0,
+                    1 => byte,
+                    _ => u8::from(j % 5000 == 4999) * byte,
+                }));
             }
             _ = check(offset, &data, block);
+            _ = check(offset + (1 << 32) + 1, &data, block);
         }
     }
 }
@@ -1129,8 +1169,8 @@ mod tests {
     }
 
     /// BackOtter: a file restored sparse, blob by blob, has the blobs'
-    /// contents, and blocks for little more than its data: at most one
-    /// more for each blob boundary.
+    /// contents, and blocks only for those with a byte other than zero
+    /// (and maybe one for the file system's own records of its extents).
     #[test]
     fn write_sparse_leaves_zero_blocks_unwritten() {
         use std::os::unix::fs::MetadataExt;
@@ -1138,13 +1178,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = LocalDestination::new(dir.path().to_str().unwrap(), false, false).unwrap();
         // Blobs of odd sizes: data, zeros, data at a block's end, zeros, a
-        // single byte, zeros to the end.
+        // single byte, zeros, a byte at a blob's start and end, zeros to
+        // the end.
         let mut blobs: Vec<Vec<u8>> = vec![vec![7; 10_000], vec![0; 3 << 20]];
         let mut b = vec![0; 1 << 20];
         b[(1 << 20) - 1] = 1;
         blobs.push(b);
         blobs.push(vec![0; (5 << 20) + 123]);
         blobs.push(vec![1]);
+        blobs.push(vec![0; 100_000]);
+        let mut b = vec![0; 50_000];
+        b[0] = 2;
+        b[49_999] = 3;
+        blobs.push(b);
         blobs.push(vec![0; 2 << 20]);
         let size: usize = blobs.iter().map(Vec::len).sum();
         dest.set_length("f", size as u64, true).unwrap();
@@ -1166,7 +1212,7 @@ mod tests {
             .chunks(usize::try_from(block).unwrap())
             .filter(|c| c.iter().any(|&b| b != 0))
             .count() as u64;
-        let max = (data_blocks + blobs.len() as u64) * block;
+        let max = (data_blocks + 1) * block;
         eprintln!(
             "block {block}: {} bytes allocated, {} of data blocks, at most {max}",
             m.blocks() * 512,

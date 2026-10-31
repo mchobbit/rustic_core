@@ -10,7 +10,9 @@ use std::{
 use bytesize::ByteSize;
 use derive_setters::Setters;
 use ignore::{Walk, WalkBuilder};
-use log::{debug, warn};
+#[cfg(unix)]
+use log::debug;
+use log::warn;
 use serde_with::{DisplayFromStr, serde_as};
 
 #[cfg(not(windows))]
@@ -333,7 +335,10 @@ impl Iterator for LocalSourceWalker {
     type Item = RusticResult<ReadSourceEntry<OpenFile>>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        #[cfg(unix)]
         let mut next = self.walker.next();
+        #[cfg(not(unix))]
+        let next = self.walker.next();
         // BackOtter: sockets are skipped, as restic skips them: a socket is
         // only the name a running program listens on, made again when it
         // starts, and a restored one has nobody listening.

@@ -21,7 +21,7 @@ use crate::{
     backend::{
         FileType, ReadBackend,
         decrypt::DecryptReadBackend,
-        local_destination::LocalDestination,
+        local_destination::{self, LocalDestination},
         node::{Node, NodeType},
         osattrs,
     },
@@ -627,8 +627,9 @@ fn restore_metadata(
 /// BackOtter: whether to restore the file `node` sparse: one that had holes
 /// (`unix.sparse`), or any with `--sparse by-content`, and only into a new,
 /// empty file (`fresh`), which the restore sizes without allocating, and
-/// where it leaves each blob's all-zero blocks of the file system unwritten
-/// (`LocalDestination::write_sparse_at`), as BackOtter's restic does. In a
+/// where it leaves the all-zero parts of each blob, block by block of the
+/// file system, unwritten (`LocalDestination::write_sparse_at`), as
+/// BackOtter's restic does. In a
 /// file that existed, a hole would keep its old contents. Any other file is
 /// allocated in full (preallocated, where the system can) and written out,
 /// zeros and all: a swap file, a preallocated file.
@@ -906,6 +907,11 @@ fn restore_contents<S: Open>(
                             )
                             .unwrap()
                         };
+                        // BackOtter: an all-zero blob (holes give many,
+                        // each written at many offsets) is looked at once:
+                        // a file restored sparse gets nothing of it.
+                        let zeros = name_dests.iter().any(|&(file_idx, _)| sparse[file_idx])
+                            && local_destination::is_zero(&data);
                         for (file_idx, start) in name_dests {
                             let data = data.clone();
                             let is_sparse = sparse[file_idx];
@@ -920,13 +926,15 @@ fn restore_contents<S: Open>(
                                 }
                                 drop(sizes_guard);
                                 // BackOtter: in a file restored sparse
-                                // (write_sparse), the blob's all-zero blocks
-                                // of the file system stay holes, as
+                                // (write_sparse), the blob's all-zero parts
+                                // of the file system's blocks stay holes, as
                                 // BackOtter's restic leaves them; any other
                                 // file gets every byte, so that it is
                                 // allocated.
                                 if is_sparse {
-                                    dest.write_sparse_at(path, start, &data).unwrap();
+                                    if !zeros {
+                                        dest.write_sparse_at(path, start, &data).unwrap();
+                                    }
                                 } else {
                                     dest.write_at(path, start, &data).unwrap();
                                 }

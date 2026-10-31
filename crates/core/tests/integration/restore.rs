@@ -159,10 +159,18 @@ fn test_restore_sparse(set_up_repo: Result<RepoOpen>) -> Result<()> {
     let node = repo.node_from_snapshot_path("latest", |_| true)?;
     let ls_opts = LsOptions::default();
     let mut sparse_marks = Vec::new();
+    let mut contents = std::collections::BTreeMap::new();
     for item in repo.ls(&node, &ls_opts)? {
         let (path, node) = item?;
-        sparse_marks.push((path, node.meta.generic_attributes.is_true("unix.sparse")));
+        sparse_marks.push((path.clone(), node.meta.generic_attributes.is_true("unix.sparse")));
+        _ = contents.insert(path, node.content);
     }
+    // The file read by its data extents has the blobs of the same bytes read
+    // plainly.
+    let blobs = |name: &str| contents[&PathBuf::from("test").join(name)].clone();
+    assert!(blobs("full").is_some_and(|blobs| blobs.len() > 1));
+    assert_eq!(blobs("sparse"), blobs("full"));
+    assert_eq!(blobs("linked/a"), blobs("full"));
     assert_eq!(
         sparse_marks,
         [

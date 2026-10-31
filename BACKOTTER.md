@@ -189,22 +189,30 @@ that either program restores what the other backed up.
   by name; `--numeric-id` is still accepted.
 - A backup reads a regular file marked `unix.sparse` on a probing system
   (Linux and Android, FreeBSD, macOS, illumos) by its data extents, as
-  BackOtter's restic does: from where it is, `lseek(SEEK_DATA)` finds the
+  BackOtter's restic does, if it still has a hole as opened (`SEEK_HOLE`
+  from 0 before its end; it may have been replaced or compressed since it
+  was listed): from where it is, `lseek(SEEK_DATA)` finds the
   next data and `lseek(SEEK_HOLE)` the next hole, only the data is read
   (`pread(2)`), and the chunker is given zeros for the holes without their
-  being read. Once a seek fails (`EINVAL`, `ENOTSUP`, ...), or nothing but
-  a hole is left (`ENXIO`; the hole ends at the size `fstat` gives before
+  being read, never past the size `fstat` gave before `SEEK_DATA`. Once a
+  seek fails (`EINVAL`, `ENOTSUP`, ...), or nothing but
+  a hole is left (`ENXIO` from `SEEK_DATA` with `SEEK_HOLE` finding the hole
+  where it is: macOS answers `ENXIO` to both at every offset of a file its
+  file system compresses; the hole ends at the size `fstat` gives before
   `SEEK_DATA`, or after it if smaller, so that data appended meanwhile
   isn't taken for a hole), the rest is read plainly, up to whatever end of
-  file a read finds. Each read fills the chunker's buffer across extents,
-  as a read of a regular file does: rustic's chunker reads on with a buffer
-  no longer than the last read gave, which reads short at every extent's
-  end would shrink to a byte. The chunker gets the
+  file a read finds. Each read fills the chunker's buffer across extents
+  and `EINTR`, as a read of a regular file does: rustic's chunker reads on
+  with a buffer no longer than the last read gave, which reads short at
+  every extent's end would shrink to a byte. The chunker gets the
   same bytes as from plain reading, so the chunks, blob IDs, trees and
   snapshots are the same bit for bit; a file that grows or shrinks while
   it is read is read as plain reading reads it, but for a hole already
   found, which gives zeros even if data was written there since (as if it
-  had been read before the write). Other files, and every file elsewhere,
+  had been read before the write). Inside a hole each buffer of zeros
+  ends at the size `fstat` gives then: a file cut short there gives the
+  zeros up to its new end and no more, and at or past it the rest is read
+  plainly (the end of file). Other files, and every file elsewhere,
   are read plainly. Each all-zero chunk (holes give many, all of the
   chunker's minimum size) is hashed once per file and length: the same
   bytes give the same ID. The rolling hash isn't skipped over long zero
@@ -216,17 +224,26 @@ that either program restores what the other backed up.
   when the restore planned it (after `--delete` removed what was there).
   That is checked on disk, not by what the walk of the destination saw (a
   file below a symlinked directory). A file restored sparse is sized
-  without being allocated (`ftruncate`), and each blob is written but for
-  its all-zero blocks, as BackOtter's restic does: blocks of the
-  destination file system's block size (`f_bsize` of `fstatfs(2)`, of
-  `fstatvfs(2)` on NetBSD and illumos, else the file's `st_blksize`; at
-  least 4096 bytes, 4096 where none is known), aligned to the offsets in
-  the file, that lie wholly inside the blob and are all zeros stay holes;
-  everything else is written, the partial blocks at a blob's ends too,
-  zeros or not (the rest of their block belongs to the next blob). So a
-  file comes back with at most a block more than its data for each blob
-  boundary. If it turns out not to be empty after all (a race), it is
-  emptied first, so that no hole keeps old contents. Stock rustic's
+  without being allocated (`ftruncate`), and each blob is written by the
+  blocks of the destination file system's block size (`f_bsize` of
+  `fstatfs(2)`, of `fstatvfs(2)` on NetBSD and illumos, else the file's
+  `st_blksize`; at least 4096 bytes, 4096 where none is known), aligned to
+  the offsets in the file, as BackOtter's restic writes it: of each block
+  the blob reaches into, the part inside the blob is left unwritten if it
+  is all zeros, else written, and nothing outside the blob is ever
+  written (adjacent parts in one write; an all-zero blob, which holes give
+  many of at many offsets, is looked at once). As the file is new and
+  sized without being allocated, what no blob writes reads as zeros, and
+  a block is allocated only if some blob put a byte other than zero in
+  it: the blocks with data, which a source whose holes are whole blocks
+  has too (measured on ext4, XFS and ZFS with and without compression:
+  the source's block count exactly, at the old rule's speed). This
+  replaced writing the partial blocks at a blob's ends whatever they held
+  (up to a block more for each blob boundary: 71% more blocks on ext4 and
+  XFS, 26 times as many on uncompressed ZFS, for a disk image), and
+  before it, leaving each blob's longest all-zero prefix unwritten. If
+  the file turns out not to be empty after all (a race), it is emptied
+  first, so that no hole keeps old contents. Stock rustic's
   `--sparse by-content` left old contents where a zero chunk went.
 - Every other file is allocated in full: a new file, or an existing one the
   restore writes into (cut to length first, if longer), is preallocated
@@ -501,11 +518,15 @@ system's module (`osattrs/linux.rs`, `freebsd.rs`, `netbsd.rs`,
 defines the same functions and constants, those of `other.rs`, which does
 nothing; `osattrs.rs` calls them without `cfg`s.
 
-Not handled, as no BackOtter build needs them: on a 32-bit glibc system,
-`SEEK_HOLE` fails (`EOVERFLOW`) on a file over 2 GiB, which then isn't
-marked `unix.sparse` (Go's restic seeks with 64-bit offsets there); and on
-Windows, which isn't a BackOtter platform, a marked file is restored
-without holes: NTFS needs `FSCTL_SET_SPARSE`, which rustic doesn't set.
+`SEEK_HOLE` and `SEEK_DATA` take 64-bit offsets (`lseek64`) on Linux
+(glibc and musl) and Android: on a 32-bit glibc or Android system `off_t`
+has 32 bits, and a file over 2 GiB would otherwise be neither marked
+`unix.sparse` nor read by its extents (Go's restic seeks with 64-bit
+offsets there too).
+
+Not handled, as no BackOtter build needs it: on Windows, which isn't a
+BackOtter platform, a marked file is restored without holes: NTFS needs
+`FSCTL_SET_SPARSE`, which rustic doesn't set.
 
 ## Moving to a new rustic_core release
 
