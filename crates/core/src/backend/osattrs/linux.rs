@@ -15,7 +15,7 @@ use std::{
 use jiff::Timestamp;
 use log::{debug, warn};
 
-use super::{Unsupported, path_error, set_flags_best_effort, unsupported};
+use super::{Unsupported, XattrErrors, path_error, set_flags_best_effort, unsupported};
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType,
     generic_attributes::{LINUX_INODE_FLAGS, LINUX_PROJECT_ID, LINUX_ZFS_DOS_FLAGS},
@@ -573,8 +573,8 @@ pub(super) fn xattrs(_path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
 }
 
 /// Extended attributes go through the xattr crate here.
-pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr"))
+pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr").into())
 }
 
 #[cfg(test)]

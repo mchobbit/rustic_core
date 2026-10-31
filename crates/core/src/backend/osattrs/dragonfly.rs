@@ -5,7 +5,10 @@ use std::{io, os::dragonfly::fs::MetadataExt, path::Path};
 
 use jiff::Timestamp;
 
-use super::{bsd_flags::DRAGONFLY_KEPT_FLAGS, c_path, check, chmod_symlink, set_flags_best_effort};
+use super::{
+    XattrErrors, bsd_flags::DRAGONFLY_KEPT_FLAGS, c_path, check, chmod_symlink,
+    set_flags_best_effort,
+};
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType, generic_attributes::DRAGONFLY_FILE_FLAGS,
 };
@@ -103,6 +106,6 @@ pub(super) fn xattrs(_path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
 }
 
 /// Extended attributes go through the xattr crate here.
-pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr"))
+pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr").into())
 }

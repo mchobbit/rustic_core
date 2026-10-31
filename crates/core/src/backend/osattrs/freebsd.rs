@@ -14,6 +14,7 @@ use jiff::Timestamp;
 use log::debug;
 
 use super::{
+    XattrErrors,
     bsd_flags::{FREEBSD_KEPT_FLAGS as KEPT_FLAGS, freebsd_file_flags},
     c_path, check, freebsd_netbsd, lower_birthtime, path_error, set_flags_best_effort,
 };
@@ -175,6 +176,6 @@ pub(super) fn xattrs(_path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
 }
 
 /// Extended attributes go through the xattr crate here.
-pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr"))
+pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr").into())
 }

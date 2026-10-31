@@ -206,7 +206,9 @@ that either program restores what the other backed up.
 - On illumos, extended attributes are named attribute files (`runat(1)`),
   which the xattr crate doesn't support: they are read and written through
   `openat(2)` with `O_XATTR`, without the `SUNWattr_ro` and `SUNWattr_rw`
-  system attribute views, as BackOtter's restic does. A restore creates an
+  system attribute views, and stored in name order, not the attribute
+  directory's, as BackOtter's restic does (elsewhere both store them in the
+  order the system lists them). A restore creates an
   attribute file with mode 0600, so that it is never readable by others
   before it gets its own owner, mode, ACL and times (`illumos.xattr_meta`),
   with `fchownat(2)`, `fchmodat(2)`, `facl(2)` and `utimensat(2)` on the
@@ -238,11 +240,11 @@ that either program restores what the other backed up.
   not kept`); with idmapd not running at all, `stat(2)` already gives every
   ephemeral id as 60001, and nothing can be kept. So **svc:/system/idmap
   must be online** at backup and at restore: BackOtter's illumos rescue
-  system runs `svcadm enable -s idmap`. libidmap is private to illumos (no
-  header installed), so rustic opens `libidmap.so.1` with `dlopen(3C)` the
-  first time it needs it rather than link with it: the binary doesn't
-  depend on it, and where it can't be opened, that is treated as idmap
-  failing. The calls are `idmap_get_create`,
+  system should run `svcadm enable -s idmap`. libidmap is private to
+  illumos (no header installed), so rustic opens `libidmap.so.1` with
+  `dlopen(3C)` the first time it needs it rather than link with it: the
+  binary doesn't depend on it, and where it can't be opened, that is
+  treated as idmap failing. The calls are `idmap_get_create`,
   `idmap_get_sidbyuid`/`_sidbygid`, `idmap_get_uidbysid`/`_gidbysid`,
   `idmap_get_mappings` and `idmap_get_destroy`; their answers are kept
   for the run.
@@ -279,6 +281,14 @@ that either program restores what the other backed up.
   refused. On a file system other than ZFS they aren't set, with one
   warning per restore ("ZFS DOS flags 0x... not restored: not ZFS") and the
   number of files at the end.
+- An extended attribute the restore can't set (`trusted.*` not as root,
+  one the file system refuses) doesn't keep the others from being set, or
+  those the node hasn't from being removed, as in BackOtter's restic: each
+  file gets one warning naming every attribute that wasn't set, with its
+  error (`restore f: setting extended attributes failed: trusted.a:
+  Operation not permitted (os error 1); ...`). Stock rustic stopped at the
+  first, leaving the rest unset, and said neither which nor why. On
+  illumos too.
 - Metadata the target file system doesn't support (flags, casefolding or a
   project ID it refuses with `ENOTTY`, `EOPNOTSUPP`/`ENOTSUP` or `EINVAL`)
   gets one warning per kind (attribute and refused flags) per restore,
@@ -325,13 +335,24 @@ that either program restores what the other backed up.
   warning. Without `--delete` a directory in the way only goes if it is
   empty; one with entries is an error for that node, as in restic. A
   special file that can't be made (a device node, as an unprivileged user)
-  gets one warning and nothing else, as in restic, not one more for each
-  metadata step after.
+  gets one warning and nothing else, not one more for each metadata step
+  after. restic reports it once too, but as an error (`ignoring error for
+  /chardev: mknod ...`, exit 1): the one difference in exit status left,
+  above.
 - A backup stores special files' nodes as restic does: a character
   device's mode has Go's `ModeDevice` and `ModeCharDevice` (stock rustic
   ANDs the two bits, which gives none), only a regular file has a size
   (stock rustic stores a symlink's target length), and a FIFO or a socket
   has no link count. Sockets are still kept, which restic skips.
+- Directories above the backed-up path (`/home` in a backup of
+  `/home/m`) get nodes of rustic's own making, as in stock rustic
+  (`archiver/tree.rs`): a directory with mode `0o755`, without Go's
+  directory bit in it, and no owner, times or anything else. restic stores
+  those directories' own metadata (their `lstat`). The paths rustic
+  archives may not be where those directories are (`--as-path`, stdin), so
+  this is left as it is; it only matters for what a restore of the whole
+  snapshot gives the directories above the backed-up one. The backed-up
+  directory itself has its own metadata (see above).
 - Partial restores (`--glob`, `--iglob`): directories above the matches
   that aren't matched themselves aren't streamed, so the restore creates
   them without any metadata, casefolding included, as stock rustic does.
@@ -366,6 +387,21 @@ that either program restores what the other backed up.
   is an error for that device node, as on 32-bit Android, rather than a
   build failure: rustic_core builds for x86_64-unknown-dragonfly (a tier 3
   target: nightly with `-Zbuild-std`, or a native Rust >= 1.91).
+- A node's times are written as restic writes them (Go's RFC 3339 with
+  nanoseconds) in UTC too: `2001-09-09T01:46:40.5Z`, where stock rustic
+  writes `+00:00` for a zero offset (as on a rescue system, which has no
+  time zone). Either form is read by both tools, and means the same time;
+  only the trees' bytes, and so their ids, differed. Other offsets were
+  already written alike (`+02:00`). A snapshot's own `time` still has
+  `+00:00` (stock rustic).
+- The owner names a backup keeps are looked up once per uid and gid in a
+  run, and on restore with `--by-name` the ids once per name, found or not:
+  the cached crate (2.x) stopped caching a lookup that found nothing, so
+  without `/etc/passwd` and `/etc/group`, as on a minimal rescue system,
+  rustic looked each file's owner up again and warned for every file
+  (`error getting user from uid 0: ENOENT`). Now it warns once per id. A
+  name not found on restore falls back to the saved id, as the warning
+  now says (it said UID 0).
 - The version reads `X.Y.Z+backotter.N`.
 
 The system calls need `unsafe`, which the workspace lints now deny (not

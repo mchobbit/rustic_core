@@ -430,6 +430,60 @@ impl SidUnmapped {
     }
 }
 
+/// BackOtter: what a restore couldn't do to the extended attributes of a
+/// file, each with its error: setting one (named), removing one, listing
+/// them. One that can't be set doesn't keep the others from being set or
+/// removed, as in BackOtter's restic, and one warning per file names them
+/// all, as in `trusted.a: Operation not permitted (os error 1); removing
+/// user.b: ...`.
+#[derive(Debug, Default)]
+pub(crate) struct XattrErrors(Vec<(String, io::Error)>);
+
+impl XattrErrors {
+    /// Adds the failure of `what`: an attribute's name, for setting it, or
+    /// what else was done (`removing NAME`, `listing`).
+    #[cfg_attr(any(windows, target_os = "openbsd"), allow(dead_code))]
+    pub(crate) fn push(&mut self, what: impl Into<String>, err: io::Error) {
+        self.0.push((what.into(), err));
+    }
+
+    /// `Ok` if nothing failed.
+    ///
+    /// # Errors
+    ///
+    /// * These failures, if there are any.
+    #[cfg_attr(any(windows, target_os = "openbsd"), allow(dead_code))]
+    pub(crate) fn into_result(self) -> Result<(), Self> {
+        if self.0.is_empty() { Ok(()) } else { Err(self) }
+    }
+}
+
+/// An error that isn't about one attribute: the file's extended attributes
+/// can't be read or written at all.
+impl From<io::Error> for XattrErrors {
+    fn from(err: io::Error) -> Self {
+        Self(vec![(String::new(), err)])
+    }
+}
+
+impl fmt::Display for XattrErrors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, (what, err)) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str("; ")?;
+            }
+            if what.is_empty() {
+                write!(f, "{err}")?;
+            } else {
+                write!(f, "{what}: {err}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for XattrErrors {}
+
 /// The kinds of metadata the restore has warned about once (unsupported
 /// metadata, unmapped SIDs), each with the first file and the number of
 /// files.
@@ -658,16 +712,18 @@ pub(crate) fn illumos_xattrs(path: &Path) -> io::Result<Vec<ExtendedAttribute>> 
 }
 
 /// Gives the file at `path` exactly the extended attributes `attrs`, on
-/// illumos.
+/// illumos. One that can't be set or removed doesn't keep the others from
+/// being set or removed.
 ///
 /// # Errors
 ///
-/// * If they can't be set, the file system has none, or this isn't illumos.
+/// * Each attribute that couldn't be set or removed; or that the file system
+///   has none, or this isn't illumos.
 #[cfg_attr(not(target_os = "illumos"), allow(dead_code))]
 pub(crate) fn set_illumos_xattrs(
     path: &Path,
     attrs: &[ExtendedAttribute],
-) -> io::Result<()> {
+) -> Result<(), XattrErrors> {
     os::set_xattrs(path, attrs)
 }
 
@@ -913,6 +969,18 @@ fn unsupported(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xattr_errors_name_each() {
+        let mut errors = XattrErrors::default();
+        assert!(XattrErrors::default().into_result().is_ok());
+        errors.push("trusted.a", io::Error::from(io::ErrorKind::PermissionDenied));
+        errors.push("removing user.b", io::Error::other("busy"));
+        let msg = errors.into_result().unwrap_err().to_string();
+        assert_eq!(msg, "trusted.a: permission denied; removing user.b: busy");
+        let all = XattrErrors::from(io::Error::other("no extended attributes"));
+        assert_eq!(all.to_string(), "no extended attributes");
+    }
 
     #[test]
     fn birthtime_first_only_when_earlier() {
