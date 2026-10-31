@@ -238,6 +238,11 @@ that either program restores what the other backed up.
 - A regular file without a mode is restored with permissions 0000: restic
   leaves a mode of 0 out of its JSON, so stock rustic leaves such a file
   (`/etc/shadow`) with the 0644 it was created with.
+- A hard link replaces whatever has its name already, as in BackOtter's
+  restic: the same link, where a restore is run again over its own result,
+  or another file. Stock rustic tried to link over it, failed (`EEXIST`)
+  and stopped there, leaving the rest of the metadata, the late flags pass
+  included, unset.
 - On restore, the project ID is set along with the extended attributes,
   ACLs after the mode, which rewrites NFSv4 ACLs, and file flags after
   everything else (contents, hard links, ownership, xattrs, timestamps,

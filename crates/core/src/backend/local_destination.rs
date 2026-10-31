@@ -942,7 +942,14 @@ impl LocalDestination {
     ///
     /// * If the new hardlink does not have a parent directory.
     /// * If the directory could not be created.
+    /// * If a file already at `item` could not be removed.
     /// * If the hardlink could not be created.
+    ///
+    /// # Notes
+    ///
+    /// BackOtter: whatever is at `item` already (the same link, left by an
+    /// earlier restore, or another file) is removed first, as BackOtter's
+    /// restic does: the link can't be made over it (`EEXIST`).
     pub(crate) fn hard_link(
         &self,
         source_item: impl AsRef<Path>,
