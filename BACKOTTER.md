@@ -162,7 +162,12 @@ that either program restores what the other backed up.
   rewrite` keeps it). A backup doesn't change the access times it saves: on
   Linux and Android, files are read and directories listed with
   `O_NOATIME`, and, where that is refused (`EPERM`: neither the owner nor
-  `CAP_FOWNER`), without it. Directories are listed by a vendored walkdir
+  `CAP_FOWNER`), without it. Symlinks can't be spared: Linux's
+  `readlink(2)` updates a symlink's atime as any read does (always on
+  `strictatime`), and has no `O_NOATIME`, so a backup with either tool
+  moves the atimes of the source's symlinks. The snapshot still has the
+  old ones (the `lstat` comes before the `readlink`), and a restore gives
+  them back. Directories are listed by a vendored walkdir
   2.5.0 (`vendor/walkdir`, swapped in with `[patch.crates-io]`, which
   reaches the ignore crate's walker too): std's `read_dir` has no way to
   pass `O_NOATIME`. Other systems have no `O_NOATIME`, and update access
@@ -310,6 +315,23 @@ that either program restores what the other backed up.
   where it still differs from the node ("casefolding (F) not restored on
   DIR: directory not empty or not supported"). The destination of a whole
   snapshot has no node, and is left as it is.
+- A restore over an existing tree removes what has a node's name but
+  another type, with or without `--delete`, as BackOtter's restic does: a
+  symlink where the snapshot has a directory is replaced by the directory
+  (stock rustic restored the directory's files through the symlink,
+  wherever it pointed, outside the destination too), a file in the place
+  of something else is made anew, and so is every special file (symlink,
+  device, FIFO, socket), which stock rustic left as it found it, with a
+  warning. Without `--delete` a directory in the way only goes if it is
+  empty; one with entries is an error for that node, as in restic. A
+  special file that can't be made (a device node, as an unprivileged user)
+  gets one warning and nothing else, as in restic, not one more for each
+  metadata step after.
+- A backup stores special files' nodes as restic does: a character
+  device's mode has Go's `ModeDevice` and `ModeCharDevice` (stock rustic
+  ANDs the two bits, which gives none), only a regular file has a size
+  (stock rustic stores a symlink's target length), and a FIFO or a socket
+  has no link count. Sockets are still kept, which restic skips.
 - Partial restores (`--glob`, `--iglob`): directories above the matches
   that aren't matched themselves aren't streamed, so the restore creates
   them without any metadata, casefolding included, as stock rustic does.

@@ -62,11 +62,16 @@ fn test_restore_preserves_hardlinks(
     assert_eq!(fs::read_link(&symlink)?, PathBuf::from("testfile"));
 
     // BackOtter: again, over the complete earlier restore, where the link is
-    // already, and over one where another file has its name.
+    // already, and over one where another file has its name, and a file the
+    // symlink's.
     restore_to(&repo, restore_dir.path(), restore_opts)?;
+    assert_eq!(fs::read_link(&symlink)?, PathBuf::from("testfile"));
     fs::remove_file(&hardlink)?;
     fs::write(&hardlink, "another file")?;
+    fs::remove_file(&symlink)?;
+    fs::write(&symlink, "a file")?;
     restore_to(&repo, restore_dir.path(), restore_opts)?;
+    assert_eq!(fs::read_link(&symlink)?, PathBuf::from("testfile"));
     let hardlink_meta = fs::metadata(&hardlink)?;
     let linked_meta = fs::metadata(&linked)?;
     assert_eq!(hardlink_meta.ino(), linked_meta.ino());
@@ -237,15 +242,25 @@ fn test_restore_sparse(set_up_repo: Result<RepoOpen>) -> Result<()> {
         &["sparse", "full", "zeros", "trailing"],
     )?;
 
-    // Through a symlinked directory, which the walk of the destination
-    // doesn't follow: the marked file there is restored over, whole.
+    // Over a symlink where the snapshot has a directory: the symlink is
+    // replaced by the directory, as BackOtter's restic does, and nothing is
+    // written where it points. The files in it are new, so those marked get
+    // their holes.
     let restore_dir = tempdir()?;
     let real = restore_dir.path().join("real");
     fs::create_dir(&real)?;
-    fs::write(real.join("sparse"), vec![0xaa_u8; sparse_data.len()])?;
+    let other = vec![0xaa_u8; sparse_data.len()];
+    fs::write(real.join("sparse"), &other)?;
     std::os::unix::fs::symlink("real", restore_dir.path().join("test"))?;
     restore_to(&repo, restore_dir.path(), RestoreOptions::default())?;
-    assert!(fs::read(real.join("sparse"))? == sparse_data, "contents differ");
+    assert!(fs::symlink_metadata(restore_dir.path().join("test"))?.is_dir());
+    assert!(fs::read(real.join("sparse"))? == other, "written through the symlink");
+    assert_eq!(fs::read_dir(&real)?.count(), 1);
+    check(
+        restore_dir.path(),
+        &["sparse", "linked/a", "linked/b"],
+        &["full", "zeros", "trailing"],
+    )?;
 
     Ok(())
 }

@@ -266,6 +266,38 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
             Ok(next_entry(walker))
         };
 
+    // BackOtter: what has a node's name but another type, and any special
+    // file, is removed first, with or without --delete, as BackOtter's restic
+    // does: a directory is restored as a directory, not through a symlink to
+    // wherever that points, and a file or special file is made anew. Without
+    // --delete a directory only goes if it is empty. Returns the next entry
+    // and whether the old one is gone.
+    let replace_existing =
+        |walker: &mut walkdir::IntoIter, entry: &DirEntry| -> (Option<DirEntry>, bool) {
+            if entry.depth() == 0 {
+                return (next_entry(walker), false);
+            }
+            let is_dir = entry.file_type().is_dir();
+            let removed = if dry_run {
+                info!("would have replaced {}", entry.path().display());
+                true
+            } else {
+                match (is_dir, opts.delete) {
+                    (false, _) => dest.remove_file(entry.path()).map_err(|err| err.to_string()),
+                    (true, true) => dest.remove_dir(entry.path()).map_err(|err| err.to_string()),
+                    (true, false) => {
+                        std::fs::remove_dir(entry.path()).map_err(|err| err.to_string())
+                    }
+                }
+                .map_err(|err| error!("error removing {}: {err}", entry.path().display()))
+                .is_ok()
+            };
+            if is_dir {
+                walker.skip_current_dir();
+            }
+            (next_entry(walker), removed)
+        };
+
     let mut process_node = |path: &PathBuf, node: &Node, exists: bool| -> RusticResult<_> {
         match node.node_type {
             NodeType::Dir => {
@@ -415,11 +447,13 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                             || node.is_special()
                         {
                             // if types do not match, first remove the existing file
-                            next_dst = process_existing(&mut walker, destination)?;
+                            let removed;
+                            (next_dst, removed) = replace_existing(&mut walker, destination);
+                            process_node(path, node, !removed)?;
                         } else {
                             next_dst = next_entry(&mut walker);
+                            process_node(path, node, true)?;
                         }
-                        process_node(path, node, true)?;
                         next_node = node_streamer.next().transpose()?;
                     }
                     Ordering::Greater => {
@@ -469,9 +503,10 @@ fn restore_metadata(
     let mut file_flags = Vec::new();
     let mut flags_linked = BTreeSet::new();
     let mut finish = |path: &PathBuf, node: &Node| {
-        set_metadata(dest, opts, path, node);
+        let made = set_metadata(dest, opts, path, node);
         let (flags, dos_flags) = (osattrs::file_flags(node), osattrs::zfs_dos_flags(node));
-        if (flags.is_some() || dos_flags.is_some())
+        if made
+            && (flags.is_some() || dos_flags.is_some())
             && hardlink_key(node).is_none_or(|key| flags_linked.insert(key))
         {
             file_flags.push((
@@ -603,16 +638,27 @@ fn hardlink_key(node: &Node) -> Option<HardlinkKey> {
 /// # Errors
 ///
 /// If the metadata could not be set.
+///
+/// # Returns
+///
+/// BackOtter: false if the node is a special file that couldn't be made,
+/// which then gets nothing else, as in BackOtter's restic: one warning for
+/// it, not one more for each step after.
 // TODO: Return a result here, introduce errors and get rid of logging.
 pub(crate) fn set_metadata(
     dest: &LocalDestination,
     opts: RestoreOptions,
     path: &PathBuf,
     node: &Node,
-) {
+) -> bool {
     debug!("setting metadata for {}", path.display());
-    dest.create_special(path, node)
-        .unwrap_or_else(|_| warn!("restore {}: creating special file failed.", path.display()));
+    if let Err(err) = dest.create_special(path, node) {
+        warn!(
+            "restore {}: creating special file failed: {err}",
+            path.display()
+        );
+        return false;
+    }
     // BackOtter: numeric ids, unless names are asked for (--by-name); then
     // on illumos the ids an owner and group that are SIDs have here, before
     // the mode, which a change of owner can clear the setuid bit of.
@@ -654,6 +700,7 @@ pub(crate) fn set_metadata(
         .unwrap_or_else(|err| warn!("restore {}: {err}", path.display()));
     dest.set_times(path, &node.meta)
         .unwrap_or_else(|_| warn!("restore {}: setting file times failed.", path.display()));
+    true
 }
 
 struct PackInfo {

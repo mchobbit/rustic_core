@@ -134,6 +134,14 @@ impl LocalSourceSaveOptions {
         };
 
         let mut node = self.to_node(&entry, &m, meta)?;
+        // BackOtter: a size only for a file, and no link count for a FIFO or
+        // a socket, as restic stores them.
+        if !node.is_file() {
+            node.meta.size = 0;
+        }
+        if matches!(node.node_type, NodeType::Fifo | NodeType::Socket) {
+            node.meta.links = 0;
+        }
         // BackOtter: the extended attributes' values after osattrs, which on
         // illumos reads their metadata first: reading a value moves its atime.
         let set_xattrs = self.set_xattrs.unwrap_or_default();
