@@ -73,6 +73,9 @@ mod tests {
     #[test]
     fn freebsd_archive_elsewhere() {
         assert_eq!(freebsd_file_flags(0, false), None);
+        assert_eq!(freebsd_file_flags(0x0020_0000, false), None);
+        // Archive alone, which UFS sets only by chflags(1): kept (it used to
+        // be lost, 0x800 restored as 0).
         assert_eq!(freebsd_file_flags(0x0800, false), Some(0x0800));
         assert_eq!(freebsd_file_flags(0x0801, false), Some(0x0801));
         // schg
