@@ -291,6 +291,18 @@ mod tests {
         assert!(!serde_json::to_string(&node).unwrap().contains("generic_attributes"));
     }
 
+    // FreeBSD's flags of a file on ZFS with archive cleared: a 0 that is
+    // there, as BackOtter's restic writes it, for the restore to set.
+    #[test]
+    fn freebsd_flags_0_json() {
+        let mut node = Node::default();
+        node.meta.generic_attributes.set_u64(FREEBSD_FILE_FLAGS, 0);
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains(r#""freebsd.file_flags":0"#), "{json}");
+        let again: Node = serde_json::from_str(&json).unwrap();
+        assert_eq!(again.meta.generic_attributes.number(FREEBSD_FILE_FLAGS), Some(0));
+    }
+
     #[test]
     fn malformed_values_are_skipped() {
         let attrs = |json: &str| -> GenericAttributes { serde_json::from_str(json).unwrap() };
