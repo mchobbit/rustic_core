@@ -50,6 +50,20 @@ that either program restores what the other backed up.
   - `dragonfly.file_flags`: DragonFly's `chflags(1)` flags, all 32 bits
     (root can set each of them on HAMMER2 and UFS). DragonFly's file
     systems have no ACLs or extended attributes.
+  - `linux.zfs_dos_flags`: on Linux, the DOS flags OpenZFS keeps for SMB
+    (`ZFS_IOC_GETDOSFLAGS`, ioctl `0x80088301`), of regular files and
+    directories on ZFS (`statfs` type `0x2fc12fc1`; the ioctl goes to no
+    other file system, where its number could mean something else): a
+    64-bit number, the flags masked with `0x302f00000000` (read-only,
+    hidden, system, archive, nounlink, offline, sparse). Immutable,
+    append-only and nodump are inode flags too, and kept in
+    `linux.inode_flags`; reparse can't be set. ZFS gives every new file
+    archive, and sets it again on every write, so a file with archive alone
+    gets no attribute, and one with none at all gets 0 (archive cleared, as
+    by a Windows backup over SMB), which is restored too. A ZFS without the
+    ioctl is only noted in the debug log. FreeBSD and illumos keep these
+    flags in `freebsd.file_flags` and `illumos.system_attributes`; they
+    aren't mapped from one system to another.
   - `unix.sparse`: `true` for a regular file with holes, on every Unix, by
     the rule BackOtter's restic follows too, from the file's lstat:
     1. If its size is 0, or its 512-byte blocks cover its size, it has
@@ -146,6 +160,18 @@ that either program restores what the other backed up.
   mode, ACLs), once per hard-linked file, since an immutable or append-only
   file refuses most of those. Where the target file system doesn't support
   a flag, the others are still set and the restore warns about that one.
+- ZFS's DOS flags (`linux.zfs_dos_flags`) go on in the same last pass, once
+  per hard-linked file, just before the file flags: a read-only file
+  refuses writes, a nounlink one unlinking and renaming, and every write
+  sets archive again. `ZFS_IOC_SETDOSFLAGS` replaces all of them, so the
+  restore reads the file's flags and changes only the kept ones, leaving
+  immutable, append-only, nodump and reparse as they are (which also needs
+  no `CAP_LINUX_IMMUTABLE`), and sets nothing when they are right already.
+  The inode flags after them leave them alone. Where the whole mask is
+  refused, each flag is tried alone, and the restore warns naming those
+  refused. On a file system other than ZFS they aren't set, with one
+  warning per restore ("ZFS DOS flags 0x... not restored: not ZFS") and the
+  number of files at the end.
 - Metadata the target file system doesn't support (flags, casefolding or a
   project ID it refuses with `ENOTTY`, `EOPNOTSUPP`/`ENOTSUP` or `EINVAL`)
   gets one warning per kind (attribute and refused flags) per restore,
@@ -158,7 +184,8 @@ that either program restores what the other backed up.
   Where it doesn't support a POSIX.1e ACL, the restore warns and narrows the
   group bits to the owning group's own access, so a file never comes back
   more open. Flags a file has already aren't set again (on Linux: no
-  `FS_IOC_SETFLAGS` when nothing differs).
+  `FS_IOC_SETFLAGS` when nothing differs). Where flags of 0 (all cleared)
+  are refused, that is warned about too, though there is no flag to name.
 - On btrfs every `FS_IOC_SETFLAGS` rewrites the `btrfs.compression`
   property (restored as an extended attribute), or deletes it. So when one
   is needed on a file with that property, the flags but immutable and

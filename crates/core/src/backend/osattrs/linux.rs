@@ -1,5 +1,6 @@
-//! Linux: the inode flags `chattr(1)` sets (`FS_IOC_GETFLAGS`), and the
-//! project ID (`FS_IOC_FSGETXATTR`) that project quotas count by.
+//! Linux: the inode flags `chattr(1)` sets (`FS_IOC_GETFLAGS`), the project
+//! ID (`FS_IOC_FSGETXATTR`) that project quotas count by, and the DOS flags
+//! ZFS keeps for SMB (`ZFS_IOC_GETDOSFLAGS`).
 
 use std::{
     fs::{File, Metadata, OpenOptions},
@@ -16,10 +17,11 @@ use log::{debug, warn};
 use super::{Unsupported, path_error, set_flags_best_effort, unsupported};
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType,
-    generic_attributes::{LINUX_INODE_FLAGS, LINUX_PROJECT_ID},
+    generic_attributes::{LINUX_INODE_FLAGS, LINUX_PROJECT_ID, LINUX_ZFS_DOS_FLAGS},
 };
 
 pub(super) const FILE_FLAGS: Option<&str> = Some(LINUX_INODE_FLAGS);
+pub(super) const ZFS_DOS_FLAGS: Option<&str> = Some(LINUX_ZFS_DOS_FLAGS);
 
 /// From `<linux/fs.h>`: the inode flags `chattr(1)` sets, s u c S i a d A m
 /// j t D T C P, and casefolding (F). The rest belong to the file system
@@ -85,6 +87,30 @@ const FS_IOC_FSSETXATTR: libc::Ioctl = libc::_IOW::<FsXattr>(0x58, 32); // 'X'
 // fsxattr's xflags for FS_IMMUTABLE_FL and FS_APPEND_FL.
 const FS_XFLAG_IMMUTABLE: u32 = 0x0000_0008;
 const FS_XFLAG_APPEND: u32 = 0x0000_0010;
+
+/// statfs's `f_type` for ZFS.
+const ZFS_SUPER_MAGIC: u32 = 0x2fc1_2fc1;
+
+// OpenZFS's DOS flags, from its <sys/fs/zfs.h> (Linux only): a uint64_t,
+// on a descriptor of the file itself. ZFS_IOC_SETDOSFLAGS replaces all the
+// flags ZFS_IOC_GETDOSFLAGS shows.
+const ZFS_IOC_GETDOSFLAGS: libc::Ioctl = libc::_IOR::<u64>(0x83, 1);
+const ZFS_IOC_SETDOSFLAGS: libc::Ioctl = libc::_IOW::<u64>(0x83, 2);
+
+/// The DOS flags kept: those `ZFS_IOC_SETDOSFLAGS` sets, but immutable,
+/// append-only and nodump, which are inode flags too (`i`, `a`, `d`), and
+/// reparse, which it refuses to change (`EPERM`).
+const ZFS_DOS_KEPT: u64 = 0x0000_0001_0000_0000 // ZFS_READONLY
+    | 0x0000_0002_0000_0000 // ZFS_HIDDEN
+    | 0x0000_0004_0000_0000 // ZFS_SYSTEM
+    | ZFS_ARCHIVE
+    | 0x0000_0020_0000_0000 // ZFS_NOUNLINK
+    | 0x0000_1000_0000_0000 // ZFS_OFFLINE
+    | 0x0000_2000_0000_0000; // ZFS_SPARSE
+
+/// The DOS flag every new file gets, and every write of its contents sets
+/// again.
+const ZFS_ARCHIVE: u64 = 0x0000_0008_0000_0000;
 
 /// Opens a regular file or directory for `FS_IOC_GETFLAGS` and
 /// `FS_IOC_SETFLAGS`, as `lsattr(1)` and `chattr(1)` do, so as not to follow
@@ -168,6 +194,36 @@ fn set_fsxattr(f: &File, attr: &FsXattr) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether the file `f` is on ZFS: the DOS flag ioctls go to no other file
+/// system, whose driver could take their numbers for something else.
+fn is_zfs(f: &File) -> io::Result<bool> {
+    let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: fstatfs writes a struct statfs to the pointer.
+    if unsafe { libc::fstatfs(f.as_raw_fd(), st.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstatfs succeeded, so it wrote the struct.
+    let st = unsafe { st.assume_init() };
+    Ok(u32::try_from(st.f_type).is_ok_and(|t| t == ZFS_SUPER_MAGIC))
+}
+
+fn get_dos_flags(f: &File) -> io::Result<u64> {
+    let mut flags: u64 = 0;
+    // SAFETY: ZFS_IOC_GETDOSFLAGS writes a uint64_t to the pointer.
+    if unsafe { libc::ioctl(f.as_raw_fd(), ZFS_IOC_GETDOSFLAGS, &raw mut flags) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags)
+}
+
+fn set_dos_flags(f: &File, flags: u64) -> io::Result<()> {
+    // SAFETY: ZFS_IOC_SETDOSFLAGS reads a uint64_t from the pointer.
+    if unsafe { libc::ioctl(f.as_raw_fd(), ZFS_IOC_SETDOSFLAGS, &raw const flags) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Sets the extended attribute `name` of the file `f` to `value`.
 fn set_xattr(f: &File, name: &str, value: &[u8]) -> io::Result<()> {
     let name = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::from)?;
@@ -203,17 +259,49 @@ pub(super) fn file_flags(
         & INODE_FLAGS)
 }
 
-/// Records the project ID of a regular file or directory, unless it is 0.
+/// Records the project ID of a regular file or directory, unless it is 0,
+/// and on ZFS its DOS flags ([`dos_flags_attribute`]).
 pub(super) fn fill_attributes(path: &Path, node: &mut Node, f: Option<&File>) -> io::Result<()> {
     let Some(f) = f else {
         return Ok(());
     };
+    let dos_flags = fill_dos_flags(path, node, f);
     match get_fsxattr(f) {
         Ok(attr) => node.meta.generic_attributes.set_number(LINUX_PROJECT_ID, attr.projid),
         Err(err) if unsupported(&err) => {}
         Err(err) => return Err(path_error("FS_IOC_FSGETXATTR", path, &err)),
     }
+    dos_flags
+}
+
+/// Records the DOS flags of the file `f` at `path`, if it is on ZFS and they
+/// are worth an attribute. A ZFS without them (`ENOTTY`, ...) only goes to
+/// the debug log.
+fn fill_dos_flags(path: &Path, node: &mut Node, f: &File) -> io::Result<()> {
+    if !is_zfs(f).map_err(|err| path_error("fstatfs", path, &err))? {
+        return Ok(());
+    }
+    match get_dos_flags(f) {
+        Ok(flags) => {
+            if let Some(flags) = dos_flags_attribute(flags) {
+                node.meta.generic_attributes.set_u64(LINUX_ZFS_DOS_FLAGS, flags);
+            }
+        }
+        Err(err) if unsupported(&err) => {
+            debug!("no ZFS DOS flags for {}: {err}", path.display());
+        }
+        Err(err) => return Err(path_error("ZFS_IOC_GETDOSFLAGS", path, &err)),
+    }
     Ok(())
+}
+
+/// What `linux.zfs_dos_flags` records for a file with the DOS flags
+/// `flags`: the [`ZFS_DOS_KEPT`] ones, 0 included (archive cleared), unless
+/// they are archive alone, which a file restored without the attribute gets
+/// anyway when it is written.
+const fn dos_flags_attribute(flags: u64) -> Option<u64> {
+    let kept = flags & ZFS_DOS_KEPT;
+    if kept == ZFS_ARCHIVE { None } else { Some(kept) }
 }
 
 pub(super) fn restore_file_flags(
@@ -225,7 +313,7 @@ pub(super) fn restore_file_flags(
     let f = open_for_flags(path, typ, None)?;
     let current = get_flags(&f).map_err(|err| {
         if unsupported(&err) {
-            Unsupported::error(LINUX_INODE_FLAGS, flags & INODE_FLAGS, err)
+            Unsupported::error(LINUX_INODE_FLAGS, (flags & INODE_FLAGS).into(), err)
         } else {
             path_error("FS_IOC_GETFLAGS", path, &err)
         }
@@ -252,6 +340,56 @@ pub(super) fn restore_file_flags(
             attr.xflags |= xflags;
             set_fsxattr(&f, &attr)
         },
+    )
+}
+
+/// Gives the regular file or directory at `path` the DOS flags `flags`
+/// (`linux.zfs_dos_flags`), on ZFS, before its inode flags, which leave them
+/// as they are.
+pub(super) fn restore_zfs_dos_flags(path: &Path, typ: &NodeType, flags: u64) -> io::Result<()> {
+    let f = open_for_flags(path, typ, None)?;
+    let unsupported_err = |err: io::Error| Unsupported::error(LINUX_ZFS_DOS_FLAGS, 0, err);
+    if !is_zfs(&f).map_err(|err| path_error("fstatfs", path, &err))? {
+        return Err(unsupported_err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("ZFS DOS flags {flags:#x} not restored: not ZFS"),
+        )));
+    }
+    let current = get_dos_flags(&f).map_err(|err| {
+        if unsupported(&err) {
+            unsupported_err(err)
+        } else {
+            path_error("ZFS_IOC_GETDOSFLAGS", path, &err)
+        }
+    })?;
+    restore_dos_flags_with(path, current, flags, |flags| set_dos_flags(&f, flags))
+}
+
+/// The DOS flags a file that has `current` gets for `flags`: the
+/// [`ZFS_DOS_KEPT`] flags of `flags`, and immutable, append-only, nodump and
+/// reparse as they are, since `ZFS_IOC_SETDOSFLAGS` sets them all.
+const fn wanted_dos_flags(current: u64, flags: u64) -> u64 {
+    (current & !ZFS_DOS_KEPT) | (flags & ZFS_DOS_KEPT)
+}
+
+/// Gives a file that has the DOS flags `current` the [`ZFS_DOS_KEPT`] flags
+/// of `flags`, with `set`, unless it has them already.
+fn restore_dos_flags_with(
+    path: &Path,
+    current: u64,
+    flags: u64,
+    mut set: impl FnMut(u64) -> io::Result<()>,
+) -> io::Result<()> {
+    if wanted_dos_flags(current, flags) == current {
+        return Ok(());
+    }
+    let own = current & !ZFS_DOS_KEPT;
+    set_flags_best_effort(
+        LINUX_ZFS_DOS_FLAGS,
+        path,
+        "ZFS_IOC_SETDOSFLAGS",
+        flags & ZFS_DOS_KEPT,
+        |f| set(own | f),
     )
 }
 
@@ -316,7 +454,7 @@ fn restore_flags_with(
         0 => Ok(()),
         _ => add_xflags(xflags).map_err(|err| {
             if unsupported(&err) {
-                Unsupported::error(LINUX_INODE_FLAGS, late, err)
+                Unsupported::error(LINUX_INODE_FLAGS, late.into(), err)
             } else {
                 path_error("FS_IOC_FSSETXATTR", path, &err)
             }
@@ -431,6 +569,149 @@ mod tests {
             assert_eq!(FS_IOC_FSGETXATTR, 0x801c_581f);
             assert_eq!(FS_IOC_FSSETXATTR, 0x401c_5820);
         }
+    }
+
+    // OpenZFS's other DOS flags.
+    const ZFS_READONLY: u64 = 0x0000_0001_0000_0000;
+    const ZFS_HIDDEN: u64 = 0x0000_0002_0000_0000;
+    const ZFS_SYSTEM: u64 = 0x0000_0004_0000_0000;
+    const ZFS_IMMUTABLE: u64 = 0x0000_0010_0000_0000;
+    const ZFS_APPENDONLY: u64 = 0x0000_0040_0000_0000;
+    const ZFS_NODUMP: u64 = 0x0000_0080_0000_0000;
+    const ZFS_REPARSE: u64 = 0x0000_0800_0000_0000;
+    const ZFS_SPARSE: u64 = 0x0000_2000_0000_0000;
+
+    #[test]
+    fn zfs_dos_ioctls() {
+        assert_eq!(ZFS_DOS_KEPT, 0x0000_302f_0000_0000);
+        #[cfg(all(target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            assert_eq!(ZFS_IOC_GETDOSFLAGS, 0x8008_8301);
+            assert_eq!(ZFS_IOC_SETDOSFLAGS, 0x4008_8302);
+        }
+    }
+
+    #[test]
+    fn dos_flags_attribute_unless_archive_alone() {
+        // A new or written file: no attribute.
+        assert_eq!(dos_flags_attribute(ZFS_ARCHIVE), None);
+        // Archive cleared: an attribute of 0.
+        assert_eq!(dos_flags_attribute(0), Some(0));
+        assert_eq!(dos_flags_attribute(ZFS_ARCHIVE | ZFS_HIDDEN), Some(ZFS_ARCHIVE | ZFS_HIDDEN));
+        // Immutable, append-only and nodump are inode flags, reparse can't
+        // be set: never stored.
+        let others = ZFS_IMMUTABLE | ZFS_APPENDONLY | ZFS_NODUMP | ZFS_REPARSE;
+        assert_eq!(dos_flags_attribute(ZFS_ARCHIVE | others), None);
+        assert_eq!(dos_flags_attribute(others), Some(0));
+        assert_eq!(dos_flags_attribute(ZFS_SYSTEM | others), Some(ZFS_SYSTEM));
+    }
+
+    #[test]
+    fn wanted_dos_flags_keep_the_inode_flags() {
+        let iad = ZFS_IMMUTABLE | ZFS_APPENDONLY | ZFS_NODUMP;
+        assert_eq!(wanted_dos_flags(iad | ZFS_ARCHIVE, ZFS_HIDDEN), iad | ZFS_HIDDEN);
+        assert_eq!(wanted_dos_flags(ZFS_REPARSE | ZFS_ARCHIVE, 0), ZFS_REPARSE);
+        // Not even from a snapshot that has them.
+        assert_eq!(wanted_dos_flags(ZFS_ARCHIVE, iad | ZFS_SYSTEM), ZFS_SYSTEM);
+    }
+
+    /// Runs [`restore_dos_flags_with`] on a file with the DOS flags
+    /// `current`, where `set` refuses `refuse`, and returns its result and
+    /// the flags it set.
+    fn restore_dos_flags_calls(
+        current: u64,
+        flags: u64,
+        refuse: u64,
+    ) -> (io::Result<()>, Vec<u64>) {
+        let mut calls = Vec::new();
+        let result = restore_dos_flags_with(Path::new("f"), current, flags, |f| {
+            calls.push(f);
+            if f & refuse & ZFS_SPARSE != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+            }
+            if f & refuse != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EPERM));
+            }
+            Ok(())
+        });
+        (result, calls)
+    }
+
+    #[test]
+    fn restore_dos_flags_read_merge_write() {
+        // As it should be: no ZFS_IOC_SETDOSFLAGS.
+        let (result, calls) = restore_dos_flags_calls(ZFS_ARCHIVE | ZFS_NODUMP, ZFS_ARCHIVE, 0);
+        assert!(result.is_ok());
+        assert!(calls.is_empty());
+        // Archive cleared, nodump kept.
+        let (result, calls) = restore_dos_flags_calls(ZFS_ARCHIVE | ZFS_NODUMP, 0, 0);
+        assert!(result.is_ok());
+        assert_eq!(calls, [ZFS_NODUMP]);
+        let (_, calls) = restore_dos_flags_calls(ZFS_ARCHIVE | ZFS_IMMUTABLE, ZFS_HIDDEN, 0);
+        assert_eq!(calls, [ZFS_IMMUTABLE | ZFS_HIDDEN]);
+    }
+
+    #[test]
+    fn restore_dos_flags_best_effort() {
+        // Read-only refused (not permitted), hidden set: an error naming
+        // read-only.
+        let (result, calls) =
+            restore_dos_flags_calls(ZFS_ARCHIVE, ZFS_READONLY | ZFS_HIDDEN, ZFS_READONLY);
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("0x100000000 of 0x300000000"), "{err}");
+        assert_eq!(calls.last(), Some(&ZFS_HIDDEN));
+        // Sparse not supported: a warning once.
+        let (result, calls) =
+            restore_dos_flags_calls(ZFS_NODUMP, ZFS_SPARSE | ZFS_SYSTEM, ZFS_SPARSE);
+        let err = result.unwrap_err();
+        let unsupported = err.get_ref().unwrap().downcast_ref::<Unsupported>().unwrap();
+        assert_eq!((unsupported.attr, unsupported.bits), (LINUX_ZFS_DOS_FLAGS, ZFS_SPARSE));
+        assert_eq!(
+            calls,
+            [
+                ZFS_NODUMP | ZFS_SPARSE | ZFS_SYSTEM,
+                ZFS_NODUMP | ZFS_SYSTEM,
+                ZFS_NODUMP | ZFS_SYSTEM | ZFS_SPARSE
+            ]
+        );
+    }
+
+    #[test]
+    fn zfs_dos_flags_round_trip() {
+        // Only where the tests run on ZFS (TMPDIR on a ZFS data set).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        let m = std::fs::symlink_metadata(&path).unwrap();
+        let f = open_for_attrs(&path, &NodeType::File, &m).unwrap();
+        if !is_zfs(&f).unwrap() {
+            // Not ZFS: no attribute, and a restore says so.
+            let mut node = Node::default();
+            fill_attributes(&path, &mut node, Some(&f)).unwrap();
+            assert_eq!(node.meta.generic_attributes.number_u64(LINUX_ZFS_DOS_FLAGS), None);
+            let err = restore_zfs_dos_flags(&path, &NodeType::File, ZFS_HIDDEN).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+            return;
+        }
+        let attribute = |path: &Path, typ: &NodeType| {
+            let m = std::fs::symlink_metadata(path).unwrap();
+            let mut node = Node::default();
+            let f = open_for_attrs(path, typ, &m);
+            fill_attributes(path, &mut node, f.as_ref()).unwrap();
+            node.meta.generic_attributes.number_u64(LINUX_ZFS_DOS_FLAGS)
+        };
+        // A new file has archive: no attribute.
+        assert_eq!(get_dos_flags(&f).unwrap(), ZFS_ARCHIVE);
+        assert_eq!(attribute(&path, &NodeType::File), None);
+        restore_zfs_dos_flags(&path, &NodeType::File, ZFS_HIDDEN | ZFS_SYSTEM).unwrap();
+        assert_eq!(attribute(&path, &NodeType::File), Some(ZFS_HIDDEN | ZFS_SYSTEM));
+        restore_zfs_dos_flags(&path, &NodeType::File, 0).unwrap();
+        assert_eq!(attribute(&path, &NodeType::File), Some(0));
+        // A write sets archive again.
+        std::fs::write(&path, b"y").unwrap();
+        assert_eq!(attribute(&path, &NodeType::File), None);
+        restore_zfs_dos_flags(dir.path(), &NodeType::Dir, ZFS_HIDDEN).unwrap();
+        assert_eq!(attribute(dir.path(), &NodeType::Dir), Some(ZFS_HIDDEN));
     }
 
     #[test]

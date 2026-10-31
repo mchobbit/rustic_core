@@ -13,6 +13,8 @@ pub(super) const FILE_FLAGS: Option<&str> = Some(FREEBSD_FILE_FLAGS);
 pub(super) const FLAGS_BEFORE_DATA: u32 = 0;
 pub(super) const FLAGS_BEFORE_ENTRIES: u32 = 0;
 pub(super) const FLAGS_XATTRS: &[&str] = &[];
+// ZFS keeps its DOS flags in the file flags here (`uarch`, `uhidden`, ...).
+pub(super) const ZFS_DOS_FLAGS: Option<&str> = None;
 
 // From <sys/stat.h>.
 const UF_SETTABLE: u32 = 0x0000_ffff; // the flags an owner may set
@@ -86,6 +88,10 @@ pub(super) fn restore_file_flags(
         // SAFETY: p is a C string.
         check(unsafe { libc::lchflags(p.as_ptr(), (own | bits).into()) }).map(drop)
     })
+}
+
+pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) -> io::Result<()> {
+    Ok(())
 }
 
 /// Restores the system extended attributes.

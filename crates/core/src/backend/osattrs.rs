@@ -9,7 +9,9 @@
 //! On restore, ACLs go on after the mode, which rewrites an NFSv4 ACL, and
 //! file flags last of all, once every file has its contents, hard links and
 //! other metadata: an immutable file refuses new hard links, times and
-//! permissions, and an immutable directory new entries.
+//! permissions, and an immutable directory new entries. On Linux, ZFS's DOS
+//! flags go on just before the file flags: a read-only file refuses writes,
+//! and every write sets the archive flag again.
 //!
 //! Every Unix also marks regular files with holes (`unix.sparse`), for the
 //! restore to make them sparse again.
@@ -117,6 +119,11 @@ pub(crate) fn file_flags(node: &Node) -> Option<u32> {
     os::FILE_FLAGS.and_then(|name| node.meta.generic_attributes.number(name))
 }
 
+/// The ZFS DOS flags `node` holds, on Linux, if any.
+pub(crate) fn zfs_dos_flags(node: &Node) -> Option<u64> {
+    os::ZFS_DOS_FLAGS.and_then(|name| node.meta.generic_attributes.number_u64(name))
+}
+
 /// Creates an empty file at `path` with those of `node`'s flags that a file
 /// system only takes while a file is empty (btrfs's no-copy-on-write), for
 /// the restore to write the contents into. Does nothing when there are none,
@@ -178,6 +185,24 @@ pub(crate) fn restore_file_flags(
     xattrs: &[ExtendedAttribute],
 ) -> io::Result<()> {
     os::restore_file_flags(path, node_type, flags, xattrs)
+}
+
+/// Sets the ZFS DOS flags (Linux) of the file at `path`, of type
+/// `node_type`, to `flags`, leaving those `linux.inode_flags` carries as they
+/// are. This goes before [`restore_file_flags`]: changing them needs no
+/// `CAP_LINUX_IMMUTABLE` as long as immutable and append-only stay as they
+/// are.
+///
+/// # Errors
+///
+/// * If some or all of the flags couldn't be set: an [`Unsupported`] error
+///   if the file system has none (one that isn't ZFS).
+pub(crate) fn restore_zfs_dos_flags(
+    path: &Path,
+    node_type: &NodeType,
+    flags: u64,
+) -> io::Result<()> {
+    os::restore_zfs_dos_flags(path, node_type, flags)
 }
 
 /// Allocates the first `len` bytes of the file `f`, holes included, where the
@@ -286,7 +311,7 @@ pub(crate) struct Unsupported {
     /// The generic attribute.
     pub(crate) attr: &'static str,
     /// The file flags refused, or 0.
-    pub(crate) bits: u32,
+    pub(crate) bits: u64,
     /// The system's error.
     pub(crate) source: io::Error,
 }
@@ -316,7 +341,7 @@ impl Unsupported {
         )),
         allow(dead_code)
     )]
-    fn error(attr: &'static str, bits: u32, source: io::Error) -> io::Error {
+    fn error(attr: &'static str, bits: u64, source: io::Error) -> io::Error {
         io::Error::new(io::ErrorKind::Unsupported, Self { attr, bits, source })
     }
 
@@ -564,11 +589,13 @@ fn path_error(op: &str, path: &Path, err: &io::Error) -> io::Error {
 }
 
 /// Calls `set` with `want`, the flags `attr` of the file at `path`, which
-/// `op` sets. If that fails, sets as many of `want`'s bits as `set` accepts,
-/// one at a time, and returns an error naming the bits it refused, with
-/// `set`'s first error: an [`Unsupported`] one if every refusal said the
-/// file system doesn't have those flags (`EINVAL`, `ENOTSUP`, `EOPNOTSUPP`,
-/// `ENOTTY`), or else with the first error that didn't.
+/// `op` sets: 32 bits (`u32`), or 64 (`u64`, ZFS's DOS flags). If that
+/// fails, sets as many of `want`'s bits as `set` accepts, one at a time, and
+/// returns an error naming the bits it refused, with `set`'s first error: an
+/// [`Unsupported`] one if every refusal said the file system doesn't have
+/// those flags (`EINVAL`, `ENOTSUP`, `EOPNOTSUPP`, `ENOTTY`), or else with
+/// the first error that didn't. If `want` is 0, with nothing to try one at a
+/// time, that is `set`'s error.
 #[cfg_attr(
     not(any(
         target_os = "dragonfly",
@@ -580,21 +607,33 @@ fn path_error(op: &str, path: &Path, err: &io::Error) -> io::Error {
     )),
     allow(dead_code)
 )]
-fn set_flags_best_effort(
+fn set_flags_best_effort<F: Copy + Into<u64> + TryFrom<u64>>(
     attr: &'static str,
     path: &Path,
     op: &str,
-    want: u32,
-    mut set: impl FnMut(u32) -> io::Result<()>,
+    want: F,
+    mut set: impl FnMut(F) -> io::Result<()>,
 ) -> io::Result<()> {
     let Err(first) = set(want) else {
         return Ok(());
     };
+    let want: u64 = want.into();
+    if want == 0 {
+        return Err(if unsupported(&first) {
+            Unsupported::error(attr, 0, first)
+        } else {
+            path_error(op, path, &first)
+        });
+    }
     let (mut got, mut refused) = (0, 0);
     let mut failed = (!unsupported(&first)).then_some(first);
     let mut unsupported_err = None;
-    for bit in (0..32).map(|i| 1_u32 << i).filter(|bit| want & bit != 0) {
-        match set(got | bit) {
+    for bit in (0..64).map(|i| 1_u64 << i).filter(|bit| want & bit != 0) {
+        // One of want's bits, so they fit.
+        let Ok(bits) = F::try_from(got | bit) else {
+            continue;
+        };
+        match set(bits) {
             Ok(()) => got |= bit,
             Err(err) => {
                 refused |= bit;
@@ -688,5 +727,58 @@ mod tests {
         assert!(err.get_ref().unwrap().downcast_ref::<Unsupported>().is_none());
         assert!(err.to_string().contains("0xc of 0x1d"), "{err}");
         assert_eq!(current.get(), 0x11);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_flags_best_effort_64_bits() {
+        let path = Path::new("f");
+        // ZFS's DOS flags: sparse not supported, read-only not permitted.
+        let (readonly, hidden, sparse) = (0x1_0000_0000_u64, 0x2_0000_0000, 0x2000_0000_0000);
+        let current = std::cell::Cell::new(0);
+        let mut set = |f: u64| {
+            if f & sparse != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+            }
+            if f & readonly != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EPERM));
+            }
+            current.set(f);
+            Ok(())
+        };
+        let err = set_flags_best_effort("x.flags", path, "set", hidden | sparse, &mut set)
+            .unwrap_err();
+        let unsupported = err.get_ref().unwrap().downcast_ref::<Unsupported>().unwrap();
+        assert_eq!(unsupported.bits, sparse);
+        assert_eq!(unsupported.kind(), "x.flags 0x200000000000");
+        assert_eq!(current.get(), hidden);
+
+        let all = readonly | hidden | sparse;
+        let err = set_flags_best_effort("x.flags", path, "set", all, &mut set).unwrap_err();
+        assert!(err.get_ref().unwrap().downcast_ref::<Unsupported>().is_none());
+        assert!(
+            err.to_string().contains("0x200100000000 of 0x200300000000"),
+            "{err}"
+        );
+        assert_eq!(current.get(), hidden);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_flags_best_effort_0_fails_with_set() {
+        // Nothing to try one at a time: the error is set's.
+        let path = Path::new("f");
+        let err = set_flags_best_effort("x.flags", path, "set", 0_u64, |_| {
+            Err(io::Error::from_raw_os_error(libc::EACCES))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.get_ref().unwrap().downcast_ref::<Unsupported>().is_none());
+        let err = set_flags_best_effort("x.flags", path, "set", 0_u32, |_| {
+            Err(io::Error::from_raw_os_error(libc::ENOTTY))
+        })
+        .unwrap_err();
+        let unsupported = err.get_ref().unwrap().downcast_ref::<Unsupported>().unwrap();
+        assert_eq!(unsupported.kind(), "x.flags");
     }
 }

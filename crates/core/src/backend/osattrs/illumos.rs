@@ -36,6 +36,8 @@ pub(super) const FILE_FLAGS: Option<&str> = Some(ILLUMOS_SYSTEM_ATTRIBUTES);
 pub(super) const FLAGS_BEFORE_DATA: u32 = 0;
 pub(super) const FLAGS_BEFORE_ENTRIES: u32 = 0;
 pub(super) const FLAGS_XATTRS: &[&str] = &[];
+// ZFS keeps its DOS flags in the system attributes here.
+pub(super) const ZFS_DOS_FLAGS: Option<&str> = None;
 
 const ACE_GETACL: libc::c_int = 4;
 const ACE_SETACL: libc::c_int = 5;
@@ -219,6 +221,10 @@ pub(super) fn restore_file_flags(
         illumos_sysattr::set_mask(&mut view, mask)?;
         f.write_all_at(&view, 0)
     })
+}
+
+pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) -> io::Result<()> {
+    Ok(())
 }
 
 /// Nothing to restore along with the extended attributes on illumos.

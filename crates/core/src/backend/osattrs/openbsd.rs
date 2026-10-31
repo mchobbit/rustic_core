@@ -11,6 +11,7 @@ pub(super) const FILE_FLAGS: Option<&str> = Some(OPENBSD_FILE_FLAGS);
 pub(super) const FLAGS_BEFORE_DATA: u32 = 0;
 pub(super) const FLAGS_BEFORE_ENTRIES: u32 = 0;
 pub(super) const FLAGS_XATTRS: &[&str] = &[];
+pub(super) const ZFS_DOS_FLAGS: Option<&str> = None;
 
 /// From `<sys/stat.h>`: the flags an owner may set (nodump, immutable,
 /// append, opaque) and those only root may (archived, immutable, append; the
@@ -79,6 +80,10 @@ pub(super) fn restore_file_flags(
         };
         check(r).map(drop)
     })
+}
+
+pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) -> io::Result<()> {
+    Ok(())
 }
 
 pub(super) fn restore_attributes(_path: &Path, _node: &Node) -> io::Result<()> {

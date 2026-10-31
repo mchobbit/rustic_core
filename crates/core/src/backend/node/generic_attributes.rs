@@ -48,6 +48,10 @@ pub const NETBSD_ACL_DEFAULT: &str = "netbsd.acl_default";
 pub const NETBSD_ACL_NFS4: &str = "netbsd.acl_nfs4";
 /// DragonFly's `chflags(1)` flags (`st_flags`).
 pub const DRAGONFLY_FILE_FLAGS: &str = "dragonfly.file_flags";
+/// The DOS flags ZFS keeps on Linux (`ZFS_IOC_GETDOSFLAGS`), those
+/// `linux.inode_flags` doesn't carry: a 64-bit mask, 0 included, when it
+/// isn't archive alone.
+pub const LINUX_ZFS_DOS_FLAGS: &str = "linux.zfs_dos_flags";
 
 /// The generic attributes restic and BackOtter's restic know: an attribute
 /// of another system is skipped quietly, an unknown one with a warning.
@@ -72,6 +76,7 @@ pub const KNOWN: &[&str] = &[
     NETBSD_ACL_DEFAULT,
     NETBSD_ACL_NFS4,
     DRAGONFLY_FILE_FLAGS,
+    LINUX_ZFS_DOS_FLAGS,
 ];
 
 /// A node's generic attributes, by name.
@@ -132,6 +137,25 @@ impl GenericAttributes {
         if n != 0 {
             _ = self.0.insert(name.to_string(), n.into());
         }
+    }
+
+    /// The 64-bit number (ZFS's DOS flags) in the attribute `name`, if there
+    /// is one, as [`number`](Self::number) reads a 32-bit one.
+    #[must_use]
+    pub fn number_u64(&self, name: &str) -> Option<u64> {
+        match self.get(name)? {
+            Ok(n) => Some(n),
+            Err(err) => {
+                warn_malformed(name, &err);
+                None
+            }
+        }
+    }
+
+    /// Stores a 64-bit number (ZFS's DOS flags) as the attribute `name`, 0
+    /// too: the caller decides when there is none.
+    pub fn set_u64(&mut self, name: &str, n: u64) {
+        _ = self.0.insert(name.to_string(), n.into());
     }
 
     /// Whether the attribute `name` (`unix.sparse`) is there and `true`. One
@@ -227,6 +251,26 @@ mod tests {
         let a = attrs(r#"{"linux.project_id":0,"unix.sparse":false}"#);
         assert_eq!(a.number(LINUX_PROJECT_ID), Some(0));
         assert!(!a.is_true(UNIX_SPARSE));
+    }
+
+    // ZFS's DOS flags: a 64-bit number, 0 included.
+    #[test]
+    fn zfs_dos_flags_json() {
+        let mut node = Node::default();
+        node.meta.generic_attributes.set_u64(LINUX_ZFS_DOS_FLAGS, 0);
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains(r#""generic_attributes":{"linux.zfs_dos_flags":0}"#), "{json}");
+        let node: Node = serde_json::from_str(&json).unwrap();
+        assert_eq!(node.meta.generic_attributes.number_u64(LINUX_ZFS_DOS_FLAGS), Some(0));
+
+        let attrs: GenericAttributes =
+            serde_json::from_str(r#"{"linux.zfs_dos_flags":52978421596160}"#).unwrap();
+        assert_eq!(attrs.number_u64(LINUX_ZFS_DOS_FLAGS), Some(0x0000_302f_0000_0000));
+        for bad in ["-1", "1.5", r#""x""#, "18446744073709551616", "true"] {
+            let attrs: GenericAttributes =
+                serde_json::from_str(&format!(r#"{{"linux.zfs_dos_flags":{bad}}}"#)).unwrap();
+            assert_eq!(attrs.number_u64(LINUX_ZFS_DOS_FLAGS), None, "{bad}");
+        }
     }
 
     // The JSON BackOtter's restic writes for a sparse file with a project ID.
