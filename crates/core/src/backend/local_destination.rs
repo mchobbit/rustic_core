@@ -917,7 +917,14 @@ impl LocalDestination {
     ///
     /// * If the new hardlink does not have a parent directory.
     /// * If the directory could not be created.
+    /// * If a file already at `item` could not be removed.
     /// * If the hardlink could not be created.
+    ///
+    /// # Notes
+    ///
+    /// BackOtter: whatever is at `item` already (the same link, left by an
+    /// earlier restore, or another file) is removed first, as BackOtter's
+    /// restic does: the link can't be made over it (`EEXIST`).
     pub(crate) fn hard_link(
         &self,
         source_item: impl AsRef<Path>,
@@ -929,6 +936,12 @@ impl LocalDestination {
             .parent()
             .ok_or_else(|| LocalDestinationErrorKind::FileDoesNotHaveParent(filename.clone()))?;
         fs::create_dir_all(dir).map_err(LocalDestinationErrorKind::DirectoryCreationFailed)?;
+        match fs::remove_file(&filename) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                return Err(LocalDestinationErrorKind::FileRemovalFailed(err));
+            }
+            _ => {}
+        }
         fs::hard_link(&source_path, &filename).map_err(|err| {
             LocalDestinationErrorKind::HardLinkingFailed {
                 source_path,

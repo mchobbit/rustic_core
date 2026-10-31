@@ -61,6 +61,18 @@ fn test_restore_preserves_hardlinks(
     assert_eq!(fs::read_to_string(&hardlink)?, fs::read_to_string(&linked)?);
     assert_eq!(fs::read_link(&symlink)?, PathBuf::from("testfile"));
 
+    // BackOtter: again, over the complete earlier restore, where the link is
+    // already, and over one where another file has its name.
+    restore_to(&repo, restore_dir.path(), restore_opts)?;
+    fs::remove_file(&hardlink)?;
+    fs::write(&hardlink, "another file")?;
+    restore_to(&repo, restore_dir.path(), restore_opts)?;
+    let hardlink_meta = fs::metadata(&hardlink)?;
+    let linked_meta = fs::metadata(&linked)?;
+    assert_eq!(hardlink_meta.ino(), linked_meta.ino());
+    assert_eq!(linked_meta.nlink(), 2);
+    assert_eq!(fs::read_to_string(&hardlink)?, fs::read_to_string(&linked)?);
+
     Ok(())
 }
 
