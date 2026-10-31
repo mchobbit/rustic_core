@@ -32,6 +32,24 @@ that either program restores what the other backed up.
     `S+v...`), as a mask; `archive` and `av_modified` only along with
     others, since ZFS sets them on every file.
   - `openbsd.file_flags`: OpenBSD's `chflags(1)` flags.
+  - `netbsd.file_flags`: NetBSD's `chflags(1)` flags, all but the three
+    the kernel manages (`SF_SNAPSHOT`, `SF_SNAPINVAL`, and `SF_LOG`, which
+    it takes from userland but which marks the WAPBL journal's inode): the
+    mask `0xff1fffff`.
+  - `netbsd.acl_access`, `netbsd.acl_default`, `netbsd.acl_nfs4`,
+    `netbsd.system_extattrs`: as the FreeBSD ones, in the same JSON form
+    and by the same rules (NetBSD took FreeBSD's ACL code), on FFSv2ea
+    (`newfs -O 2ea`) mounted with `posix1eacls` or `nfs4acls`; plain FFSv2
+    has neither ACLs nor extended attributes, and gets none, quietly.
+    Unlike FreeBSD, NetBSD gives symlinks ACLs of their own, which are kept
+    and restored. The ACL system calls go by their numbers
+    (`__acl_get_link` 487, `__acl_set_link` 488, `lpathconf` 499), and
+    NetBSD's `pathconf(2)` names are its own (`_PC_ACL_EXTENDED` 14,
+    `_PC_ACL_NFS4` 17, where FreeBSD has 59 and 64); the rest is one module,
+    `osattrs/freebsd_netbsd.rs`, for both.
+  - `dragonfly.file_flags`: DragonFly's `chflags(1)` flags, all 32 bits
+    (root can set each of them on HAMMER2 and UFS). DragonFly's file
+    systems have no ACLs or extended attributes.
   - `unix.sparse`: `true` for a regular file with holes, on every Unix, by
     the rule BackOtter's restic follows too, from the file's lstat:
     1. If its size is 0, or its 512-byte blocks cover its size, it has
@@ -105,9 +123,9 @@ that either program restores what the other backed up.
   namespaces, as `user.NAME` and `system.NAME`, and restores the system
   namespace's raw UFS ACL storage). Stock rustic's FreeBSD snapshots
   therefore restore their user attributes with a `user.` in front.
-- On FreeBSD the user namespace is listed directly: the xattr crate (1.6)
-  names the last attribute of the system namespace as one of the user
-  namespace, which a restore then creates, empty.
+- On FreeBSD and NetBSD the user namespace is listed directly: the xattr
+  crate (1.6) names the last attribute of the system namespace as one of
+  the user namespace, which a restore then creates, empty.
 - On illumos, extended attributes are named attribute files (`runat(1)`),
   which the xattr crate doesn't support: they are read and written through
   `openat(2)` with `O_XATTR`, without the `SUNWattr_ro` and `SUNWattr_rw`
@@ -165,7 +183,15 @@ that either program restores what the other backed up.
 - Partial restores (`--glob`, `--iglob`): directories above the matches
   that aren't matched themselves aren't streamed, so the restore creates
   them without any metadata, casefolding included, as stock rustic does.
-- On FreeBSD a restored symlink keeps its own permissions (`lchmod(2)`).
+- A restored symlink keeps its own permissions on FreeBSD (`lchmod(2)`) and
+  on OpenBSD, NetBSD and DragonFly (`fchmodat(2)` with
+  `AT_SYMLINK_NOFOLLOW`; OpenBSD has no `lchmod`), where stock rustic
+  leaves the 0755 a new symlink gets. A file system that refuses
+  (`EOPNOTSUPP`, `EINVAL`) is only noted in the debug log.
+- On DragonFly, where `dev_t` is 32 bits, a device number that doesn't fit
+  is an error for that device node, as on 32-bit Android, rather than a
+  build failure: rustic_core builds for x86_64-unknown-dragonfly (a tier 3
+  target: nightly with `-Zbuild-std`, or a native Rust >= 1.91).
 - The version reads `X.Y.Z+backotter.N`.
 
 The system calls need `unsafe`, which the workspace lints now deny (not

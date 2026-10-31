@@ -1,11 +1,19 @@
 //! FreeBSD ACLs as `<sys/acl.h>` has them, and the part of FreeBSD's ACL
 //! code (`sys/kern/subr_acl_nfs4.c`) that tells a trivial NFSv4 ACL, one that
-//! says no more than the file's mode, from one worth keeping. Portable, so
-//! that it is tested on any system; the system calls are in `freebsd.rs`.
+//! says no more than the file's mode, from one worth keeping. NetBSD took
+//! FreeBSD's ACL code: the same `struct acl`, kept in the same form under
+//! its own names ([`Os`]). Portable, so that it is tested on any system;
+//! the system calls are in `freebsd_netbsd.rs`.
 
-#![cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+#![cfg_attr(not(any(target_os = "freebsd", target_os = "netbsd")), allow(dead_code))]
 
 use serde::{Deserialize, Serialize};
+
+use crate::backend::node::generic_attributes::{
+    FREEBSD_ACL_ACCESS, FREEBSD_ACL_DEFAULT, FREEBSD_ACL_NFS4, FREEBSD_SYSTEM_EXTATTRS,
+    GenericAttributes, NETBSD_ACL_ACCESS, NETBSD_ACL_DEFAULT, NETBSD_ACL_NFS4,
+    NETBSD_SYSTEM_EXTATTRS,
+};
 
 pub(super) const MAX_ENTRIES: usize = 254; // ACL_MAX_ENTRIES
 pub(super) const UNDEFINED_ID: u32 = 0xffff_ffff; // ACL_UNDEFINED_ID
@@ -49,6 +57,92 @@ const ENTRY_INHERIT_ONLY: u16 = 0x0008;
 #[allow(clippy::trivially_copy_pass_by_ref)]
 const fn is_zero(v: &u16) -> bool {
     *v == 0
+}
+
+/// What FreeBSD's and NetBSD's ACLs and system extended attributes differ
+/// in: the names they are kept under, and the numbers of `<sys/unistd.h>`.
+pub(super) struct Os {
+    /// The generic attribute of a POSIX.1e access ACL.
+    pub acl_access: &'static str,
+    /// The generic attribute of a directory's POSIX.1e default ACL.
+    pub acl_default: &'static str,
+    /// The generic attribute of an NFSv4 ACL.
+    pub acl_nfs4: &'static str,
+    /// The generic attribute of the system extended attributes.
+    pub system_extattrs: &'static str,
+    /// `_PC_ACL_EXTENDED`: whether a file system has POSIX.1e ACLs
+    /// (`pathconf(2)`).
+    pub pc_acl_extended: i32,
+    /// `_PC_ACL_NFS4`: whether it has NFSv4 ACLs.
+    pub pc_acl_nfs4: i32,
+    /// Whether a symlink has ACLs of its own.
+    pub symlink_acls: bool,
+}
+
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+pub(super) const FREEBSD: Os = Os {
+    acl_access: FREEBSD_ACL_ACCESS,
+    acl_default: FREEBSD_ACL_DEFAULT,
+    acl_nfs4: FREEBSD_ACL_NFS4,
+    system_extattrs: FREEBSD_SYSTEM_EXTATTRS,
+    pc_acl_extended: 59,
+    pc_acl_nfs4: 64,
+    symlink_acls: false,
+};
+
+#[cfg_attr(not(target_os = "netbsd"), allow(dead_code))]
+pub(super) const NETBSD: Os = Os {
+    acl_access: NETBSD_ACL_ACCESS,
+    acl_default: NETBSD_ACL_DEFAULT,
+    acl_nfs4: NETBSD_ACL_NFS4,
+    system_extattrs: NETBSD_SYSTEM_EXTATTRS,
+    pc_acl_extended: 14,
+    pc_acl_nfs4: 17,
+    // `setfacl -h` gives a symlink its own on FFSv2ea.
+    symlink_acls: true,
+};
+
+/// The types of ACL (`acl_type_t`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AclType {
+    Access = 2,
+    Default = 3,
+    Nfs4 = 4,
+}
+
+impl Os {
+    /// The generic attribute an ACL of type `typ` is kept in.
+    pub(super) const fn attribute(&self, typ: AclType) -> &'static str {
+        match typ {
+            AclType::Access => self.acl_access,
+            AclType::Default => self.acl_default,
+            AclType::Nfs4 => self.acl_nfs4,
+        }
+    }
+}
+
+/// Keeps `acl`, an ACL of type `typ`, in `attrs` if it says more than the
+/// file's mode.
+///
+/// # Errors
+///
+/// * If the ACL can't be encoded as JSON.
+pub(super) fn keep_acl(
+    os: &Os,
+    attrs: &mut GenericAttributes,
+    typ: AclType,
+    acl: &[AclEntry],
+) -> serde_json::Result<()> {
+    let keep = match typ {
+        // Three entries are just the mode: user_obj, group_obj and other.
+        AclType::Access => acl.len() > 3,
+        AclType::Default => !acl.is_empty(),
+        AclType::Nfs4 => !nfs4_is_trivial(acl),
+    };
+    if keep {
+        attrs.set(os.attribute(typ), &acl)?;
+    }
+    Ok(())
 }
 
 /// One entry of a FreeBSD ACL (`struct acl_entry`), as BackOtter's restic
@@ -264,6 +358,58 @@ mod tests {
         acl[2].perm = 7;
         acl[4].perm = 5;
         assert_eq!(posix_owning_group_perms(&acl), Some(5));
+    }
+
+    #[test]
+    fn pathconf_names_per_system() {
+        assert_eq!((FREEBSD.pc_acl_extended, FREEBSD.pc_acl_nfs4), (59, 64));
+        assert_eq!((NETBSD.pc_acl_extended, NETBSD.pc_acl_nfs4), (14, 17));
+    }
+
+    #[test]
+    fn kept_alike_on_freebsd_and_netbsd() {
+        let base = vec![
+            entry(USER_OBJ, UNDEFINED_ID, 6, 0),
+            entry(GROUP_OBJ, UNDEFINED_ID, 4, 0),
+            entry(OTHER, UNDEFINED_ID, 4, 0),
+        ];
+        let mut named = base.clone();
+        named.insert(1, entry(USER, 1001, 7, 0));
+        named.insert(3, entry(MASK, UNDEFINED_ID, 7, 0));
+        let mut nfs4 = vec![entry(USER, 1001, READ_DATA, ENTRY_TYPE_DENY)];
+        nfs4.extend(nfs4_trivial_acl(0o644));
+
+        let mut json = Vec::new();
+        for (os, prefix) in [(&FREEBSD, "freebsd"), (&NETBSD, "netbsd")] {
+            let mut attrs = GenericAttributes::default();
+            keep_acl(os, &mut attrs, AclType::Access, &base).unwrap();
+            keep_acl(os, &mut attrs, AclType::Default, &[]).unwrap();
+            keep_acl(os, &mut attrs, AclType::Nfs4, &nfs4_trivial_acl(0o750)).unwrap();
+            assert!(attrs.is_empty(), "{prefix}: trivial ACLs kept");
+
+            keep_acl(os, &mut attrs, AclType::Access, &named).unwrap();
+            keep_acl(os, &mut attrs, AclType::Default, &base).unwrap();
+            keep_acl(os, &mut attrs, AclType::Nfs4, &nfs4).unwrap();
+            let kept: Vec<_> = attrs.names().collect();
+            assert_eq!(
+                kept,
+                [
+                    format!("{prefix}.acl_access"),
+                    format!("{prefix}.acl_default"),
+                    format!("{prefix}.acl_nfs4")
+                ]
+            );
+            let back: Vec<AclEntry> = attrs.get(os.acl_nfs4).unwrap().unwrap();
+            assert_eq!(back, nfs4);
+            json.push(serde_json::to_string(&attrs).unwrap().replace(prefix, "PREFIX"));
+        }
+        assert_eq!(json[0], json[1]);
+        // A generic attribute's object keys come out sorted.
+        assert!(
+            json[0].contains(r#""PREFIX.acl_nfs4":[{"id":1001,"perm":8,"tag":2,"type":512},"#),
+            "{}",
+            json[0]
+        );
     }
 
     #[test]

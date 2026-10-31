@@ -1,7 +1,8 @@
 //! BackOtter: metadata some systems keep that rustic otherwise doesn't save:
 //! file flags (Linux's `chattr(1)` flags, the BSDs' `chflags(1)` flags,
-//! illumos' system attributes), ACLs (FreeBSD's and illumos') and FreeBSD's
-//! system extended attributes. They are kept as restic generic attributes
+//! illumos' system attributes), ACLs (FreeBSD's, NetBSD's and illumos') and
+//! FreeBSD's and NetBSD's system extended attributes. They are kept as
+//! restic generic attributes
 //! ([`generic_attributes`](super::node::generic_attributes)), in the same
 //! form as BackOtter's restic.
 //!
@@ -32,12 +33,19 @@ use crate::backend::node::{
     generic_attributes::{KNOWN, UNIX_SPARSE},
 };
 
+mod bsd_flags;
 mod freebsd_acl;
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+mod freebsd_netbsd;
 mod illumos_acl;
 mod illumos_sysattr;
 #[cfg(unix)]
 mod sparse;
 
+#[cfg(target_os = "dragonfly")]
+mod dragonfly;
+#[cfg(target_os = "dragonfly")]
+use dragonfly as os;
 #[cfg(target_os = "freebsd")]
 mod freebsd;
 #[cfg(target_os = "freebsd")]
@@ -50,21 +58,29 @@ use illumos as os;
 mod linux;
 #[cfg(target_os = "linux")]
 use linux as os;
+#[cfg(target_os = "netbsd")]
+mod netbsd;
+#[cfg(target_os = "netbsd")]
+use netbsd as os;
 #[cfg(target_os = "openbsd")]
 mod openbsd;
 #[cfg(target_os = "openbsd")]
 use openbsd as os;
 #[cfg(not(any(
+    target_os = "dragonfly",
     target_os = "freebsd",
     target_os = "illumos",
     target_os = "linux",
+    target_os = "netbsd",
     target_os = "openbsd"
 )))]
 mod other;
 #[cfg(not(any(
+    target_os = "dragonfly",
     target_os = "freebsd",
     target_os = "illumos",
     target_os = "linux",
+    target_os = "netbsd",
     target_os = "openbsd"
 )))]
 use other as os;
@@ -291,9 +307,11 @@ impl Unsupported {
     /// An [`io::Error`] for this.
     #[cfg_attr(
         not(any(
+            target_os = "dragonfly",
             target_os = "freebsd",
             target_os = "illumos",
             target_os = "linux",
+            target_os = "netbsd",
             target_os = "openbsd"
         )),
         allow(dead_code)
@@ -354,8 +372,8 @@ pub(crate) fn report_unsupported() {
 }
 
 /// Restores the attributes that go along with the extended attributes
-/// (FreeBSD's system extended attributes), and warns once about each generic
-/// attribute that isn't known at all.
+/// (FreeBSD's and NetBSD's system extended attributes), and warns once about
+/// each generic attribute that isn't known at all.
 ///
 /// # Errors
 ///
@@ -376,7 +394,7 @@ pub(crate) fn restore_acls(path: &Path, node: &Node) -> io::Result<()> {
 }
 
 /// Gives a symlink its own permissions back, where the system keeps them
-/// (FreeBSD).
+/// (FreeBSD, NetBSD, OpenBSD, DragonFly).
 ///
 /// # Errors
 ///
@@ -411,21 +429,22 @@ pub(crate) fn set_illumos_xattrs(
 }
 
 /// The names of the extended attributes of the file at `path`, as the xattr
-/// crate names them. On FreeBSD, those of the user namespace only, listed
-/// here: xattr 1.6 names the last attribute of the system namespace as one
-/// of the user namespace (which is kept as a generic attribute anyway).
+/// crate names them. On FreeBSD and NetBSD, those of the user namespace
+/// only, listed here: xattr 1.6 names the last attribute of the system
+/// namespace as one of the user namespace (which is kept as a generic
+/// attribute anyway).
 ///
 /// # Errors
 ///
 /// * If they can't be listed.
 #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
 pub(crate) fn xattr_list(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
-    #[cfg(target_os = "freebsd")]
-    let names = os::user_extattr_names(path)?
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+    let names = freebsd_netbsd::user_extattr_names(path)?
         .into_iter()
         .map(|name| format!("user.{name}").into())
         .collect();
-    #[cfg(not(target_os = "freebsd"))]
+    #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
     let names = xattr::list(path)?.collect();
     Ok(names)
 }
@@ -434,7 +453,7 @@ pub(crate) fn xattr_list(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
 /// crate lists it by, or `None` for one that isn't kept as an extended
 /// attribute. On FreeBSD and NetBSD restic keeps the user namespace only,
 /// under bare names, where the xattr crate says `user.NAME` and
-/// `system.NAME`; FreeBSD's system namespace is kept as a generic attribute.
+/// `system.NAME`; their system namespace is kept as a generic attribute.
 #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
 pub(crate) fn xattr_node_name(name: &std::ffi::OsStr) -> Option<String> {
     let name = name.to_string_lossy();
@@ -472,7 +491,13 @@ fn warn_unknown(node: &Node) {
 }
 
 /// `path` as a C string.
-#[cfg(any(target_os = "freebsd", target_os = "illumos", target_os = "openbsd"))]
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "illumos",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
 fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(io::Error::from)
@@ -480,7 +505,13 @@ fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
 
 /// The result of a C call that returns -1 (or less than 0) and sets errno
 /// when it fails.
-#[cfg(any(target_os = "freebsd", target_os = "illumos", target_os = "openbsd"))]
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "illumos",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
 fn check<T: Copy + Default + PartialOrd>(r: T) -> io::Result<T> {
     if r < T::default() {
         Err(io::Error::last_os_error())
@@ -489,12 +520,41 @@ fn check<T: Copy + Default + PartialOrd>(r: T) -> io::Result<T> {
     }
 }
 
+/// Gives the symlink at `path` the permissions of `node`'s mode, which
+/// OpenBSD, NetBSD and DragonFly keep (`fchmodat(2)` with
+/// `AT_SYMLINK_NOFOLLOW`; OpenBSD has no `lchmod(2)`), and `ls(1)` and
+/// `mtree(8)` show, though access doesn't depend on them. Without this a
+/// restored symlink gets 0755. A file system that keeps none only goes to
+/// the debug log.
+#[cfg(any(target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))]
+fn chmod_symlink(path: &Path, node: &Node) -> io::Result<()> {
+    use crate::backend::ignore::mapper::nix_mapper::map_mode_from_go;
+
+    let Some(mode) = node.meta.mode else {
+        return Ok(());
+    };
+    let p = c_path(path)?;
+    let mode = libc::mode_t::try_from(map_mode_from_go(mode) & 0o7777).unwrap_or(0o755);
+    // SAFETY: p is a C string.
+    let r = unsafe { libc::fchmodat(libc::AT_FDCWD, p.as_ptr(), mode, libc::AT_SYMLINK_NOFOLLOW) };
+    match check(r) {
+        Ok(_) => Ok(()),
+        Err(err) if matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL)) => {
+            debug!("symlink mode of {} not set: {err}", path.display());
+            Ok(())
+        }
+        Err(err) => Err(path_error("fchmodat", path, &err)),
+    }
+}
+
 /// An error that names the operation and the file.
 #[cfg_attr(
     not(any(
+        target_os = "dragonfly",
         target_os = "freebsd",
         target_os = "illumos",
         target_os = "linux",
+        target_os = "netbsd",
         target_os = "openbsd"
     )),
     allow(dead_code)
@@ -511,9 +571,11 @@ fn path_error(op: &str, path: &Path, err: &io::Error) -> io::Error {
 /// `ENOTTY`), or else with the first error that didn't.
 #[cfg_attr(
     not(any(
+        target_os = "dragonfly",
         target_os = "freebsd",
         target_os = "illumos",
         target_os = "linux",
+        target_os = "netbsd",
         target_os = "openbsd"
     )),
     allow(dead_code)
@@ -569,9 +631,11 @@ fn set_flags_best_effort(
 /// flags, a project ID), rather than that setting it failed.
 #[cfg_attr(
     not(any(
+        target_os = "dragonfly",
         target_os = "freebsd",
         target_os = "illumos",
         target_os = "linux",
+        target_os = "netbsd",
         target_os = "openbsd"
     )),
     allow(dead_code)
