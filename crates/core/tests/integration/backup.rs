@@ -15,8 +15,8 @@ use rustic_core::{
 };
 
 use super::{
-    RepoOpen, TestSource, assert_with_win, insta_node_redaction, insta_snapshotfile_redaction,
-    set_up_repo, tar_gz_testdata,
+    RepoOpen, TestSource, assert_with_win, atime_as_mtime, insta_node_redaction,
+    insta_snapshotfile_redaction, set_up_repo, tar_gz_testdata,
 };
 
 #[rstest]
@@ -35,7 +35,9 @@ fn test_backup_with_tar_gz_passes(
     let paths = &source.path_list();
 
     // we use as_path to not depend on the actual tempdir
-    let opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
+    let opts = BackupOptions::default()
+        .as_path(PathBuf::from_str("test")?)
+        .ignore_save_opts(atime_as_mtime());
 
     // first backup
     let first_snapshot = repo.backup(&opts, paths, SnapshotFile::default())?;
@@ -163,6 +165,7 @@ fn test_backup_dry_run_with_tar_gz_passes(
     // we use as_path to not depend on the actual tempdir
     let opts = BackupOptions::default()
         .as_path(PathBuf::from_str("test")?)
+        .ignore_save_opts(atime_as_mtime())
         .dry_run(true);
 
     // dry-run backup
@@ -327,7 +330,7 @@ fn test_backup_keeps_access_times(set_up_repo: Result<RepoOpen>) -> Result<()> {
     let repo = set_up_repo?.to_indexed_ids()?;
     let opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
     let paths = PathList::from_iter(Some(source.path().to_path_buf()));
-    let _snapshot = repo.backup(&opts, &paths, SnapshotFile::default())?;
+    let first = repo.backup(&opts, &paths, SnapshotFile::default())?;
 
     let repo = repo.to_indexed()?;
     let atime = |path: &str| -> Result<Option<i64>> {
@@ -344,6 +347,11 @@ fn test_backup_keeps_access_times(set_up_repo: Result<RepoOpen>) -> Result<()> {
             let m = std::fs::metadata(&path)?;
             assert_eq!(FileTime::from_last_access_time(&m), old, "{}", path.display());
         }
+        // So a second backup saves the same trees, even where the file
+        // system updates atimes on every access (strictatime).
+        let repo = repo.to_indexed_ids()?;
+        let second = repo.backup(&opts, &paths, SnapshotFile::default())?;
+        assert_eq!(second.tree, first.tree);
     }
     Ok(())
 }
