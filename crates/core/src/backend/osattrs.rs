@@ -39,7 +39,9 @@ use log::{debug, warn};
 
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType,
-    generic_attributes::{KNOWN, UNIX_BIRTHTIME, UNIX_SPARSE},
+    generic_attributes::{
+        ILLUMOS_SYSTEM_ATTRIBUTES, ILLUMOS_UNREAD_SIZE, KNOWN, UNIX_BIRTHTIME, UNIX_SPARSE,
+    },
 };
 
 mod bsd_flags;
@@ -153,6 +155,57 @@ pub(crate) fn file_flags(node: &Node) -> Option<u32> {
 /// The ZFS DOS flags `node` holds, on Linux, if any.
 pub(crate) fn zfs_dos_flags(node: &Node) -> Option<u64> {
     os::ZFS_DOS_FLAGS.and_then(|name| node.meta.generic_attributes.number_u64(name))
+}
+
+/// Whether `node`, a regular file, has illumos' `av_quarantined` among the
+/// system attributes [`fill`] recorded: no one may open such a file for
+/// reading, root included (`EACCES`), nor its extended attributes; its
+/// metadata can be read all the same (the system attributes through its
+/// attribute directory, as `getattrat(3C)` reads them).
+pub(crate) fn is_quarantined(node: &Node) -> bool {
+    node.is_file()
+        && node
+            .meta
+            .generic_attributes
+            .number(ILLUMOS_SYSTEM_ATTRIBUTES)
+            .is_some_and(|mask| mask & illumos_sysattr::AV_QUARANTINED != 0)
+}
+
+/// Whether opening the regular file at `path` for reading is refused with
+/// `EACCES`, as for a file illumos quarantined ([`is_quarantined`]). It is
+/// opened and closed, nothing more.
+pub(crate) fn open_refused(path: &Path) -> bool {
+    match File::open(path) {
+        Ok(_) => false,
+        #[cfg(unix)]
+        Err(err) => err.raw_os_error() == Some(libc::EACCES),
+        #[cfg(not(unix))]
+        Err(_) => false,
+    }
+}
+
+/// Makes `node`, a regular file whose contents couldn't be read (one
+/// illumos quarantined: [`is_quarantined`], [`open_refused`]), a node
+/// without contents: no content, size 0, and the size it has in
+/// `illumos.unread_size`, which says its contents weren't backed up. Its
+/// extended attributes, which couldn't be read either, are left out; the
+/// rest of its metadata is kept. A warning names it.
+pub(crate) fn keep_unread(path: &Path, node: &mut Node) {
+    let size = node.meta.size;
+    node.content = Some(Vec::new());
+    node.meta.size = 0;
+    node.meta.extended_attributes.clear();
+    node.meta.generic_attributes.set_u64(ILLUMOS_UNREAD_SIZE, size);
+    warn!(
+        "{}: av_quarantined: contents not backed up ({size} bytes)",
+        path.display()
+    );
+}
+
+/// The size of the file `node` when its contents weren't backed up
+/// ([`keep_unread`]): the restore makes it an empty file, and warns.
+pub(crate) fn unread_size(node: &Node) -> Option<u64> {
+    node.meta.generic_attributes.number_u64(ILLUMOS_UNREAD_SIZE)
 }
 
 /// Creates an empty file at `path` with those of `node`'s flags that a file
@@ -1043,6 +1096,59 @@ fn unsupported(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A file illumos quarantined, as the backup builds its node from the
+    // lstat and the system attributes: no contents, size 0, its size in
+    // illumos.unread_size, its other metadata kept.
+    #[test]
+    fn quarantined_node_without_contents() {
+        use crate::backend::node::Metadata;
+
+        let mut meta = Metadata {
+            mode: Some(0o644),
+            uid: Some(0),
+            inode: 7,
+            links: 1,
+            size: 12,
+            extended_attributes: vec![ExtendedAttribute {
+                name: "note".to_string(),
+                value: Some(b"x".to_vec()),
+            }],
+            ..Metadata::default()
+        };
+        let quarantined = illumos_sysattr::AV_QUARANTINED | illumos_sysattr::AUTOMATIC;
+        meta.generic_attributes
+            .set_u64(ILLUMOS_SYSTEM_ATTRIBUTES, quarantined.into());
+        let mut node = Node::new_node(std::ffi::OsStr::new("q"), NodeType::File, meta);
+        assert!(is_quarantined(&node));
+        assert_eq!(unread_size(&node), None);
+
+        keep_unread(Path::new("/q"), &mut node);
+        assert_eq!(node.content, Some(Vec::new()));
+        assert_eq!(node.meta.size, 0);
+        assert!(node.meta.extended_attributes.is_empty());
+        assert_eq!(unread_size(&node), Some(12));
+        assert_eq!(node.meta.mode, Some(0o644));
+        assert_eq!(node.meta.inode, 7);
+        assert_eq!(file_flags_mask(&node), Some(u64::from(quarantined)));
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains(r#""content":[]"#), "{json}");
+        assert!(json.contains(r#""illumos.unread_size":12"#), "{json}");
+        assert!(!json.contains(r#""size""#), "{json}");
+
+        // Other files, and a directory with the attribute, aren't.
+        let mut other = Node::default();
+        other.meta.generic_attributes.set_u64(ILLUMOS_SYSTEM_ATTRIBUTES, 1 << 5);
+        assert!(!is_quarantined(&other));
+        let mut dir = Node::new_node(std::ffi::OsStr::new("d"), NodeType::Dir, Metadata::default());
+        dir.meta.generic_attributes.set_u64(ILLUMOS_SYSTEM_ATTRIBUTES, quarantined.into());
+        assert!(!is_quarantined(&dir));
+        assert!(!open_refused(Path::new("/nonexistent/bko")));
+    }
+
+    fn file_flags_mask(node: &Node) -> Option<u64> {
+        node.meta.generic_attributes.number_u64(ILLUMOS_SYSTEM_ATTRIBUTES)
+    }
 
     #[test]
     fn xattr_errors_name_each() {

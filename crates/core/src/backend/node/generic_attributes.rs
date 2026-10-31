@@ -68,6 +68,10 @@ pub const ILLUMOS_XATTR_META: &str = "illumos.xattr_meta";
 /// An illumos file's ZFS project ID and whether it hands it down
 /// (`zfs project -p ID -s`), when it has either.
 pub const ILLUMOS_ZFS_PROJECT: &str = "illumos.zfs_project";
+/// The size in bytes of a regular file whose contents weren't backed up,
+/// because illumos quarantined it (`av_quarantined`) and no one, root
+/// included, could read it: its node has no contents and size 0.
+pub const ILLUMOS_UNREAD_SIZE: &str = "illumos.unread_size";
 
 /// The generic attributes restic and BackOtter's restic know: an attribute
 /// of another system is skipped quietly, an unknown one with a warning.
@@ -98,6 +102,7 @@ pub const KNOWN: &[&str] = &[
     ILLUMOS_GROUP_SID,
     ILLUMOS_XATTR_META,
     ILLUMOS_ZFS_PROJECT,
+    ILLUMOS_UNREAD_SIZE,
 ];
 
 /// A node's generic attributes, by name.
@@ -378,6 +383,23 @@ mod tests {
                 serde_json::from_str(&format!(r#"{{"unix.birthtime":{bad}}}"#)).unwrap();
             assert_eq!(attrs.timestamp(UNIX_BIRTHTIME), None, "{bad}");
         }
+    }
+
+    // A file whose contents weren't backed up: its size a JSON number.
+    #[test]
+    fn unread_size_json() {
+        let mut node = Node::default();
+        node.meta.generic_attributes.set_u64(ILLUMOS_UNREAD_SIZE, 5_000_000_000);
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(
+            json.contains(r#""generic_attributes":{"illumos.unread_size":5000000000}"#),
+            "{json}"
+        );
+        let node: Node = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            node.meta.generic_attributes.number_u64(ILLUMOS_UNREAD_SIZE),
+            Some(5_000_000_000)
+        );
     }
 
     // The JSON BackOtter's restic writes for a sparse file with a project ID.

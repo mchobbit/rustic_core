@@ -353,6 +353,16 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         std::collections::btree_map::Entry::Occupied(_) => return Ok(()), // this is a hardlink to an existing candidate, will be processed later while setting metadata
                     }
                 }
+                // BackOtter: a file whose contents weren't backed up (one
+                // illumos quarantined) is restored empty, with the rest of its
+                // metadata, its system attributes last as for any file; one
+                // warning for it, not for each of its hard links.
+                if let Some(size) = osattrs::unread_size(node) {
+                    warn!(
+                        "{}: contents were not backed up (av_quarantined at backup, {size} bytes)",
+                        dest.path(path).display()
+                    );
+                }
                 // BackOtter: whether the file goes into a new, empty file,
                 // which can be restored sparse (write_sparse): nothing is
                 // there now, seen by the walk of the destination or not (a

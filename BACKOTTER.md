@@ -73,6 +73,10 @@ that either program restores what the other backed up.
     down (`zfs project -p 77 -s`), as `{"id":77,"inherit":true}`
     (`"inherit"` left out when false), when it has either; regular files
     and directories.
+  - `illumos.unread_size`: the size in bytes (a JSON number) of a regular
+    file whose contents weren't backed up, because illumos quarantined it
+    (`av_quarantined`) and no one could read it: its node has no contents
+    and size 0. See `av_quarantined` below.
   - `openbsd.file_flags`: OpenBSD's `chflags(1)` flags.
   - `netbsd.file_flags`: NetBSD's `chflags(1)` flags, all but the three
     the kernel manages (`SF_SNAPSHOT`, `SF_SNAPINVAL`, and `SF_LOG`, which
@@ -267,13 +271,29 @@ that either program restores what the other backed up.
   as any other) or inherited from its directory, and its project ID
   (`linux.project_id`), and setting one returns 0 and does nothing (Linux
   6.12).
-- A file with illumos' `av_quarantined` can't be opened, by root either
-  (`EACCES`), so a backup leaves it out, with a warning (`ignoring error:
-  Failed to open ...`) and exit 0, as with any file it can't read;
-  BackOtter's restic reports the same as an error (exit 3). Neither keeps
-  its node, attributes or contents: reading them would mean clearing the
-  attribute on the source. To back one up, clear the attribute first
-  (`chmod S-vav_quarantined`).
+- A file with illumos' `av_quarantined` can't be opened for reading, by
+  root either (`EACCES`), nor its extended attributes, but its metadata can
+  be read: a backup keeps its node without its contents, as BackOtter's
+  restic does. Where opening a regular file is refused with `EACCES` and
+  its system attributes (read through its attribute directory, opened with
+  libc's `__openattrdirat` as `getattrat(3C)` and `ls -/ v` open it,
+  without opening the file) have `av_quarantined`, the node has its mode,
+  owner, times,
+  links, inode, device, SID owners, ACL, system attributes
+  (`av_quarantined` included) and birth time, no `content` and size 0, and
+  `illumos.unread_size`, the file's real size; its extended attributes and
+  `illumos.xattr_meta` are left out (they can't be read), as is its ZFS
+  project (reading it opens the file). One warning names it
+  (`PATH: av_quarantined: contents not backed up (N bytes)`) and the backup
+  exits 0. Any other file that can't be opened is left out, as before,
+  with `ignoring error: Failed to open ...`. The source's attribute is
+  never cleared or changed. A restore makes such a file empty, gives it
+  the rest of its metadata, the system attributes last as for any file (so
+  it is quarantined again), and warns once for it (`PATH: contents were not
+  backed up (av_quarantined at backup, N bytes)`), exit 0; on another
+  system too, where the system attributes are left as for any illumos
+  file. A version that doesn't know `illumos.unread_size` warns once about
+  it as unknown and restores the empty file.
 - A backup keeps the metadata of the directory it backs up (stock rustic
   stores it as a bare directory, mode 0755 and nothing else), so that
   restoring `SNAP:path` can give the destination that directory's metadata,

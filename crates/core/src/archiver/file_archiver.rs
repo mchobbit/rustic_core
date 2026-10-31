@@ -104,7 +104,11 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
                     let size = node.meta.size;
                     p.inc(size);
                     (node, size)
-                } else if node.node_type == NodeType::File {
+                } else if node.node_type == NodeType::File
+                    // BackOtter: not a file the source gave its contents
+                    // already (none, for one illumos quarantined).
+                    && node.content.is_none()
+                {
                     let r = open
                         .ok_or_else(
                             || RusticError::new(

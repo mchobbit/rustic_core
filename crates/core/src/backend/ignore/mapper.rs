@@ -146,7 +146,15 @@ impl LocalSourceSaveOptions {
         // illumos reads their metadata first: reading a value moves its atime.
         let set_xattrs = self.set_xattrs.unwrap_or_default();
         osattrs::fill(entry.path(), &mut node, &m, set_xattrs == XattrOption::Yes);
-        node.meta.extended_attributes = set_xattrs.map_or_else(xattr);
+        // BackOtter: a file illumos quarantined (av_quarantined) can't be
+        // read, by root either, nor its extended attributes: its node is
+        // kept without them or its contents, with a warning, as in
+        // BackOtter's restic (the archiver reads no contents for it).
+        if osattrs::is_quarantined(&node) && osattrs::open_refused(entry.path()) {
+            osattrs::keep_unread(entry.path(), &mut node);
+        } else {
+            node.meta.extended_attributes = set_xattrs.map_or_else(xattr);
+        }
         let path = entry.into_path();
         let open = Some(OpenFile(path.clone()));
         Ok(ReadSourceEntry { path, node, open })
