@@ -25,11 +25,15 @@ const BITS: [(&str, u32); 12] = [
     ("immutable", 1 << 5),
     ("appendonly", 1 << 6),
     ("nodump", 1 << 7),
-    ("av_quarantined", 1 << 8),
+    ("av_quarantined", AV_QUARANTINED),
     ("av_modified", 1 << 9),
     ("offline", 1 << 10),
     ("sparse", 1 << 11),
 ];
+
+/// A file no one may read, root included (`EACCES`): see
+/// `osattrs::is_quarantined`.
+pub(super) const AV_QUARANTINED: u32 = 1 << 8;
 
 /// ZFS sets these two on every file it creates or writes to, as Windows does
 /// its archive bit; on their own they're no reason to keep a file's

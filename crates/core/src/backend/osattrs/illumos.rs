@@ -83,6 +83,12 @@ unsafe extern "C" {
         nentries: libc::c_int,
         aclbufp: *mut libc::c_void,
     ) -> libc::c_int;
+    /// Opens the attribute directory of the file `name` (relative to `fd`)
+    /// without opening the file itself: libc's own, which `getattrat(3C)`
+    /// and `setattrat(3C)`, and so `ls -/` and `chmod S`, use (exported, but
+    /// no public name). It follows a symlink.
+    #[link_name = "__openattrdirat"]
+    fn openattrdirat(fd: libc::c_int, name: *const libc::c_char) -> libc::c_int;
 }
 
 /// What an ACL is read from or written to: the file at a path, with
@@ -187,17 +193,41 @@ fn unsupported(err: &io::Error) -> bool {
 /// and opening a device or FIFO could have side effects. The errors are the
 /// system's, for the callers to tell a file system without the view (UFS,
 /// tmpfs) from a failure.
+///
+/// A regular file illumos quarantined (`av_quarantined`) can't be opened,
+/// by root either (`EACCES`), but its attribute directory can, without
+/// opening the file, as `getattrat(3C)` and `ls -/ v` open it
+/// (`__openattrdirat`): its view is opened through that.
 fn sysattr_view(path: &Path, typ: &NodeType, write: bool) -> io::Result<File> {
     if !matches!(typ, NodeType::File | NodeType::Dir) {
         return Err(io::Error::from(io::ErrorKind::Unsupported));
     }
-    let f = OpenOptions::new()
+    let rw = if write { libc::O_RDWR } else { libc::O_RDONLY };
+    // The view in the file's attribute directory (O_XATTR), or in that
+    // directory itself when the file can't be opened.
+    let (base, how) = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    let how = O_XATTR | libc::O_CLOEXEC | if write { libc::O_RDWR } else { libc::O_RDONLY };
+        .open(path)
+    {
+        Ok(f) => (f, O_XATTR | libc::O_CLOEXEC | rw),
+        Err(err) if matches!(typ, NodeType::File) && err.raw_os_error() == Some(libc::EACCES) => {
+            (attr_dir_unopened(path).map_err(|_| err)?, libc::O_CLOEXEC | rw)
+        }
+        Err(err) => return Err(err),
+    };
     // SAFETY: the name is a C string.
-    let fd = check(unsafe { libc::openat(f.as_raw_fd(), c"SUNWattr_rw".as_ptr(), how) })?;
+    let fd = check(unsafe { libc::openat(base.as_raw_fd(), c"SUNWattr_rw".as_ptr(), how) })?;
+    // SAFETY: fd is a new file descriptor, owned by nothing else.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// The attribute directory of the file at `path`, opened without opening
+/// the file, for the system attribute view of one that can't be opened.
+fn attr_dir_unopened(path: &Path) -> io::Result<File> {
+    let p = c_path(path)?;
+    // SAFETY: p is a C string.
+    let fd = check(unsafe { openattrdirat(libc::AT_FDCWD, p.as_ptr()) })?;
     // SAFETY: fd is a new file descriptor, owned by nothing else.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
