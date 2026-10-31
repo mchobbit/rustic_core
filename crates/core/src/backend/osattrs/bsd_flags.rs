@@ -16,20 +16,17 @@ pub(super) const FREEBSD_KEPT_FLAGS: u32 =
     (FREEBSD_UF_SETTABLE | FREEBSD_SF_SETTABLE) & !FREEBSD_SF_SNAPSHOT;
 
 /// The `freebsd.file_flags` of a file with the flags `st_flags`, on ZFS
-/// (`zfs`) or another file system, if it gets one. ZFS gives every file it
-/// writes `UF_ARCHIVE`, as Windows its archive bit, so archive alone gets
-/// no attribute there, and no flags at all get 0 (archive cleared, as by a
-/// Windows backup over SMB), which the restore sets. Elsewhere `uarch` is
-/// kept only along with other flags, and no flags get no attribute.
+/// (`zfs`) or another file system, if it gets one: what a new file there
+/// has gets none. ZFS gives every file it writes `UF_ARCHIVE`, as Windows
+/// its archive bit, so archive alone gets no attribute there, and no flags
+/// at all get 0 (archive cleared, as by a Windows backup over SMB), which
+/// the restore sets. Elsewhere no flags get no attribute, and `uarch`
+/// alone, which nothing sets there but `chflags(1)`, is kept.
 #[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
 pub(super) fn freebsd_file_flags(st_flags: u32, zfs: bool) -> Option<u32> {
     let flags = st_flags & FREEBSD_KEPT_FLAGS;
-    let none = if zfs {
-        flags == FREEBSD_UF_ARCHIVE
-    } else {
-        flags & !FREEBSD_UF_ARCHIVE == 0
-    };
-    (!none).then_some(flags)
+    let new_file = if zfs { FREEBSD_UF_ARCHIVE } else { 0 };
+    (flags != new_file).then_some(flags)
 }
 
 // NetBSD's <sys/stat.h>: the flags the kernel manages.
@@ -76,7 +73,7 @@ mod tests {
     #[test]
     fn freebsd_archive_elsewhere() {
         assert_eq!(freebsd_file_flags(0, false), None);
-        assert_eq!(freebsd_file_flags(0x0800, false), None);
+        assert_eq!(freebsd_file_flags(0x0800, false), Some(0x0800));
         assert_eq!(freebsd_file_flags(0x0801, false), Some(0x0801));
         // schg
         assert_eq!(freebsd_file_flags(0x0002_0000, false), Some(0x0002_0000));

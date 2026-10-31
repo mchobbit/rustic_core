@@ -26,8 +26,8 @@ that either program restores what the other backed up.
     Linux's ZFS its archive DOS flag, so there a file with `uarch` alone gets
     no attribute, and one with no flags at all gets 0 (archive cleared),
     which the restore sets, as any value it finds. On other file systems
-    `uarch` is kept only along with other flags, and no flags get no
-    attribute.
+    (UFS) no flags get no attribute, and `uarch` alone, which only
+    `chflags(1)` sets there, is kept.
   - `freebsd.acl_access`, `freebsd.acl_default`: POSIX.1e ACLs (UFS mounted
     `acls`), access and directories' default.
   - `freebsd.acl_nfs4`: NFSv4 ACLs (ZFS, UFS mounted `nfsv4acls`).
