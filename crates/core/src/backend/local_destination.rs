@@ -20,6 +20,7 @@ use nix::{
     fcntl::{AT_FDCWD, AtFlags},
     unistd::{Gid, Uid, fchownat},
 };
+use same_file::is_same_file;
 
 #[cfg(not(windows))]
 use crate::backend::ignore::mapper::nix_mapper::map_mode_from_go;
@@ -916,6 +917,8 @@ impl LocalDestination {
 
     /// Create a hardlink `item` pointing to `source_item`, both relative to the base path.
     ///
+    /// An entry that already exists at `item` is replaced, unless it already is that hardlink.
+    ///
     /// # Arguments
     ///
     /// * `source_item` - The already-restored file to link to
@@ -930,9 +933,11 @@ impl LocalDestination {
     ///
     /// # Notes
     ///
-    /// BackOtter: whatever is at `item` already (the same link, left by an
-    /// earlier restore, or another file) is removed first, as BackOtter's
-    /// restic does: the link can't be made over it (`EEXIST`).
+    /// BackOtter: as in BackOtter's restic, what is at `item` already
+    /// (another file, a symlink) is replaced, as the link can't be made over
+    /// it (`EEXIST`); the same link, left by an earlier restore, is left as
+    /// it is (upstream's #634), which also keeps the file when a symlinked
+    /// directory makes both names one. A directory there is an error.
     pub(crate) fn hard_link(
         &self,
         source_item: impl AsRef<Path>,
@@ -944,13 +949,7 @@ impl LocalDestination {
             .parent()
             .ok_or_else(|| LocalDestinationErrorKind::FileDoesNotHaveParent(filename.clone()))?;
         fs::create_dir_all(dir).map_err(LocalDestinationErrorKind::DirectoryCreationFailed)?;
-        match fs::remove_file(&filename) {
-            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
-                return Err(LocalDestinationErrorKind::FileRemovalFailed(err));
-            }
-            _ => {}
-        }
-        fs::hard_link(&source_path, &filename).map_err(|err| {
+        link_over_existing(&source_path, &filename).map_err(|err| {
             LocalDestinationErrorKind::HardLinkingFailed {
                 source_path,
                 filename,
@@ -1172,6 +1171,30 @@ fn sparse_writes(offset: u64, data: &[u8], block: u64) -> Vec<std::ops::Range<us
 pub(crate) fn is_zero(data: &[u8]) -> bool {
     data.chunks(1024)
         .all(|piece| piece.iter().fold(0, |acc, &b| acc | b) == 0)
+}
+
+/// Hardlink `filename` to `source`, replacing a different entry that sits at `filename`.
+///
+/// # Arguments
+///
+/// * `source` - The file to link to
+/// * `filename` - The path of the hardlink
+///
+/// # Errors
+///
+/// * If `filename` could not be inspected, removed or linked.
+fn link_over_existing(source: &Path, filename: &Path) -> std::io::Result<()> {
+    match fs::hard_link(source, filename) {
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let is_symlink = fs::symlink_metadata(filename)?.is_symlink();
+            if !is_symlink && is_same_file(source, filename)? {
+                return Ok(());
+            }
+            fs::remove_file(filename)?;
+            fs::hard_link(source, filename)
+        }
+        linked => linked,
+    }
 }
 
 #[cfg(test)]
@@ -1599,6 +1622,53 @@ mod tests {
 mod path_tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn hard_link_leaves_a_directory_in_place() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let dest = LocalDestination::new(temp.path().to_str().unwrap(), false, false)?;
+        fs::write(temp.path().join("canonical"), "restored")?;
+        fs::create_dir(temp.path().join("link"))?;
+
+        assert!(dest.hard_link("canonical", "link").is_err());
+
+        assert!(temp.path().join("link").is_dir());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn hard_link_replaces_a_symlink_to_the_canonical_file() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let dest = LocalDestination::new(temp.path().to_str().unwrap(), false, false)?;
+        fs::write(temp.path().join("canonical"), "restored")?;
+        symlink("canonical", temp.path().join("link"))?;
+
+        dest.hard_link("canonical", "link")?;
+
+        assert!(!fs::symlink_metadata(temp.path().join("link"))?.is_symlink());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn hard_link_keeps_the_file_when_a_symlinked_directory_makes_both_paths_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let dest = LocalDestination::new(temp.path().to_str().unwrap(), false, false)?;
+        fs::create_dir(temp.path().join("real"))?;
+        symlink("real", temp.path().join("alias"))?;
+        fs::write(temp.path().join("real/canonical"), "restored")?;
+
+        dest.hard_link("real/canonical", "alias/canonical")?;
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("real/canonical"))?,
+            "restored"
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_path_sanitization() -> Result<(), Box<dyn std::error::Error>> {
