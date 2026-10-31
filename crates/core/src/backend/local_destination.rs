@@ -547,8 +547,13 @@ impl LocalDestination {
             {
                 return Ok(());
             }
+            // BackOtter: a file system without them; the warning names
+            // each attribute, as it does those that can't be set.
             Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {
-                return Err(LocalDestinationErrorKind::XattrsNotSet(err.into()));
+                for ExtendedAttribute { name, .. } in extended_attributes {
+                    errors.push(name.as_str(), osattrs::same_error(&err));
+                }
+                return Err(LocalDestinationErrorKind::XattrsNotSet(errors));
             }
             Err(err) => {
                 errors.push("listing", err);
@@ -584,6 +589,11 @@ impl LocalDestination {
         for (index, ExtendedAttribute { name, value }) in extended_attributes.iter().enumerate() {
             if !done[index] {
                 let os_name = osattrs::xattr_os_name(name);
+                // BackOtter: not one that isn't kept (bcachefs_effective.*,
+                // which stock restic keeps), whose setting does nothing.
+                if osattrs::xattr_node_name(os_name.as_ref()).is_none() {
+                    continue;
+                }
                 if let Err(err) =
                     xattr::set(&filename, os_name, value.as_ref().unwrap_or(&Vec::new()))
                 {

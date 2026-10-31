@@ -19,7 +19,13 @@ that either program restores what the other backed up.
   - `linux.inode_flags`: the `chattr(1)` flags (`FS_IOC_GETFLAGS`), limited
     to those a user can set, and casefolding (`F`).
   - `linux.project_id`: the project ID (`FS_IOC_FSGETXATTR`) that project
-    quotas count by, of regular files and directories.
+    quotas count by, of regular files and directories. bcachefs (Linux
+    6.12) gives there the ID a file had when its inode was read in, 0 for
+    one set since (`chattr -p`, a restore) until it is read in again, and
+    the ID it has in the extended attribute `bcachefs_effective.project`:
+    on bcachefs that is read instead, where there is one. The restore sets
+    it with `FS_IOC_FSSETXATTR`, as anywhere (setting the attribute does
+    nothing, `bcachefs.project` is refused).
   - `freebsd.file_flags`: FreeBSD's `chflags(1)` flags (`st_flags`). ZFS
     (`statfs(2)`'s `f_fstypename` `zfs`, looked up once per file system; a
     symlink's is its directory's) sets `uarch` on every file it writes, as
@@ -207,8 +213,7 @@ that either program restores what the other backed up.
   which the xattr crate doesn't support: they are read and written through
   `openat(2)` with `O_XATTR`, without the `SUNWattr_ro` and `SUNWattr_rw`
   system attribute views, and stored in name order, not the attribute
-  directory's, as BackOtter's restic does (elsewhere both store them in the
-  order the system lists them). A restore creates an
+  directory's, as BackOtter's restic does. A restore creates an
   attribute file with mode 0600, so that it is never readable by others
   before it gets its own owner, mode, ACL and times (`illumos.xattr_meta`),
   with `fchownat(2)`, `fchmodat(2)`, `facl(2)` and `utimensat(2)` on the
@@ -235,7 +240,8 @@ that either program restores what the other backed up.
   before the mode: `osattrs::restore_owner`, a no-op elsewhere) and the ACL
   entry that. A SID idmap can't map gets nobody (60001), never the number
   the backup saw, which may be another SID's by now, with a warning once
-  per attribute and the number of files at the end; it isn't an error. A
+  per attribute (owner and group of the same file each get theirs) and
+  the number of files at the end; it isn't an error. A
   backup where idmap gives no SID warns once (`idmap offline: SID owners
   not kept`); with idmapd not running at all, `stat(2)` already gives every
   ephemeral id as 60001, and nothing can be kept. So **svc:/system/idmap
@@ -250,6 +256,24 @@ that either program restores what the other backed up.
   for the run.
 - A file that can't have extended attributes (a FIFO on ZFS) has none,
   rather than a warning, as in restic.
+- Extended attributes are stored in the byte order of their names, on
+  every system (Linux, macOS, FreeBSD, NetBSD, illumos), as BackOtter's
+  restic stores them; stock rustic keeps the order the file system lists
+  them in. The order means nothing to a restore, which sets each attribute
+  by name.
+- bcachefs' `bcachefs_effective.*` extended attributes aren't kept, nor
+  set or removed by a restore (one in a snapshot of stock restic's is
+  skipped): they show the options a file has, its own (`bcachefs.*`, kept
+  as any other) or inherited from its directory, and its project ID
+  (`linux.project_id`), and setting one returns 0 and does nothing (Linux
+  6.12).
+- A file with illumos' `av_quarantined` can't be opened, by root either
+  (`EACCES`), so a backup leaves it out, with a warning (`ignoring error:
+  Failed to open ...`) and exit 0, as with any file it can't read;
+  BackOtter's restic reports the same as an error (exit 3). Neither keeps
+  its node, attributes or contents: reading them would mean clearing the
+  attribute on the source. To back one up, clear the attribute first
+  (`chmod S-vav_quarantined`).
 - A backup keeps the metadata of the directory it backs up (stock rustic
   stores it as a bare directory, mode 0755 and nothing else), so that
   restoring `SNAP:path` can give the destination that directory's metadata,
@@ -288,7 +312,9 @@ that either program restores what the other backed up.
   error (`restore f: setting extended attributes failed: trusted.a:
   Operation not permitted (os error 1); ...`). Stock rustic stopped at the
   first, leaving the rest unset, and said neither which nor why. On
-  illumos too.
+  illumos too, and on a file system without extended attributes (NetBSD's
+  FFSv1 and plain FFSv2): each of the file's attributes is named, with
+  `Operation not supported`.
 - Metadata the target file system doesn't support (flags, casefolding or a
   project ID it refuses with `ENOTTY`, `EOPNOTSUPP`/`ENOTSUP` or `EINVAL`)
   gets one warning per kind (attribute and refused flags) per restore,
@@ -299,6 +325,13 @@ that either program restores what the other backed up.
   warns about metadata it can't set, where BackOtter's restic fails (exit
   1) for failures other than unsupported ones. That is the one difference in
   exit status left between the two.
+  Where flags as a whole are refused (one only root may set, as the owner),
+  the restore changes them from what the file has, one at a time, keeping
+  each change accepted, and warns naming the bits it couldn't set or clear
+  (`file flags 0x20 of 0x229 not set, 0x200 not cleared`): every write
+  sets all of a file's flags, so trying them from none would clear, each
+  time, one the owner may set but not clear (illumos' `av_modified`), and
+  every try would fail.
   Where it doesn't support a POSIX.1e ACL, the restore warns and narrows the
   group bits to the owning group's own access, so a file never comes back
   more open. Flags a file has already aren't set again (on Linux: no

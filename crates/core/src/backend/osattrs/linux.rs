@@ -92,6 +92,12 @@ const FS_XFLAG_APPEND: u32 = 0x0000_0010;
 /// statfs's `f_type` for ZFS.
 const ZFS_SUPER_MAGIC: u32 = 0x2fc1_2fc1;
 
+/// statfs's `f_type` for bcachefs.
+const BCACHEFS_SUPER_MAGIC: u32 = 0xca45_1a4e;
+
+/// The extended attribute that shows a bcachefs file's project ID.
+const BCACHEFS_PROJECT: &str = "bcachefs_effective.project";
+
 // OpenZFS's DOS flags, from its <sys/fs/zfs.h> (Linux only): a uint64_t,
 // on a descriptor of the file itself. ZFS_IOC_SETDOSFLAGS replaces all the
 // flags ZFS_IOC_GETDOSFLAGS shows.
@@ -195,9 +201,9 @@ fn set_fsxattr(f: &File, attr: &FsXattr) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether the file `f` is on ZFS: the DOS flag ioctls go to no other file
-/// system, whose driver could take their numbers for something else.
-fn is_zfs(f: &File) -> io::Result<bool> {
+/// Whether the file `f` is on the file system whose statfs `f_type` is
+/// `magic`.
+fn is_on(f: &File, magic: u32) -> io::Result<bool> {
     let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: fstatfs writes a struct statfs to the pointer.
     if unsafe { libc::fstatfs(f.as_raw_fd(), st.as_mut_ptr()) } < 0 {
@@ -205,7 +211,50 @@ fn is_zfs(f: &File) -> io::Result<bool> {
     }
     // SAFETY: fstatfs succeeded, so it wrote the struct.
     let st = unsafe { st.assume_init() };
-    Ok(u32::try_from(st.f_type).is_ok_and(|t| t == ZFS_SUPER_MAGIC))
+    Ok(u32::try_from(st.f_type).is_ok_and(|t| t == magic))
+}
+
+/// Whether the file `f` is on ZFS: the DOS flag ioctls go to no other file
+/// system, whose driver could take their numbers for something else.
+fn is_zfs(f: &File) -> io::Result<bool> {
+    is_on(f, ZFS_SUPER_MAGIC)
+}
+
+/// The project ID of the file `f`, whose `FS_IOC_FSGETXATTR` gave `attr`.
+/// bcachefs (Linux 6.12) gives there the ID the file had when its inode
+/// was read in, 0 for one set since (`chattr -p`, a restore), until it is
+/// read in again; the ID it has is in the extended attribute
+/// `bcachefs_effective.project`, which is taken where there is one.
+fn file_projid(f: &File, attr: &FsXattr) -> u32 {
+    if !is_on(f, BCACHEFS_SUPER_MAGIC).unwrap_or(false) {
+        return attr.projid;
+    }
+    get_xattr(f, BCACHEFS_PROJECT)
+        .ok()
+        .and_then(|value| String::from_utf8(value).ok())
+        .and_then(|value| value.trim_end_matches('\0').trim().parse().ok())
+        .unwrap_or(attr.projid)
+}
+
+/// The value of the extended attribute `name` of the file `f`.
+fn get_xattr(f: &File, name: &str) -> io::Result<Vec<u8>> {
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::from)?;
+    let mut value = vec![0_u8; 64];
+    loop {
+        // SAFETY: name is a C string, value a buffer of its length.
+        let n = unsafe {
+            libc::fgetxattr(f.as_raw_fd(), name.as_ptr(), value.as_mut_ptr().cast(), value.len())
+        };
+        if let Ok(n) = usize::try_from(n) {
+            value.truncate(n);
+            return Ok(value);
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ERANGE) || value.len() >= 1 << 16 {
+            return Err(err);
+        }
+        value.resize(value.len() * 4, 0);
+    }
 }
 
 fn get_dos_flags(f: &File) -> io::Result<u64> {
@@ -271,7 +320,7 @@ pub(super) fn fill_attributes(path: &Path, node: &mut Node, f: Option<&File>) ->
     };
     let dos_flags = fill_dos_flags(path, node, f);
     match get_fsxattr(f) {
-        Ok(attr) => node.meta.generic_attributes.set_number(LINUX_PROJECT_ID, attr.projid),
+        Ok(attr) => node.meta.generic_attributes.set_number(LINUX_PROJECT_ID, file_projid(f, &attr)),
         Err(err) if unsupported(&err) => {}
         Err(err) => return Err(path_error("FS_IOC_FSGETXATTR", path, &err)),
     }
@@ -392,6 +441,7 @@ fn restore_dos_flags_with(
         LINUX_ZFS_DOS_FLAGS,
         path,
         "ZFS_IOC_SETDOSFLAGS",
+        Some(current & ZFS_DOS_KEPT),
         flags & ZFS_DOS_KEPT,
         |f| set(own | f),
     )
@@ -432,6 +482,7 @@ fn restore_flags_with(
             LINUX_INODE_FLAGS,
             path,
             "FS_IOC_SETFLAGS",
+            Some(current & KEPT_LATE),
             flags & KEPT_LATE,
             |f| set(own | f),
         );
@@ -441,9 +492,14 @@ fn restore_flags_with(
     let set_first = if own | first == current {
         Ok(())
     } else {
-        set_flags_best_effort(LINUX_INODE_FLAGS, path, "FS_IOC_SETFLAGS", first, |f| {
-            set(own | f)
-        })
+        set_flags_best_effort(
+            LINUX_INODE_FLAGS,
+            path,
+            "FS_IOC_SETFLAGS",
+            Some(current & KEPT_LATE),
+            first,
+            |f| set(own | f),
+        )
     };
     let set_property = set_compression(compression)
         .map_err(|err| path_error(&format!("set {BTRFS_COMPRESSION} of"), path, &err));
@@ -544,7 +600,7 @@ pub(super) fn restore_attributes(path: &Path, node: &Node) -> io::Result<()> {
     };
     let f = open_for_flags(path, &node.node_type, None)?;
     let mut attr = get_fsxattr(&f).map_err(|err| classify("FS_IOC_FSGETXATTR", err))?;
-    if attr.projid != projid {
+    if file_projid(&f, &attr) != projid {
         attr.projid = projid;
         set_fsxattr(&f, &attr).map_err(|err| classify("FS_IOC_FSSETXATTR", err))?;
     }

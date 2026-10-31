@@ -430,6 +430,40 @@ impl SidUnmapped {
     }
 }
 
+/// BackOtter: more than one error from one step of restoring a file's
+/// metadata, which [`warn_restore`] warns about each as if alone: the owner
+/// and the group both SIDs that idmap couldn't map, a warning for each
+/// attribute.
+#[derive(Debug)]
+pub(crate) struct RestoreErrors(Vec<io::Error>);
+
+impl RestoreErrors {
+    /// `Ok` for no errors, the error itself for one, and one that holds them
+    /// all for more.
+    #[cfg_attr(not(target_os = "illumos"), allow(dead_code))]
+    fn result(mut errors: Vec<io::Error>) -> io::Result<()> {
+        match errors.len() {
+            0 => Ok(()),
+            1 => Err(errors.remove(0)),
+            _ => Err(io::Error::other(Self(errors))),
+        }
+    }
+}
+
+impl fmt::Display for RestoreErrors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, err) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str("; ")?;
+            }
+            write!(f, "{err}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RestoreErrors {}
+
 /// BackOtter: what a restore couldn't do to the extended attributes of a
 /// file, each with its error: setting one (named), removing one, listing
 /// them. One that can't be set doesn't keep the others from being set or
@@ -456,6 +490,17 @@ impl XattrErrors {
     pub(crate) fn into_result(self) -> Result<(), Self> {
         if self.0.is_empty() { Ok(()) } else { Err(self) }
     }
+}
+
+/// BackOtter: a copy of `err`, for each of several things it kept from being
+/// done, such as each extended attribute of a file on a file system without
+/// them.
+#[cfg_attr(any(windows, target_os = "openbsd", target_os = "illumos"), allow(dead_code))]
+pub(crate) fn same_error(err: &io::Error) -> io::Error {
+    err.raw_os_error().map_or_else(
+        || io::Error::new(err.kind(), err.to_string()),
+        io::Error::from_raw_os_error,
+    )
 }
 
 /// An error that isn't about one attribute: the file's extended attributes
@@ -491,9 +536,16 @@ static UNSUPPORTED: Mutex<BTreeMap<String, (PathBuf, u64)>> = Mutex::new(BTreeMa
 
 /// Warns about an error restoring the metadata of `path`: an [`Unsupported`]
 /// or [`SidUnmapped`] one once per kind, with the first file, and
-/// [`report_unsupported`] counts the files; any other each time.
+/// [`report_unsupported`] counts the files; any other each time; each of
+/// [`RestoreErrors`] as if alone.
 pub(crate) fn warn_restore(path: &Path, err: &io::Error) {
     let inner = err.get_ref();
+    if let Some(errors) = inner.and_then(|e| e.downcast_ref::<RestoreErrors>()) {
+        for err in &errors.0 {
+            warn_restore(path, err);
+        }
+        return;
+    }
     let (kind, msg) = if let Some(e) = inner.and_then(|e| e.downcast_ref::<Unsupported>()) {
         (format!("{} not supported by the file system", e.kind()), e.to_string())
     } else if let Some(e) = inner.and_then(|e| e.downcast_ref::<SidUnmapped>()) {
@@ -752,15 +804,26 @@ pub(crate) fn xattr_list(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
 /// crate lists it by, or `None` for one that isn't kept as an extended
 /// attribute. On FreeBSD and NetBSD restic keeps the user namespace only,
 /// under bare names, where the xattr crate says `user.NAME` and
-/// `system.NAME`; their system namespace is kept as a generic attribute.
+/// `system.NAME`; their system namespace is kept as a generic attribute. On
+/// Linux, bcachefs' `bcachefs_effective.*` aren't kept: they show the
+/// options a file has, its own (`bcachefs.*`, kept) or inherited, and its
+/// project ID, and setting one does nothing.
 #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
 pub(crate) fn xattr_node_name(name: &std::ffi::OsStr) -> Option<String> {
     let name = name.to_string_lossy();
     if cfg!(any(target_os = "freebsd", target_os = "netbsd")) {
         return name.strip_prefix("user.").map(str::to_string);
     }
+    if cfg!(target_os = "linux") && name.starts_with(BCACHEFS_EFFECTIVE) {
+        return None;
+    }
     Some(name.into_owned())
 }
+
+/// The prefix of bcachefs' extended attributes that show a file's options as
+/// they apply to it, whether its own or inherited ([`xattr_node_name`]).
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
+pub(crate) const BCACHEFS_EFFECTIVE: &str = "bcachefs_effective.";
 
 /// The name the xattr crate takes for a node's extended attribute; see
 /// [`xattr_node_name`].
@@ -864,12 +927,17 @@ fn path_error(op: &str, path: &Path, err: &io::Error) -> io::Error {
 
 /// Calls `set` with `want`, the flags `attr` of the file at `path`, which
 /// `op` sets: 32 bits (`u32`), or 64 (`u64`, ZFS's DOS flags). If that
-/// fails, sets as many of `want`'s bits as `set` accepts, one at a time, and
-/// returns an error naming the bits it refused, with `set`'s first error: an
+/// fails, changes the flags from `current`, what the file has (0 if not
+/// known), towards `want` one bit at a time, keeping each change `set`
+/// accepts: so a flag only root may set, or one the owner may set but not
+/// clear (illumos' `av_modified`), doesn't keep the others from being set or
+/// cleared, though `set` sets all the flags at once. It returns an error
+/// naming the bits it couldn't set or clear, with `set`'s first error: an
 /// [`Unsupported`] one if every refusal said the file system doesn't have
 /// those flags (`EINVAL`, `ENOTSUP`, `EOPNOTSUPP`, `ENOTTY`), or else with
-/// the first error that didn't. If `want` is 0, with nothing to try one at a
-/// time, that is `set`'s error.
+/// the first error that didn't. If nothing differs from `current`, there is
+/// nothing to try one at a time: that is `Ok` if `current` is known, and
+/// `set`'s error if not.
 #[cfg_attr(
     not(any(
         target_os = "dragonfly",
@@ -885,6 +953,7 @@ fn set_flags_best_effort<F: Copy + Into<u64> + TryFrom<u64>>(
     attr: &'static str,
     path: &Path,
     op: &str,
+    current: Option<F>,
     want: F,
     mut set: impl FnMut(F) -> io::Result<()>,
 ) -> io::Result<()> {
@@ -892,23 +961,28 @@ fn set_flags_best_effort<F: Copy + Into<u64> + TryFrom<u64>>(
         return Ok(());
     };
     let want: u64 = want.into();
-    if want == 0 {
-        return Err(if unsupported(&first) {
-            Unsupported::error(attr, 0, first)
+    let known = current.is_some();
+    let current: u64 = current.map_or(0, Into::into);
+    let change = want ^ current;
+    if change == 0 {
+        return if known {
+            Ok(())
+        } else if unsupported(&first) {
+            Err(Unsupported::error(attr, 0, first))
         } else {
-            path_error(op, path, &first)
-        });
+            Err(path_error(op, path, &first))
+        };
     }
-    let (mut got, mut refused) = (0, 0);
+    let (mut got, mut refused) = (current, 0);
     let mut failed = (!unsupported(&first)).then_some(first);
     let mut unsupported_err = None;
-    for bit in (0..64).map(|i| 1_u64 << i).filter(|bit| want & bit != 0) {
-        // One of want's bits, so they fit.
-        let Ok(bits) = F::try_from(got | bit) else {
+    for bit in (0..64).map(|i| 1_u64 << i).filter(|bit| change & bit != 0) {
+        // current and want fit, so this does.
+        let Ok(bits) = F::try_from(got ^ bit) else {
             continue;
         };
         match set(bits) {
-            Ok(()) => got |= bit,
+            Ok(()) => got ^= bit,
             Err(err) => {
                 refused |= bit;
                 if !unsupported(&err) {
@@ -922,21 +996,21 @@ fn set_flags_best_effort<F: Copy + Into<u64> + TryFrom<u64>>(
     if refused == 0 {
         return Ok(());
     }
+    let what = match (refused & want, refused & !want) {
+        (set, 0) => format!("file flags {set:#x} of {want:#x} not set"),
+        (0, cleared) => format!("file flags {cleared:#x} not cleared"),
+        (set, cleared) => {
+            format!("file flags {set:#x} of {want:#x} not set, {cleared:#x} not cleared")
+        }
+    };
     match (failed, unsupported_err) {
         (Some(err), _) => Err(path_error(
             op,
             path,
-            &io::Error::new(
-                err.kind(),
-                format!("file flags {refused:#x} of {want:#x} not set: {err}"),
-            ),
+            &io::Error::new(err.kind(), format!("{what}: {err}")),
         )),
         (None, Some(err)) => Err(Unsupported::error(attr, refused, err)),
-        (None, None) => Err(path_error(
-            op,
-            path,
-            &io::Error::other(format!("file flags {refused:#x} of {want:#x} not set")),
-        )),
+        (None, None) => Err(path_error(op, path, &io::Error::other(what))),
     }
 }
 
@@ -1033,17 +1107,17 @@ mod tests {
             current.set(f);
             Ok(())
         };
-        set_flags_best_effort("x.flags", path, "set", 0x3, &mut set).unwrap();
+        set_flags_best_effort("x.flags", path, "set", None, 0x3, &mut set).unwrap();
 
         // Unsupported: a warning once.
-        let err = set_flags_best_effort("x.flags", path, "set", 0x15, &mut set).unwrap_err();
+        let err = set_flags_best_effort("x.flags", path, "set", None, 0x15, &mut set).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         let unsupported = err.get_ref().unwrap().downcast_ref::<Unsupported>().unwrap();
         assert_eq!((unsupported.attr, unsupported.bits), ("x.flags", 0x4));
         assert_eq!(current.get(), 0x11);
 
         // Unsupported and not permitted: an error.
-        let err = set_flags_best_effort("x.flags", path, "set", 0x1d, &mut set).unwrap_err();
+        let err = set_flags_best_effort("x.flags", path, "set", None, 0x1d, &mut set).unwrap_err();
         assert!(err.get_ref().unwrap().downcast_ref::<Unsupported>().is_none());
         assert!(err.to_string().contains("0xc of 0x1d"), "{err}");
         assert_eq!(current.get(), 0x11);
@@ -1066,7 +1140,7 @@ mod tests {
             current.set(f);
             Ok(())
         };
-        let err = set_flags_best_effort("x.flags", path, "set", hidden | sparse, &mut set)
+        let err = set_flags_best_effort("x.flags", path, "set", None, hidden | sparse, &mut set)
             .unwrap_err();
         let unsupported = err.get_ref().unwrap().downcast_ref::<Unsupported>().unwrap();
         assert_eq!(unsupported.bits, sparse);
@@ -1074,7 +1148,7 @@ mod tests {
         assert_eq!(current.get(), hidden);
 
         let all = readonly | hidden | sparse;
-        let err = set_flags_best_effort("x.flags", path, "set", all, &mut set).unwrap_err();
+        let err = set_flags_best_effort("x.flags", path, "set", None, all, &mut set).unwrap_err();
         assert!(err.get_ref().unwrap().downcast_ref::<Unsupported>().is_none());
         assert!(
             err.to_string().contains("0x200100000000 of 0x200300000000"),
@@ -1085,16 +1159,67 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn set_flags_best_effort_from_current() {
+        // illumos as the owner: every write names every flag; immutable
+        // (0x20) only root may set, av_modified (0x200) the owner may set
+        // but not clear. A new file has archive (0x8) and av_modified.
+        let path = Path::new("f");
+        let (archive, immutable, av_modified) = (0x8_u32, 0x20, 0x200);
+        let current = std::cell::Cell::new(archive | av_modified);
+        let mut set = |f: u32| {
+            let was = current.get();
+            if f & immutable != 0 && was & immutable == 0
+                || f & av_modified == 0 && was & av_modified != 0
+            {
+                return Err(io::Error::from_raw_os_error(libc::EPERM));
+            }
+            current.set(f);
+            Ok(())
+        };
+        // hidden (0x1) and archive set beside immutable, which isn't.
+        let want = 0x1 | archive | immutable | av_modified;
+        let err = set_flags_best_effort("x.flags", path, "set", Some(current.get()), want, &mut set)
+            .unwrap_err();
+        assert!(err.to_string().contains("file flags 0x20 of 0x229 not set:"), "{err}");
+        assert_eq!(current.get(), 0x1 | archive | av_modified);
+
+        // archive cleared beside av_modified, which can't be.
+        current.set(archive | av_modified);
+        let err = set_flags_best_effort("x.flags", path, "set", Some(current.get()), 0, &mut set)
+            .unwrap_err();
+        assert!(err.to_string().contains("file flags 0x200 not cleared:"), "{err}");
+        assert_eq!(current.get(), av_modified);
+
+        // Both at once.
+        current.set(archive | av_modified);
+        let err =
+            set_flags_best_effort("x.flags", path, "set", Some(current.get()), immutable, &mut set)
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("file flags 0x20 of 0x20 not set, 0x200 not cleared:"),
+            "{err}"
+        );
+        assert_eq!(current.get(), av_modified);
+
+        // Nothing to change: whatever set says, the file has the flags.
+        set_flags_best_effort("x.flags", path, "set", Some(av_modified), av_modified, |_| {
+            Err(io::Error::from_raw_os_error(libc::EPERM))
+        })
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn set_flags_best_effort_0_fails_with_set() {
         // Nothing to try one at a time: the error is set's.
         let path = Path::new("f");
-        let err = set_flags_best_effort("x.flags", path, "set", 0_u64, |_| {
+        let err = set_flags_best_effort("x.flags", path, "set", None, 0_u64, |_| {
             Err(io::Error::from_raw_os_error(libc::EACCES))
         })
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert!(err.get_ref().unwrap().downcast_ref::<Unsupported>().is_none());
-        let err = set_flags_best_effort("x.flags", path, "set", 0_u32, |_| {
+        let err = set_flags_best_effort("x.flags", path, "set", None, 0_u32, |_| {
             Err(io::Error::from_raw_os_error(libc::ENOTTY))
         })
         .unwrap_err();
