@@ -98,6 +98,11 @@ pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) 
     Ok(())
 }
 
+/// The numeric owner the restore gives is all there is.
+pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
+    Ok(())
+}
+
 /// Restores the system extended attributes.
 pub(super) fn restore_attributes(path: &Path, node: &Node) -> io::Result<()> {
     freebsd_netbsd::restore_system_extattrs(path, node)

@@ -520,6 +520,11 @@ fn prepare_dir_with(
     }
 }
 
+/// The numeric owner the restore gives is all there is.
+pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
+    Ok(())
+}
+
 /// Restores the project ID, along with the extended attributes. A project
 /// ID of 0 is the default, and left as it is.
 pub(super) fn restore_attributes(path: &Path, node: &Node) -> io::Result<()> {

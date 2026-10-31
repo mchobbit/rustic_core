@@ -57,6 +57,17 @@ pub const LINUX_ZFS_DOS_FLAGS: &str = "linux.zfs_dos_flags";
 /// and illumos (ZFS's `crtime`): RFC 3339 in UTC with its nanoseconds, the
 /// form of a node's mtime.
 pub const UNIX_BIRTHTIME: &str = "unix.birthtime";
+/// The SID an illumos file's owner is, when its uid is ephemeral (above
+/// `MAXUID`): one idmap hands out for a SID, and only until a reboot.
+pub const ILLUMOS_OWNER_SID: &str = "illumos.owner_sid";
+/// The SID an illumos file's group is, as [`ILLUMOS_OWNER_SID`].
+pub const ILLUMOS_GROUP_SID: &str = "illumos.group_sid";
+/// The owner, group, mode, times and ACL of each of an illumos file's
+/// extended attributes (named attribute files), by name.
+pub const ILLUMOS_XATTR_META: &str = "illumos.xattr_meta";
+/// An illumos file's ZFS project ID and whether it hands it down
+/// (`zfs project -p ID -s`), when it has either.
+pub const ILLUMOS_ZFS_PROJECT: &str = "illumos.zfs_project";
 
 /// The generic attributes restic and BackOtter's restic know: an attribute
 /// of another system is skipped quietly, an unknown one with a warning.
@@ -83,6 +94,10 @@ pub const KNOWN: &[&str] = &[
     DRAGONFLY_FILE_FLAGS,
     LINUX_ZFS_DOS_FLAGS,
     UNIX_BIRTHTIME,
+    ILLUMOS_OWNER_SID,
+    ILLUMOS_GROUP_SID,
+    ILLUMOS_XATTR_META,
+    ILLUMOS_ZFS_PROJECT,
 ];
 
 /// A node's generic attributes, by name.
