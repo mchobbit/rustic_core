@@ -106,11 +106,7 @@ pub(super) fn has_holes(path: &Path, m: &Metadata, f: Option<&File>) -> bool {
     target_vendor = "apple"
 ))]
 fn seek_hole(f: &File) -> io::Result<u64> {
-    use std::os::fd::AsRawFd;
-
-    // SAFETY: f is an open file.
-    let hole = unsafe { libc::lseek(f.as_raw_fd(), 0, libc::SEEK_HOLE) };
-    u64::try_from(hole).map_err(|_| io::Error::last_os_error())
+    lseek(f, 0, libc::SEEK_HOLE)
 }
 
 /// Opens the regular file at `path` for [`seek_hole`] as `lsattr(1)` opens
@@ -210,8 +206,9 @@ const fn fs_block_size(_f: &File) -> Option<u64> {
 /// The reader the backup gives the chunker for the regular file `f`, which
 /// `sparse` says has holes (`unix.sparse`, as [`has_holes`] found): on the
 /// systems that probe for holes with `SEEK_HOLE`, a file with holes is read
-/// by its data extents ([`HoleReader`]); any other is `f` itself. Either way
-/// the bytes are those plain reading gives, so are the chunks.
+/// by its data extents ([`HoleReader`]), if it still has a hole as opened
+/// ([`holes_now`]); any other is `f` itself. Either way the bytes are those
+/// plain reading gives, so are the chunks.
 pub(super) fn backup_reader(f: File, sparse: bool) -> Box<dyn io::Read + Send> {
     #[cfg(any(
         target_os = "linux",
@@ -221,7 +218,12 @@ pub(super) fn backup_reader(f: File, sparse: bool) -> Box<dyn io::Read + Send> {
         target_vendor = "apple"
     ))]
     if sparse {
-        return Box::new(HoleReader::new(f));
+        let holes = holes_now(&f);
+        // SEEK_HOLE moved the offset plain reading starts at (HoleReader
+        // reads with pread).
+        if holes || lseek(&f, 0, libc::SEEK_SET).is_err() {
+            return Box::new(HoleReader::new(f));
+        }
     }
     #[cfg(not(any(
         target_os = "linux",
@@ -232,6 +234,29 @@ pub(super) fn backup_reader(f: File, sparse: bool) -> Box<dyn io::Read + Send> {
     )))]
     let _ = sparse;
     Box::new(f)
+}
+
+/// Whether the regular file `f`, opened to be read, has a hole before its end
+/// by `SEEK_HOLE`. The file marked when it was listed may have been replaced
+/// since, or compressed by its file system: macOS answers `ENXIO` to
+/// `SEEK_HOLE` and `SEEK_DATA` at every offset of a file compressed by the
+/// file system (`UF_COMPRESSED`), whose data plain reading gives. Moves the
+/// offset of `f`.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "illumos",
+    target_vendor = "apple"
+))]
+fn holes_now(f: &File) -> bool {
+    match (f.metadata(), seek_hole(f)) {
+        (Ok(m), Ok(hole)) => hole < m.len(),
+        (m, hole) => {
+            debug!("no hole found as opened ({:?}, {hole:?}); reading plainly", m.err());
+            false
+        }
+    }
 }
 
 #[cfg(any(
@@ -294,9 +319,22 @@ impl Extents for File {
 fn lseek(f: &File, off: u64, whence: libc::c_int) -> io::Result<u64> {
     use std::os::fd::AsRawFd;
 
-    let off = libc::off_t::try_from(off).map_err(io::Error::other)?;
+    // 64-bit offsets where `off_t` may have 32 bits (32-bit glibc and
+    // Android), which would leave a file over 2 GiB unread by its extents.
+    #[cfg(any(
+        target_os = "android",
+        all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))
+    ))]
+    use libc::{lseek64 as lseek, off64_t as off_t};
+    #[cfg(not(any(
+        target_os = "android",
+        all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))
+    )))]
+    use libc::{lseek, off_t};
+
+    let off = off_t::try_from(off).map_err(io::Error::other)?;
     // SAFETY: f is an open file.
-    let pos = unsafe { libc::lseek(f.as_raw_fd(), off, whence) };
+    let pos = unsafe { lseek(f.as_raw_fd(), off, whence) };
     u64::try_from(pos).map_err(|_| io::Error::last_os_error())
 }
 
@@ -370,9 +408,14 @@ impl<F: Extents> HoleReader<F> {
             // No data from `off` on: a hole up to the end of file, or `off`
             // is at the end (or past it: the file shrank). The end is the
             // size before SEEK_DATA, or after it if the file shrank since.
+            // A hole only where SEEK_HOLE finds one at `off` too: macOS
+            // answers ENXIO to both at every offset of a file its file
+            // system compresses, whose data plain reading gives.
             Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {
                 match size.and_then(|size| Ok(size.min(self.f.size()?))) {
-                    Ok(size) if size > off => (true, size),
+                    Ok(size) if size > off && self.f.seek_hole(off).ok() == Some(off) => {
+                        (true, size)
+                    }
                     _ => (false, PLAIN),
                 }
             }
@@ -380,7 +423,12 @@ impl<F: Extents> HoleReader<F> {
                 debug!("no SEEK_DATA at {off}: {err}; reading the rest");
                 (false, PLAIN)
             }
-            Ok(data) if data > off => (true, data),
+            // A hole up to the data, but not past the size before SEEK_DATA
+            // (which a correct file system never puts data past).
+            Ok(data) if data > off => match size {
+                Ok(size) if data.min(size) > off => (true, data.min(size)),
+                _ => (false, PLAIN),
+            },
             Ok(_) => match self.f.seek_hole(off) {
                 Ok(hole) if hole > off => (false, hole),
                 other => {
@@ -402,14 +450,16 @@ impl<F: Extents> HoleReader<F> {
 ))]
 impl<F: Extents> io::Read for HoleReader<F> {
     /// Fills `buf` across extents, as a read of a regular file does, short
-    /// only at the end of file (or on an error after some bytes): the
-    /// chunker reads on with a buffer no longer than the last read gave.
+    /// only at the end of file (or on an error after some bytes, `EINTR`
+    /// retried): the chunker reads on with a buffer no longer than the last
+    /// read gave.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut done = 0;
         while done < buf.len() {
             match self.read_extent(&mut buf[done..]) {
                 Ok(0) => break,
                 Ok(n) => done += n,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) if done > 0 => break,
                 Err(err) => return Err(err),
             }
@@ -434,6 +484,15 @@ impl<F: Extents> HoleReader<F> {
         }
         if self.off >= self.end {
             self.next_extent();
+        } else if self.hole {
+            // Further into a hole (`next_extent` has just asked), the hole
+            // ends at the size `fstat` gives now, asked once a buffer: a
+            // file cut short inside it is read as plain reading reads it,
+            // up to its end of file now, and past that plainly (EOF).
+            match self.f.size() {
+                Ok(size) if size > self.off => self.end = self.end.min(size),
+                _ => (self.hole, self.end) = (false, PLAIN),
+            }
         }
         let len = usize::try_from(self.end - self.off).map_or(buf.len(), |n| n.min(buf.len()));
         let buf = &mut buf[..len];
@@ -529,7 +588,9 @@ mod tests {
         let data = vec![1_u8; 1 << 16];
 
         // Zeros written out: no holes, whether the file system compresses
-        // them (SEEK_HOLE sees through that) or not.
+        // them (SEEK_HOLE sees through that) or not; unless it makes holes
+        // of them itself, as ZFS with compression does, which nobody can
+        // tell from holes.
         let full = dir.path().join("full");
         let mut f = File::create(&full).unwrap();
         f.write_all(&data).unwrap();
@@ -538,7 +599,24 @@ mod tests {
         f.sync_all().unwrap();
         drop(f);
         let m = std::fs::symlink_metadata(&full).unwrap();
-        assert!(!has_holes(&full, &m, opened(&full).as_ref()));
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "illumos",
+            target_vendor = "apple"
+        ))]
+        let made_holes = maybe_sparse(m.len(), m.blocks())
+            && seek_hole(&File::open(&full).unwrap()).is_ok_and(|hole| hole < m.len());
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "illumos",
+            target_vendor = "apple"
+        )))]
+        let made_holes = false;
+        assert_eq!(has_holes(&full, &m, opened(&full).as_ref()), made_holes);
 
         let sparse = dir.path().join("sparse");
         let mut f = File::create(&sparse).unwrap();
@@ -576,18 +654,22 @@ mod tests {
         }
         drop(f);
         let m = std::fs::symlink_metadata(&path).unwrap();
-        assert!(!maybe_sparse(m.len(), m.blocks()));
+        if maybe_sparse(m.len(), m.blocks()) {
+            // A file system that takes fallocate without allocating (ZFS).
+            return;
+        }
         assert!(!has_holes(&path, &m, Some(&File::open(&path).unwrap())));
     }
 
-    /// Holes are made in blocks of at least 4096 bytes, a power of two.
+    /// Holes are made in blocks of at least 4096 bytes (whatever their size:
+    /// some FUSE and network file systems report odd ones).
     #[test]
     fn hole_block_size_at_least_4096() {
         let dir = tempfile::tempdir().unwrap();
         let f = File::create(dir.path().join("f")).unwrap();
         let size = hole_block_size(&f);
         eprintln!("block size {size}");
-        assert!(size >= MIN_HOLE_BLOCK && size.is_power_of_two(), "{size}");
+        assert!(size >= MIN_HOLE_BLOCK, "{size}");
     }
 
     /// A file for [`HoleReader`]: its bytes, the holes its file system
@@ -604,6 +686,10 @@ mod tests {
         fail: Option<(usize, i32)>,
         /// The most bytes a read gives (short reads).
         short: usize,
+        /// Every other read fails with `EINTR`.
+        interrupt: bool,
+        /// `SEEK_DATA` puts data past the end of file (a file system bug).
+        data_past_eof: bool,
     }
 
     #[derive(Debug, Clone)]
@@ -621,6 +707,25 @@ mod tests {
             self.data.len() as u64
         }
 
+        /// Changes the file, as another program could at any time.
+        fn apply(&mut self, change: Change) {
+            match change {
+                Change::Append(data) => self.data.extend(data),
+                Change::AppendHole(n) => {
+                    let len = self.len();
+                    self.data.resize(self.data.len() + usize::try_from(n).unwrap(), 0);
+                    self.holes.push(len..len + n);
+                }
+                Change::Truncate(len) => {
+                    self.data.truncate(usize::try_from(len).unwrap());
+                    self.holes.retain(|h| h.start < len);
+                    if let Some(h) = self.holes.last_mut() {
+                        h.end = h.end.min(len);
+                    }
+                }
+            }
+        }
+
         /// Counts a call, makes the change due, and says whether seeks
         /// fail now.
         fn call(&mut self) -> Option<io::Error> {
@@ -629,21 +734,7 @@ mod tests {
                 _ => None,
             };
             if let Some(change) = due {
-                match change {
-                    Change::Append(data) => self.data.extend(data),
-                    Change::AppendHole(n) => {
-                        let len = self.len();
-                        self.data.resize(self.data.len() + usize::try_from(n).unwrap(), 0);
-                        self.holes.push(len..len + n);
-                    }
-                    Change::Truncate(len) => {
-                        self.data.truncate(usize::try_from(len).unwrap());
-                        self.holes.retain(|h| h.start < len);
-                        if let Some(h) = self.holes.last_mut() {
-                            h.end = h.end.min(len);
-                        }
-                    }
-                }
+                self.apply(change);
             }
             self.calls += 1;
             self.fail
@@ -664,6 +755,9 @@ mod tests {
                 }
             }
             if pos >= self.len() {
+                if self.data_past_eof && off < self.len() {
+                    return Ok(self.len() + 4096);
+                }
                 return Err(io::Error::from_raw_os_error(libc::ENXIO));
             }
             Ok(pos)
@@ -690,6 +784,9 @@ mod tests {
 
         fn read_at(&mut self, buf: &mut [u8], off: u64) -> io::Result<usize> {
             _ = self.call();
+            if self.interrupt && self.calls.is_multiple_of(2) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
             let Some(rest) = usize::try_from(off).ok().and_then(|off| self.data.get(off..)) else {
                 return Ok(0);
             };
@@ -737,6 +834,8 @@ mod tests {
             change: None,
             fail: None,
             short: usize::MAX,
+            interrupt: false,
+            data_past_eof: false,
         }
     }
 
@@ -803,36 +902,41 @@ mod tests {
         }
     }
 
-    /// Reads fill the buffer, across extents, until the end of file.
+    /// Reads fill the buffer, across extents and `EINTR`, until the end of
+    /// file.
     #[test]
     fn hole_reader_fills_the_buffer() {
         use std::io::Read;
 
         const K: usize = 4096;
-        let mut f = sim_file(&[(0, 100), (1, 3 * K), (0, 5), (1, 2 * K), (0, 7)], 512, 9);
-        f.short = 1000;
-        let len = f.data.len();
-        let mut r = HoleReader::new(f);
-        let mut buf = vec![0; K];
-        let mut got = 0;
-        loop {
-            let n = r.read(&mut buf).unwrap();
-            if n == 0 {
-                break;
+        for interrupt in [false, true] {
+            let mut f = sim_file(&[(0, 100), (1, 3 * K), (0, 5), (1, 2 * K), (0, 7)], 512, 9);
+            f.short = 1000;
+            f.interrupt = interrupt;
+            let want = f.data.clone();
+            let mut r = HoleReader::new(f);
+            let mut buf = vec![0; K];
+            let mut got = Vec::new();
+            loop {
+                let n = r.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+                assert!(n == K || got.len() == want.len(), "{n} at {}", got.len());
             }
-            got += n;
-            assert!(n == K || got == len, "{n} at {got}");
+            assert_eq!(got, want, "interrupt {interrupt}");
         }
-        assert_eq!(got, len);
     }
 
     /// Where `SEEK_DATA` or `SEEK_HOLE` fails, before or along the way, the rest
-    /// is read plainly.
+    /// is read plainly. `ENXIO` at every offset is what macOS answers for a
+    /// file its file system compresses: not a hole up to the end.
     #[test]
     fn hole_reader_seek_fails() {
         const K: usize = 4096;
         let f = sim_file(&[(0, K), (1, 4 * K), (0, K), (1, 4 * K), (0, 3)], K as u64, 3);
-        for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::EIO] {
+        for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::EIO, libc::ENXIO] {
             for at in 0..12 {
                 let mut f = f.clone();
                 f.fail = Some((at, errno));
@@ -842,37 +946,109 @@ mod tests {
         }
     }
 
-    /// A file that grows or shrinks while it is read: no error, no bytes
-    /// the file hadn't, and all of it that is there when the end is read.
+    /// Data that `SEEK_DATA` puts past the end of file gives no zeros past it.
+    #[test]
+    fn hole_reader_data_past_eof() {
+        const K: usize = 4096;
+        for runs in [vec![(0, K), (1, 4 * K)], vec![(1, 4 * K)], vec![(0, 3)]] {
+            let mut f = sim_file(&runs, K as u64, 4);
+            f.data_past_eof = true;
+            assert_eq!(read_all(HoleReader::new(f.clone()), &[K]), f.data, "{runs:?}");
+        }
+    }
+
+    /// A file that grows or shrinks while it is read, between two system
+    /// calls or between two reads: no error, no bytes the file hadn't, and
+    /// all of it that is there when the end is read. Cut short, it gives
+    /// what plain reading gives: up to the new end, or to where the reader
+    /// was if that is further (somewhere in the read that saw the cut, if
+    /// it came within one).
     #[test]
     fn hole_reader_changing_file() {
+        use std::io::Read;
+
         const K: usize = 4096;
         let f = sim_file(&[(0, K), (1, 4 * K), (0, K), (1, 4 * K)], K as u64, 5);
         let len = f.len();
-        for at in 0..16 {
+        for (by_reads, at) in (0..24).map(|at| (false, at)).chain((0..12).map(|at| (true, at))) {
             for change in [
                 Change::Append(vec![9; 3 * K]),
                 Change::AppendHole(3 * K as u64),
                 Change::Truncate(len / 2),
                 Change::Truncate(K as u64 + 1),
+                Change::Truncate(3 * K as u64),
                 Change::Truncate(0),
             ] {
                 for short in [usize::MAX, 1000] {
                     let mut f = f.clone();
-                    f.change = Some((at, change.clone()));
+                    if !by_reads {
+                        f.change = Some((at, change.clone()));
+                    }
                     f.short = short;
                     let mut r = HoleReader::new(f.clone());
-                    let out = read_all(&mut r, &[K, 100]);
-                    let now = &r.f.data;
-                    let what = format!("{change:?} at {at}, short {short}");
-                    match change {
-                        Change::Append(_) | Change::AppendHole(_) => assert_eq!(&out, now, "{what}"),
-                        Change::Truncate(cut) => {
-                            assert_eq!(out, f.data[..out.len()], "{what}");
-                            assert!(out.len() as u64 >= cut, "{what}");
+                    let mut out = Vec::new();
+                    let mut buf = vec![0; K];
+                    // The output's length before and after the read in
+                    // which the change was made (or before which).
+                    let mut seen = None;
+                    for i in 0.. {
+                        let before = out.len() as u64;
+                        if by_reads && i == at {
+                            r.f.apply(change.clone());
+                            seen = Some((before, before));
+                        }
+                        let n = r.read(&mut buf[..[K, 100][i % 2]]).unwrap();
+                        out.extend_from_slice(&buf[..n]);
+                        if !by_reads && seen.is_none() && r.f.calls > at {
+                            seen = Some((before, out.len() as u64));
+                        }
+                        if n == 0 {
+                            break;
                         }
                     }
+                    let now = &r.f.data;
+                    let what = format!("{change:?} at {at} (by reads: {by_reads}), short {short}");
+                    match change {
+                        Change::Append(_) | Change::AppendHole(_) if seen.is_some() => {
+                            assert_eq!(&out, now, "{what}");
+                        }
+                        Change::Truncate(cut) if seen.is_some() => {
+                            assert_eq!(out, f.data[..out.len()], "{what}");
+                            let total = out.len() as u64;
+                            let (before, after) = seen.unwrap();
+                            assert!(
+                                cut.max(before) <= total && total <= cut.max(after),
+                                "{what}: {total} bytes, cut at {cut} in {before}..{after}"
+                            );
+                        }
+                        // The end of file came first.
+                        _ => assert_eq!(out, f.data, "{what}"),
+                    }
                 }
+            }
+        }
+    }
+
+    /// A file cut short while the reader is inside a hole gives what plain
+    /// reading gives from there: the bytes up to the new end, and no more
+    /// zeros past it.
+    #[test]
+    fn hole_reader_cut_in_a_hole() {
+        use std::io::Read;
+
+        const K: usize = 4096;
+        let f = sim_file(&[(0, K), (1, 16 * K), (0, K)], K as u64, 6);
+        let at = 2 * K as u64;
+        for cut in [at + 1, 5 * K as u64, 10 * K as u64 + 7, 17 * K as u64, at, K as u64, 0] {
+            for sizes in [&[K][..], &[100], &[1 << 20]] {
+                let mut r = HoleReader::new(f.clone());
+                let mut out = vec![0; 2 * K];
+                r.read_exact(&mut out).unwrap();
+                r.f.apply(Change::Truncate(cut));
+                out.extend(read_all(&mut r, sizes));
+                let what = format!("cut at {cut}, reads of {sizes:?}");
+                assert_eq!(out.len() as u64, cut.max(at), "{what}");
+                assert_eq!(out, f.data[..out.len()], "{what}");
             }
         }
     }
@@ -886,9 +1062,13 @@ mod tests {
             seed in proptest::num::u64::ANY,
             sizes in proptest::collection::vec(1_usize..70_000, 1..4),
             short in proptest::sample::select(vec![usize::MAX, 777]),
+            interrupt in proptest::bool::ANY,
+            data_past_eof in proptest::bool::ANY,
         ) {
             let mut f = sim_file(&runs, block, seed);
             f.short = short;
+            f.interrupt = interrupt;
+            f.data_past_eof = data_past_eof;
             let mut r = HoleReader::new(f.clone());
             proptest::prop_assert_eq!(&read_all(&mut r, &sizes), &f.data);
             proptest::prop_assert_eq!(r.zeros, hole_bytes(&f));
@@ -989,5 +1169,215 @@ mod tests {
         // The data written into the hole may have come too late.
         assert_eq!(got[..2 << 20], want[..2 << 20]);
         assert_eq!(got[(2 << 20) + 100..], want[(2 << 20) + 100..]);
+    }
+
+    /// Reads all of `a` in various amounts and compares it with plain
+    /// reading of `b`; gives the length.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "illumos",
+        target_vendor = "apple"
+    ))]
+    fn same_as_plain(mut a: impl io::Read, mut b: impl io::Read, what: &str) -> u64 {
+        let (mut ba, mut bb) = (vec![0_u8; 1 << 20], vec![0_u8; 1 << 20]);
+        let sizes = [1 << 20, 4096, 777, 1 << 16, 1];
+        let mut total = 0;
+        for i in 0.. {
+            let n = a.read(&mut ba[..sizes[i % sizes.len()]]).unwrap();
+            if n == 0 {
+                let mut rest = Vec::new();
+                _ = b.read_to_end(&mut rest).unwrap();
+                assert!(rest.is_empty(), "{what}: {} bytes more read plainly", rest.len());
+                break;
+            }
+            b.read_exact(&mut bb[..n]).unwrap_or_else(|err| panic!("{what}: at {total}: {err}"));
+            assert!(ba[..n] == bb[..n], "{what}: differ in {total}..+{n}");
+            total += n as u64;
+        }
+        total
+    }
+
+    /// Random layouts of real files, read before their data reaches the disk,
+    /// and a file over 4 GiB with data across the 4 GiB line and at its end:
+    /// the bytes plain reading gives.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "illumos",
+        target_vendor = "apple"
+    ))]
+    #[test]
+    fn hole_reader_real_random_layouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut rand = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for round in 0..16 {
+            let path = dir.path().join(format!("f{round}"));
+            let mut f = File::create(&path).unwrap();
+            let size = match round {
+                0 => (5 << 30) + 12345,
+                1 => 1,
+                2 => 4095,
+                _ => rand() % (48 << 20) + 1,
+            };
+            let mut writes = Vec::new();
+            if round == 0 {
+                writes.extend([((4 << 30) - 3000, 9000), (1 << 32, 1), (size - 1, 1)]);
+            }
+            for _ in 0..rand() % 25 {
+                let off = rand() % size;
+                writes.push((off, (rand() % 400_000).min(size - off)));
+            }
+            for (off, len) in writes {
+                _ = f.seek(SeekFrom::Start(off)).unwrap();
+                // Zeros among the data too.
+                let buf: Vec<u8> = (0..len).map(|_| (rand() % 3) as u8 * 85).collect();
+                f.write_all(&buf).unwrap();
+            }
+            f.set_len(size).unwrap();
+            let m = f.metadata().unwrap();
+            if round == 0 && !maybe_sparse(m.len(), m.blocks()) {
+                // A file system without holes: not 5 GiB of zeros.
+                continue;
+            }
+            let what = format!("round {round}, size {size}");
+            let n = same_as_plain(
+                backup_reader(File::open(&path).unwrap(), true),
+                File::open(&path).unwrap(),
+                &what,
+            );
+            assert_eq!(n, size, "{what}");
+            drop(f);
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    /// A real file of 6 GiB and 7 bytes with data just below 4 GiB and past
+    /// 5 GiB: the same length and SHA-256 by its extents as read plainly.
+    /// Its holes take no disk.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "illumos",
+        target_vendor = "apple"
+    ))]
+    #[test]
+    fn hole_reader_past_4_gib() {
+        use sha2::{Digest, Sha256};
+
+        const G: u64 = 1 << 30;
+        fn digest(mut r: impl io::Read) -> (u64, Vec<u8>) {
+            let mut hasher = Sha256::new();
+            let mut buf = vec![0; 1 << 20];
+            let mut len = 0;
+            loop {
+                let n = r.read(&mut buf).unwrap();
+                if n == 0 {
+                    return (len, hasher.finalize().to_vec());
+                }
+                hasher.update(&buf[..n]);
+                len += n as u64;
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big");
+        let mut f = File::create(&path).unwrap();
+        let size = 6 * G + 7;
+        f.set_len(size).unwrap();
+        for (off, byte) in [(4 * G - 2, 1), (5 * G + 12345, 2)] {
+            _ = f.seek(SeekFrom::Start(off)).unwrap();
+            f.write_all(&vec![byte; 70_000]).unwrap();
+        }
+        drop(f);
+        let f = File::open(&path).unwrap();
+        let m = f.metadata().unwrap();
+        if !maybe_sparse(m.len(), m.blocks()) || !seek_hole(&f).is_ok_and(|hole| hole < size) {
+            // A file system without holes: not 6 GiB of zeros.
+            return;
+        }
+        let plain = digest(File::open(&path).unwrap());
+        assert_eq!(plain.0, size);
+        let mut r = HoleReader::new(f);
+        assert_eq!(digest(&mut r), plain);
+        assert!(r.zeros > 5 * G, "{} bytes of holes", r.zeros);
+        assert_eq!(digest(backup_reader(File::open(&path).unwrap(), true)), plain);
+    }
+
+    /// Another thread writes into the holes, appends and truncates while a
+    /// real file is read: no error, every byte one the file had, no more
+    /// bytes than it ever had.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "illumos",
+        target_vendor = "apple"
+    ))]
+    #[test]
+    fn hole_reader_concurrent_writer() {
+        use std::{
+            io::Read,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+        };
+
+        const M: u64 = 1 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        for round in 0..8 {
+            let path = dir.path().join(format!("c{round}"));
+            let mut f = File::create(&path).unwrap();
+            f.write_all(&[7; 5000]).unwrap();
+            f.set_len(64 * M).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let writer = {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut x = round + 11;
+                    let mut rand = move || {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        x
+                    };
+                    let mut max = 64 * M;
+                    while !stop.load(Ordering::Relaxed) {
+                        match rand() % 10 {
+                            0 => f.set_len(rand() % (96 * M)).unwrap(),
+                            1 => {
+                                let len = rand() % (32 * M) + 64 * M;
+                                max = max.max(len);
+                                f.set_len(len).unwrap();
+                            }
+                            _ => {
+                                let off = rand() % (96 * M);
+                                _ = f.seek(SeekFrom::Start(off)).unwrap();
+                                f.write_all(&[9; 8192]).unwrap();
+                                max = max.max(off + 8192);
+                            }
+                        }
+                    }
+                    max
+                })
+            };
+            let mut out = Vec::new();
+            _ = backup_reader(File::open(&path).unwrap(), true)
+                .read_to_end(&mut out)
+                .unwrap();
+            stop.store(true, Ordering::Relaxed);
+            let max = writer.join().unwrap();
+            assert!(out.len() as u64 <= max, "round {round}");
+            assert!(out.iter().all(|&b| [0, 7, 9].contains(&b)), "round {round}");
+        }
     }
 }
