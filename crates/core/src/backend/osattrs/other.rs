@@ -4,6 +4,7 @@ use std::{fs::File, io, path::Path};
 
 use jiff::Timestamp;
 
+use super::XattrErrors;
 use crate::backend::node::{ExtendedAttribute, Node, NodeType};
 
 pub(super) const FILE_FLAGS: Option<&str> = None;
@@ -79,6 +80,6 @@ pub(super) fn xattrs(_path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
 }
 
 /// Extended attributes go through the xattr crate here.
-pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr"))
+pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr").into())
 }

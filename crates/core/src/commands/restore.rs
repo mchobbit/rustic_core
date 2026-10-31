@@ -643,7 +643,7 @@ fn hardlink_key(node: &Node) -> Option<HardlinkKey> {
 ///
 /// BackOtter: false if the node is a special file that couldn't be made,
 /// which then gets nothing else, as in BackOtter's restic: one warning for
-/// it, not one more for each step after.
+/// it (restic reports an error), not one more for each step after.
 // TODO: Return a result here, introduce errors and get rid of logging.
 pub(crate) fn set_metadata(
     dest: &LocalDestination,
@@ -683,10 +683,11 @@ pub(crate) fn set_metadata(
         osattrs::restore_symlink_mode(&target, node)
             .unwrap_or_else(|err| warn!("restore {}: {err}", path.display()));
     }
+    // BackOtter: one warning naming each attribute not set, and its error.
     dest.set_extended_attributes(path, &node.meta.extended_attributes)
-        .unwrap_or_else(|_| {
+        .unwrap_or_else(|err| {
             warn!(
-                "restore {}: setting extended attributes failed.",
+                "restore {}: setting extended attributes failed: {err}",
                 path.display()
             );
         });

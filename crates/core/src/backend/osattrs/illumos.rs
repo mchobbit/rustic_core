@@ -32,7 +32,7 @@ use jiff::Timestamp;
 use log::{debug, warn};
 
 use super::{
-    SidUnmapped, Unsupported, c_path, check,
+    SidUnmapped, Unsupported, XattrErrors, c_path, check,
     illumos_acl::{self, AceEntry, NOBODY},
     illumos_idmap,
     illumos_project::ZfsProject,
@@ -606,7 +606,8 @@ fn attr_dir(path: &Path) -> io::Result<Option<File>> {
     }
 }
 
-/// The names in an attribute directory, without the system attribute views.
+/// The names in an attribute directory, without the system attribute views,
+/// sorted, as BackOtter's restic stores them (not in directory order).
 fn attr_names(dir: &File) -> io::Result<Vec<String>> {
     // fdopendir(3C) takes over the descriptor it's given: give it its own.
     // SAFETY: dir is an open descriptor.
@@ -634,6 +635,7 @@ fn attr_names(dir: &File) -> io::Result<Vec<String>> {
     }
     // SAFETY: d is an open DIR, closed once.
     _ = unsafe { libc::closedir(d) };
+    names.sort_unstable();
     Ok(names)
 }
 
@@ -669,8 +671,10 @@ pub(super) fn xattrs(path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
         .collect()
 }
 
-/// Gives the file at `path` exactly the extended attributes `attrs`.
-pub(super) fn set_xattrs(path: &Path, attrs: &[ExtendedAttribute]) -> io::Result<()> {
+/// Gives the file at `path` exactly the extended attributes `attrs`. One
+/// that can't be set or removed doesn't keep the others from being set or
+/// removed, as in BackOtter's restic: each failure is returned, by name.
+pub(super) fn set_xattrs(path: &Path, attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
     let Some(dir) = attr_dir(path)? else {
         if attrs.is_empty() {
             return Ok(());
@@ -678,20 +682,35 @@ pub(super) fn set_xattrs(path: &Path, attrs: &[ExtendedAttribute]) -> io::Result
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "no extended attributes on this file system",
-        ));
+        )
+        .into());
     };
-    for name in attr_names(&dir)? {
-        if !attrs.iter().any(|a| a.name == name) {
-            let n = CString::new(name)?;
-            // SAFETY: n is a C string.
-            _ = check(unsafe { libc::unlinkat(dir.as_raw_fd(), n.as_ptr(), 0) })?;
+    let mut errors = XattrErrors::default();
+    match attr_names(&dir) {
+        Ok(names) => {
+            for name in names {
+                if !attrs.iter().any(|a| a.name == name) {
+                    let n = CString::new(name.as_str()).map_err(io::Error::from);
+                    // SAFETY: n is a C string.
+                    let removed = n.and_then(|n| {
+                        check(unsafe { libc::unlinkat(dir.as_raw_fd(), n.as_ptr(), 0) })
+                    });
+                    if let Err(err) = removed {
+                        errors.push(format!("removing {name}"), err);
+                    }
+                }
+            }
         }
+        Err(err) => errors.push("listing", err),
     }
     for a in attrs {
-        let mut f = open_attr(&dir, &a.name, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)?;
-        f.write_all(a.value.as_deref().unwrap_or_default())?;
+        let set = open_attr(&dir, &a.name, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)
+            .and_then(|mut f| f.write_all(a.value.as_deref().unwrap_or_default()));
+        if let Err(err) = set {
+            errors.push(a.name.as_str(), err);
+        }
     }
-    Ok(())
+    errors.into_result()
 }
 
 /// How errors name the extended attribute `name` of the file at `path`.

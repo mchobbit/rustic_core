@@ -11,8 +11,6 @@ use std::{
 use bytes::Bytes;
 #[cfg(not(target_os = "dragonfly"))]
 use filetime::{FileTime, set_symlink_file_times};
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
-use log::warn;
 #[cfg(not(windows))]
 use nix::errno::Errno;
 #[cfg(not(windows))]
@@ -42,19 +40,27 @@ mod helpers {
     use log::warn;
     use nix::unistd::{Gid, Group, Uid, User};
 
-    #[cached]
+    // BackOtter: a name that isn't found is cached too (`cache_none`), so
+    // that it is looked up, and a failed lookup warned about, once per run:
+    // cached 2 caches `None` no more, and without /etc/passwd every file
+    // warned. The restore falls back to the saved id (set_user_group).
+    #[cached(cache_none = true)]
     pub(super) fn uid_from_name(name: String) -> Option<Uid> {
         User::from_name(&name)
-            .inspect_err(|err| warn!("Cannot determine UID from name {name}: {err}. Using UID 0."))
+            .inspect_err(|err| {
+                warn!("Cannot determine UID from name {name}: {err}. Using the saved UID.");
+            })
             .unwrap_or_default()
             .map(|u| u.uid)
     }
 
     // Helper function to cache mapping group name -> gid
-    #[cached]
+    #[cached(cache_none = true)]
     pub(super) fn gid_from_name(name: String) -> Option<Gid> {
         Group::from_name(&name)
-            .inspect_err(|err| warn!("Cannot determine GID from name {name}: {err}. Using UID 0."))
+            .inspect_err(|err| {
+                warn!("Cannot determine GID from name {name}: {err}. Using the saved GID.");
+            })
             .unwrap_or_default()
             .map(|g| g.gid)
     }
@@ -89,26 +95,11 @@ pub enum LocalDestinationErrorKind {
     #[error(transparent)]
     #[cfg(not(windows))]
     FromErrnoError(Errno),
-    /// listing xattrs on `{path:?}`: `{source:?}`
-    #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
-    ListingXattrsFailed {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    /// setting xattr `{name}` on `{filename:?}` with `{source:?}`
+    // BackOtter: each extended attribute that couldn't be set or removed,
+    // with its error, in one (stock rustic stopped at the first).
+    /// {0}
     #[cfg(not(any(windows, target_os = "openbsd")))]
-    SettingXattrFailed {
-        name: String,
-        filename: PathBuf,
-        source: std::io::Error,
-    },
-    /// getting xattr `{name}` on `{filename:?}` with `{source:?}`
-    #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
-    GettingXattrFailed {
-        name: String,
-        filename: PathBuf,
-        source: std::io::Error,
-    },
+    XattrsNotSet(osattrs::XattrErrors),
     /// removing directories failed: `{0:?}`
     DirectoryRemovalFailed(std::io::Error),
     /// removing file failed: `{0:?}`
@@ -502,20 +493,14 @@ impl LocalDestination {
     ///
     /// # Errors
     ///
-    /// * If the extended attributes could not be set.
+    /// * Each extended attribute that couldn't be set or removed.
     pub(crate) fn set_extended_attributes(
         &self,
         item: impl AsRef<Path>,
         extended_attributes: &[ExtendedAttribute],
     ) -> LocalDestinationResult<()> {
-        let filename = self.path(item);
-        osattrs::set_illumos_xattrs(&filename, extended_attributes).map_err(|err| {
-            LocalDestinationErrorKind::SettingXattrFailed {
-                name: String::new(),
-                filename,
-                source: err,
-            }
-        })
+        osattrs::set_illumos_xattrs(&self.path(item), extended_attributes)
+            .map_err(LocalDestinationErrorKind::XattrsNotSet)
     }
 
     #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
@@ -528,17 +513,14 @@ impl LocalDestination {
     ///
     /// # Errors
     ///
-    /// * If listing the extended attributes failed.
-    /// * If getting an extended attribute failed.
-    /// * If setting an extended attribute failed.
+    /// * BackOtter: each extended attribute that couldn't be set or removed,
+    ///   and a failure to list them, all in one; one that can't be set
+    ///   doesn't keep the others from being set or removed, as in
+    ///   BackOtter's restic (stock rustic stopped at the first).
     ///
     /// # Returns
     ///
     /// Ok if the extended attributes were set.
-    ///
-    /// # Panics
-    ///
-    /// * If the extended attributes could not be set.
     pub(crate) fn set_extended_attributes(
         &self,
         item: impl AsRef<Path>,
@@ -551,10 +533,12 @@ impl LocalDestination {
             return Ok(());
         }
         let mut done = vec![false; extended_attributes.len()];
+        let mut errors = osattrs::XattrErrors::default();
 
         // BackOtter: osattrs::xattr_list, as the xattr crate's list misnames
         // one on FreeBSD; and a file that can't have any (a FIFO on ZFS)
-        // needs none.
+        // needs none. Where they can't be listed for another reason, they
+        // are still set, as in restic.
         let curr_names = match osattrs::xattr_list(&filename) {
             Ok(names) => names,
             Err(err)
@@ -563,11 +547,12 @@ impl LocalDestination {
             {
                 return Ok(());
             }
+            Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {
+                return Err(LocalDestinationErrorKind::XattrsNotSet(err.into()));
+            }
             Err(err) => {
-                return Err(LocalDestinationErrorKind::ListingXattrsFailed {
-                    source: err,
-                    path: filename.clone(),
-                });
+                errors.push("listing", err);
+                Vec::new()
             }
         };
         for curr_name in curr_names {
@@ -581,31 +566,16 @@ impl LocalDestination {
                 .enumerate()
                 .find(|(_, ExtendedAttribute { name, .. })| name == &curr_node_name)
             {
-                Some((index, ExtendedAttribute { name, value })) => {
-                    let curr_value = xattr::get(&filename, &curr_name).map_err(|err| {
-                        LocalDestinationErrorKind::GettingXattrFailed {
-                            name: name.clone(),
-                            filename: filename.clone(),
-                            source: err,
-                        }
-                    })?;
-                    if value != &curr_value {
-                        xattr::set(&filename, &curr_name, value.as_ref().unwrap_or(&Vec::new()))
-                            .map_err(|err| LocalDestinationErrorKind::SettingXattrFailed {
-                                name: name.clone(),
-                                filename: filename.clone(),
-                                source: err,
-                            })?;
+                // BackOtter: one with the right value already is left; one
+                // that can't be read is set below, as are the others.
+                Some((index, ExtendedAttribute { value, .. })) => {
+                    if xattr::get(&filename, &curr_name).is_ok_and(|curr| value == &curr) {
+                        done[index] = true;
                     }
-                    done[index] = true;
                 }
                 None => {
                     if let Err(err) = xattr::remove(&filename, &curr_name) {
-                        warn!(
-                            "error removing xattr {} on {}: {err}",
-                            curr_name.display(),
-                            filename.display()
-                        );
+                        errors.push(format!("removing {curr_node_name}"), err);
                     }
                 }
             }
@@ -614,17 +584,15 @@ impl LocalDestination {
         for (index, ExtendedAttribute { name, value }) in extended_attributes.iter().enumerate() {
             if !done[index] {
                 let os_name = osattrs::xattr_os_name(name);
-                xattr::set(&filename, os_name, value.as_ref().unwrap_or(&Vec::new())).map_err(
-                    |err| LocalDestinationErrorKind::SettingXattrFailed {
-                        name: name.clone(),
-                        filename: filename.clone(),
-                        source: err,
-                    },
-                )?;
+                if let Err(err) =
+                    xattr::set(&filename, os_name, value.as_ref().unwrap_or(&Vec::new()))
+                {
+                    errors.push(name.as_str(), err);
+                }
             }
         }
 
-        Ok(())
+        errors.into_result().map_err(LocalDestinationErrorKind::XattrsNotSet)
     }
 
     /// Set length of `item` (relative to the base path)
@@ -955,5 +923,58 @@ impl LocalDestination {
             }
         })?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn xattr(name: &str, value: &[u8]) -> ExtendedAttribute {
+        ExtendedAttribute {
+            name: name.to_string(),
+            value: Some(value.to_vec()),
+        }
+    }
+
+    /// BackOtter: an extended attribute that can't be set, first in the node,
+    /// doesn't keep the others from being set, or those the node hasn't from
+    /// being removed; the error names each one that failed.
+    #[test]
+    fn xattr_not_settable_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        fs::write(&file, b"").unwrap();
+        // A file system without user extended attributes can't show it.
+        if xattr::set(&file, "user.old", b"x").is_err() {
+            eprintln!("no user extended attributes in {}", dir.path().display());
+            return;
+        }
+        let dest = LocalDestination::new(dir.path().to_str().unwrap(), false, false).unwrap();
+        // Linux has no namespace "bogus": EOPNOTSUPP, for root too. Not as
+        // root, trusted.* gives EPERM.
+        let mut attrs = vec![xattr("bogus.a", b"1"), xattr("user.b", b"2")];
+        if !nix::unistd::geteuid().is_root() {
+            attrs.insert(0, xattr("trusted.t", b"0"));
+        }
+        attrs.push(xattr("bogus.c", b"3"));
+        let err = dest.set_extended_attributes("f", &attrs).unwrap_err().to_string();
+        assert_eq!(xattr::get(&file, "user.b").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(xattr::get(&file, "user.old").unwrap(), None);
+        assert!(err.contains("bogus.a: "), "{err}");
+        assert!(err.ends_with(&format!("; bogus.c: {}", std::io::Error::from_raw_os_error(95))));
+        assert!(!err.contains("user."), "{err}");
+        if !nix::unistd::geteuid().is_root() {
+            assert!(err.starts_with("trusted.t: Operation not permitted"), "{err}");
+        }
+
+        // Again, over its own result: only the attributes that can't be set.
+        let err = dest.set_extended_attributes("f", &attrs).unwrap_err().to_string();
+        assert!(!err.contains("user."), "{err}");
+        assert_eq!(xattr::get(&file, "user.b").unwrap(), Some(b"2".to_vec()));
+
+        // A node without any removes them all.
+        dest.set_extended_attributes("f", &[]).unwrap();
+        assert_eq!(xattr::list(&file).unwrap().count(), 0);
     }
 }

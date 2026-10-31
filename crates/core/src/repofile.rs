@@ -4,7 +4,7 @@ use jiff::{
     Timestamp, Zoned,
     civil::Time,
     fmt::temporal::{DateTimePrinter, Pieces},
-    tz::TimeZone,
+    tz::{Offset, TimeZone},
 };
 use serde::{Deserialize, Deserializer, Serialize, de, de::DeserializeOwned};
 use serde_with::{DeserializeAs, SerializeAs};
@@ -134,7 +134,18 @@ impl SerializeAs<Timestamp> for RusticTime {
         S: serde::Serializer,
     {
         let offset = TimeZone::system().to_offset(*source);
-        serializer.collect_str(&source.display_with_offset(offset).to_string())
+        serializer.collect_str(&timestamp_to_string(*source, offset))
+    }
+}
+
+/// BackOtter: a node's time `ts` at `offset`, as restic writes it (Go's
+/// RFC 3339 with nanoseconds): with `Z` for a zero offset, not `+00:00`.
+/// Either form is read; only the trees' bytes, and so their ids, differ.
+fn timestamp_to_string(ts: Timestamp, offset: Offset) -> String {
+    if offset == Offset::UTC {
+        ts.to_string()
+    } else {
+        ts.display_with_offset(offset).to_string()
     }
 }
 
@@ -167,3 +178,25 @@ pub use {
         StringList,
     },
 };
+
+#[cfg(test)]
+mod tests {
+    use jiff::tz::offset;
+
+    use super::*;
+
+    #[test]
+    fn node_times_as_restic_writes_them() {
+        // BackOtter: Go writes "Z" for a zero offset, and trims trailing
+        // zeros of the nanoseconds.
+        let ts = Timestamp::new(1_000_000_000, 123_456_789).unwrap();
+        assert_eq!(timestamp_to_string(ts, Offset::UTC), "2001-09-09T01:46:40.123456789Z");
+        let ts = Timestamp::new(1_000_000_000, 0).unwrap();
+        assert_eq!(timestamp_to_string(ts, Offset::UTC), "2001-09-09T01:46:40Z");
+        let ts = Timestamp::new(1_000_000_000, 500_000_000).unwrap();
+        assert_eq!(timestamp_to_string(ts, offset(2)), "2001-09-09T03:46:40.5+02:00");
+        for s in ["2001-09-09T01:46:40.5Z", "2001-09-09T01:46:40.5+00:00"] {
+            assert_eq!(s.parse::<Timestamp>().unwrap(), ts);
+        }
+    }
+}

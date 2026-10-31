@@ -109,7 +109,11 @@ pub const fn map_mode_from_go(go_mode: u32) -> u32 {
 /// # Returns
 ///
 /// The group name for the given gid or `None` if the group could not be found.
-#[cached]
+///
+/// BackOtter: `None` is cached too (`cache_none`), so that each gid is looked
+/// up, and a failed lookup warned about, once per run: cached 2 caches
+/// `None` no more, and without /etc/group every file warned.
+#[cached(cache_none = true)]
 pub fn get_group_by_gid(gid: u32) -> Option<String> {
     match Group::from_gid(Gid::from_raw(gid)) {
         Ok(Some(group)) => Some(group.name),
@@ -130,7 +134,9 @@ pub fn get_group_by_gid(gid: u32) -> Option<String> {
 /// # Returns
 ///
 /// The user name for the given uid or `None` if the user could not be found.
-#[cached]
+///
+/// BackOtter: `None` is cached too, as for [`get_group_by_gid`].
+#[cached(cache_none = true)]
 pub fn get_user_by_uid(uid: u32) -> Option<String> {
     match User::from_uid(Uid::from_raw(uid)) {
         Ok(Some(user)) => Some(user.name),
@@ -154,5 +160,18 @@ mod tests {
         assert_eq!(map_mode_from_go(0x0420_01a4), S_IFCHR | 0o644);
         assert_eq!(map_mode_to_go(S_IFBLK | 0o600), GO_MODE_DEVICE | 0o600);
         assert_eq!(map_mode_from_go(GO_MODE_DEVICE | 0o600), S_IFBLK | 0o600);
+    }
+
+    #[test]
+    fn unknown_ids_looked_up_once() {
+        // BackOtter: an id without a user or group is cached as one, so that
+        // it isn't looked up (and a failed lookup warned about) for each
+        // file.
+        use cached::Cached;
+        let id = 0xfff0_bc01;
+        assert_eq!(get_user_by_uid(id), None);
+        assert_eq!(get_group_by_gid(id), None);
+        assert_eq!(GET_USER_BY_UID.write().cache_get(&id), Some(&None));
+        assert_eq!(GET_GROUP_BY_GID.write().cache_get(&id), Some(&None));
     }
 }
