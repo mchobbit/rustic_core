@@ -278,8 +278,7 @@ that either program restores what the other backed up.
   its system attributes (read through its attribute directory, opened with
   libc's `__openattrdirat` as `getattrat(3C)` and `ls -/ v` open it,
   without opening the file) have `av_quarantined`, the node has its mode,
-  owner, times,
-  links, inode, device, SID owners, ACL, system attributes
+  owner, times, links, inode, device, SID owners, ACL, system attributes
   (`av_quarantined` included) and birth time, no `content` and size 0, and
   `illumos.unread_size`, the file's real size; its extended attributes and
   `illumos.xattr_meta` are left out (they can't be read), as is its ZFS
@@ -287,12 +286,14 @@ that either program restores what the other backed up.
   (`PATH: av_quarantined: contents not backed up (N bytes)`) and the backup
   exits 0. Any other file that can't be opened is left out, as before,
   with `ignoring error: Failed to open ...`. The source's attribute is
-  never cleared or changed. A restore makes such a file empty, gives it
-  the rest of its metadata, the system attributes last as for any file (so
-  it is quarantined again), and warns once for it (`PATH: contents were not
-  backed up (av_quarantined at backup, N bytes)`), exit 0; on another
-  system too, where the system attributes are left as for any illumos
-  file. A version that doesn't know `illumos.unread_size` warns once about
+  never cleared or changed. A restore makes such a file empty, a new one
+  in place of any file there (which may be quarantined, its contents and
+  extended attributes closed to the restore too), as BackOtter's restic
+  does, gives it the rest of its metadata, the system attributes last as
+  for any file (so it is quarantined again), and warns once for it
+  (`PATH: contents were not backed up (av_quarantined at backup, N
+  bytes)`), exit 0; on another system too, where the system attributes are
+  left as for any illumos file. A version that doesn't know `illumos.unread_size` warns once about
   it as unknown and restores the empty file.
 - A backup keeps the metadata of the directory it backs up (stock rustic
   stores it as a bare directory, mode 0755 and nothing else), so that
