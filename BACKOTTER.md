@@ -30,7 +30,11 @@ that either program restores what the other backed up.
   - `illumos.acl`: ZFS's ACLs on illumos (NFSv4-style ACEs).
   - `illumos.system_attributes`: illumos' system attributes (`chmod(1)`'s
     `S+v...`), as a mask; `archive` and `av_modified` only along with
-    others, since ZFS sets them on every file.
+    others, since ZFS sets them on every file. They are read and written
+    through each file's `SUNWattr_rw` view, a packed nvlist; a restore
+    writes an nvlist of the attributes' booleans alone, never the view it
+    read, which would set the creation time too (refused on an immutable
+    file).
   - `openbsd.file_flags`: OpenBSD's `chflags(1)` flags.
   - `netbsd.file_flags`: NetBSD's `chflags(1)` flags, all but the three
     the kernel manages (`SF_SNAPSHOT`, `SF_SNAPINVAL`, and `SF_LOG`, which
@@ -86,11 +90,25 @@ that either program restores what the other backed up.
     On ZFS a probe of a file with unwritten changes waits for them to be
     written (a transaction group), as it does for BackOtter's restic, which
     probes the same files.
+  - `unix.birthtime`: a file's birth (creation) time, on FreeBSD and NetBSD
+    (`st_birthtim`, every type of file) and illumos (ZFS's `crtime` from
+    the `SUNWattr_rw` view, regular files and directories), as a string in
+    the form of a node's mtime, as Go writes it: RFC 3339 in UTC with every
+    nanosecond and no trailing zeros, such as
+    `"2001-09-09T01:46:40.123456789Z"` or `"2001-09-09T01:46:40Z"`; any
+    offset and number of digits is read. Not when the file system reports
+    second 0 or -1 (UFS1, NetBSD's FFSv1), but otherwise always, even when
+    it equals the mtime (a restored ZFS file's `crtime` on illumos would be
+    the time of the restore). Not on Linux, which can read one but not set
+    it, nor OpenBSD or DragonFly, which keep none. (`windows.creation_time`
+    is a FILETIME, in 100 ns ticks, and restic on Windows would apply it.)
   A file only gets an attribute when it has something the mode doesn't say
-  (flags, a project ID, a non-trivial ACL, holes). A generic attribute
+  (flags, a project ID, a non-trivial ACL, holes), except for its birth
+  time on FreeBSD, NetBSD and illumos. A generic attribute
   rustic doesn't know at all gets a warning, once; one of another system is
   skipped quietly. A known attribute with a value that can't be read
-  (`linux.inode_flags`, `linux.project_id`, `unix.sparse`, `*.file_flags`)
+  (`linux.inode_flags`, `linux.project_id`, `unix.sparse`,
+  `unix.birthtime`, `*.file_flags`)
   is skipped with a warning once per attribute name, as in BackOtter's
   restic; it isn't an error. A project ID of 0 is left as the file has it.
 - On Linux, regular files and directories are opened for their flags,
@@ -210,6 +228,22 @@ that either program restores what the other backed up.
 - Partial restores (`--glob`, `--iglob`): directories above the matches
   that aren't matched themselves aren't streamed, so the restore creates
   them without any metadata, casefolding included, as stock rustic does.
+- Birth times are restored just before the atime and mtime, as part of
+  setting the times, after contents, extended attributes, mode and ACLs
+  (none of which changes them) and before the late flags pass. illumos sets
+  any `crtime` (later than the mtime too) by writing an nvlist of `crtime`
+  alone to the file's `SUNWattr_rw` view; an immutable file would refuse
+  it. FreeBSD and NetBSD have no call that sets a birth time, but their
+  kernels lower it to any mtime set earlier than it (UFS2, FFSv2, ZFS;
+  files, directories and symlinks; owners too). So a birth time earlier
+  than the mtime is first set as the mtime, with `utimensat(2)`, the atime
+  omitted (`UTIME_OMIT`) and `AT_SYMLINK_NOFOLLOW`, and nanoseconds (the
+  filetime crate drops them where it goes through `utimes(2)`); the real
+  times, set next, leave it. One that isn't earlier comes back as the
+  mtime, the closest those systems can get. Elsewhere, and on a file system
+  without them (illumos' UFS and tmpfs: `ENOENT`, `EINVAL`, `ENOTSUP` on
+  the view), the attribute is only noted in the debug log. A failure
+  (`EPERM` as neither owner nor root) is warned about, as for the times.
 - A restored symlink keeps its own permissions on FreeBSD (`lchmod(2)`) and
   on OpenBSD, NetBSD and DragonFly (`fchmodat(2)` with
   `AT_SYMLINK_NOFOLLOW`; OpenBSD has no `lchmod`), where stock rustic

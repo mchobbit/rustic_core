@@ -642,6 +642,10 @@ pub(crate) fn set_metadata(
         .unwrap_or_else(|err| osattrs::warn_restore(path, &err));
     osattrs::restore_acls(&target, node)
         .unwrap_or_else(|err| warn!("restore {}: {err}", path.display()));
+    // BackOtter: the birth time just before the times, which on FreeBSD and
+    // NetBSD replace the earlier mtime it is set as.
+    osattrs::restore_birthtime(&target, node)
+        .unwrap_or_else(|err| warn!("restore {}: {err}", path.display()));
     dest.set_times(path, &node.meta)
         .unwrap_or_else(|_| warn!("restore {}: setting file times failed.", path.display()));
 }

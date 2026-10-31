@@ -1,12 +1,14 @@
-//! illumos: the ACLs ZFS keeps (NFSv4-style ACEs), and the system attributes
+//! illumos: the ACLs ZFS keeps (NFSv4-style ACEs), the system attributes
 //! (immutable, appendonly, nounlink, nodump, hidden, readonly, ...), which
-//! are kept and restored as file flags. Without its ACL a file comes back
-//! with its mode alone, which loses named users and groups and, worse, deny
-//! entries: access the ACL denied can come back allowed.
+//! are kept and restored as file flags, and the creation time (`crtime`),
+//! kept as the birth time. Without its ACL a file comes back with its mode
+//! alone, which loses named users and groups and, worse, deny entries:
+//! access the ACL denied can come back allowed.
 //!
 //! libc's `fgetattr(3C)` and `fsetattr(3C)` read and write the system
 //! attributes through each file's `SUNWattr_rw` extended attribute, a packed
-//! nvlist; this does the same, without libnvpair.
+//! nvlist; this does the same, without libnvpair, writing an nvlist of just
+//! the attributes it sets (`illumos_sysattr.rs`).
 
 use std::{
     ffi::{CStr, CString},
@@ -20,16 +22,18 @@ use std::{
     ptr,
 };
 
+use jiff::Timestamp;
 use log::debug;
 
 use super::{
     c_path, check,
     illumos_acl::{self, AceEntry},
-    illumos_sysattr, path_error, set_flags_best_effort,
+    illumos_sysattr::{self, View},
+    path_error, set_flags_best_effort,
 };
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType,
-    generic_attributes::{ILLUMOS_ACL, ILLUMOS_SYSTEM_ATTRIBUTES},
+    generic_attributes::{ILLUMOS_ACL, ILLUMOS_SYSTEM_ATTRIBUTES, UNIX_BIRTHTIME},
 };
 
 pub(super) const FILE_FLAGS: Option<&str> = Some(ILLUMOS_SYSTEM_ATTRIBUTES);
@@ -119,7 +123,9 @@ fn unsupported(err: &io::Error) -> bool {
 
 /// Opens the `SUNWattr_rw` view of the file at `path`, a regular file or
 /// directory; other types of file have no system attributes worth keeping,
-/// and opening a device or FIFO could have side effects.
+/// and opening a device or FIFO could have side effects. The errors are the
+/// system's, for the callers to tell a file system without the view (UFS,
+/// tmpfs) from a failure.
 fn sysattr_view(path: &Path, typ: &NodeType, write: bool) -> io::Result<File> {
     if !matches!(typ, NodeType::File | NodeType::Dir) {
         return Err(io::Error::from(io::ErrorKind::Unsupported));
@@ -127,60 +133,78 @@ fn sysattr_view(path: &Path, typ: &NodeType, write: bool) -> io::Result<File> {
     let f = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|err| path_error("open", path, &err))?;
+        .open(path)?;
     let how = O_XATTR | libc::O_CLOEXEC | if write { libc::O_RDWR } else { libc::O_RDONLY };
     // SAFETY: the name is a C string.
-    let fd = check(unsafe { libc::openat(f.as_raw_fd(), c"SUNWattr_rw".as_ptr(), how) })
-        .map_err(|err| path_error("openat SUNWattr_rw", path, &err))?;
+    let fd = check(unsafe { libc::openat(f.as_raw_fd(), c"SUNWattr_rw".as_ptr(), how) })?;
     // SAFETY: fd is a new file descriptor, owned by nothing else.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn read_view(f: &mut File, path: &Path) -> io::Result<Vec<u8>> {
+/// The whole of the view `f`, from its start: it is read once for the
+/// system attributes and once for the creation time.
+fn read_view(f: &File, path: &Path) -> io::Result<Vec<u8>> {
     let mut view = Vec::new();
-    _ = f
-        .read_to_end(&mut view)
-        .map_err(|err| path_error("read SUNWattr_rw", path, &err))?;
-    Ok(view)
+    let mut buf = [0; 1024];
+    loop {
+        let n = f
+            .read_at(&mut buf, view.len() as u64)
+            .map_err(|err| path_error("read SUNWattr_rw", path, &err))?;
+        if n == 0 {
+            return Ok(view);
+        }
+        view.extend_from_slice(&buf[..n]);
+    }
 }
 
-/// No file is opened for its attributes ahead of them here.
+fn parse_view<'a>(buf: &'a [u8], path: &Path) -> io::Result<View<'a>> {
+    View::parse(buf).map_err(|err| path_error("read SUNWattr_rw", path, &err))
+}
+
+/// Opens the `SUNWattr_rw` view of a regular file or directory, for its
+/// system attributes and creation time. `None` for other types of file, and
+/// on a file system without them.
 pub(super) fn open_for_attrs(
-    _path: &Path,
-    _typ: &NodeType,
+    path: &Path,
+    typ: &NodeType,
     _m: &std::fs::Metadata,
 ) -> Option<File> {
-    None
+    if !matches!(typ, NodeType::File | NodeType::Dir) {
+        return None;
+    }
+    sysattr_view(path, typ, false)
+        .map_err(|err| debug!("no system attributes for {}: {err}", path.display()))
+        .ok()
 }
 
 pub(super) fn file_flags(
     path: &Path,
-    typ: &NodeType,
+    _typ: &NodeType,
     _m: &std::fs::Metadata,
-    _f: Option<&File>,
+    f: Option<&File>,
 ) -> io::Result<u32> {
-    if !matches!(typ, NodeType::File | NodeType::Dir) {
+    let Some(f) = f else {
         return Ok(0);
-    }
-    let mut f = match sysattr_view(path, typ, false) {
-        Ok(f) => f,
-        Err(err) => {
-            // A file system without them.
-            debug!("no system attributes for {}: {err}", path.display());
-            return Ok(0);
-        }
     };
-    let view = read_view(&mut f, path)?;
-    let mask =
-        illumos_sysattr::mask(&view).map_err(|err| path_error("read SUNWattr_rw", path, &err))?;
+    let mask = parse_view(&read_view(f, path)?, path)?.mask();
     if mask & !illumos_sysattr::AUTOMATIC == 0 {
         return Ok(0);
     }
     Ok(mask)
 }
 
-pub(super) fn fill_attributes(path: &Path, node: &mut Node, _f: Option<&File>) -> io::Result<()> {
+/// Records the creation time, from the system attribute view, and the ACL.
+pub(super) fn fill_attributes(path: &Path, node: &mut Node, f: Option<&File>) -> io::Result<()> {
+    let birth = f.map_or(Ok(()), |f| {
+        if let Some(crtime) = parse_view(&read_view(f, path)?, path)?.crtime() {
+            node.meta.generic_attributes.set_timestamp(UNIX_BIRTHTIME, crtime);
+        }
+        Ok(())
+    });
+    fill_acl(path, node).and(birth)
+}
+
+fn fill_acl(path: &Path, node: &mut Node) -> io::Result<()> {
     if node.is_symlink() {
         return Ok(());
     }
@@ -209,17 +233,20 @@ pub(super) fn prepare_dir_for_flags(_path: &Path, _flags: u32) -> io::Result<()>
     Ok(())
 }
 
+/// Sets the system attributes the view has to those in `flags`, writing
+/// their booleans alone: the whole view would set the creation time too,
+/// which an immutable file refuses.
 pub(super) fn restore_file_flags(
     path: &Path,
     typ: &NodeType,
     flags: u32,
     _xattrs: &[ExtendedAttribute],
 ) -> io::Result<()> {
-    let mut f = sysattr_view(path, typ, true)?;
-    let mut view = read_view(&mut f, path)?;
+    let f = sysattr_view(path, typ, true).map_err(|err| path_error("open SUNWattr_rw", path, &err))?;
+    let buf = read_view(&f, path)?;
+    let view = parse_view(&buf, path)?;
     set_flags_best_effort(ILLUMOS_SYSTEM_ATTRIBUTES, path, "write SUNWattr_rw", flags, |mask| {
-        illumos_sysattr::set_mask(&mut view, mask)?;
-        f.write_all_at(&view, 0)
+        f.write_all_at(&view.mask_nvlist(mask), 0)
     })
 }
 
@@ -246,6 +273,30 @@ pub(super) fn restore_acls(path: &Path, node: &Node) -> io::Result<()> {
 /// A symlink's own permissions don't matter on illumos.
 pub(super) fn restore_symlink_mode(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
+}
+
+/// Sets the birth time, ZFS's `crtime`, of a regular file or directory,
+/// which can be any time: an nvlist of `crtime` alone, written to its
+/// `SUNWattr_rw` view, sets it and leaves everything else. This goes before
+/// the system attributes, since an immutable file refuses it. Symlinks have
+/// no view of their own (it is their target's), the other types none, and
+/// neither has UFS or tmpfs.
+pub(super) fn restore_birthtime(path: &Path, node: &Node, birth: Timestamp) -> io::Result<()> {
+    let f = match sysattr_view(path, &node.node_type, true) {
+        Ok(f) => f,
+        Err(err)
+            if err.kind() == io::ErrorKind::Unsupported
+                || matches!(
+                    err.raw_os_error(),
+                    Some(libc::ENOENT | libc::EINVAL | libc::ENOTSUP | libc::EOPNOTSUPP)
+                ) =>
+        {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, err));
+        }
+        Err(err) => return Err(path_error("open SUNWattr_rw", path, &err)),
+    };
+    f.write_all_at(&illumos_sysattr::crtime_nvlist(birth), 0)
+        .map_err(|err| path_error("write SUNWattr_rw crtime", path, &err))
 }
 
 /// The system attribute views in every attribute directory, which aren't

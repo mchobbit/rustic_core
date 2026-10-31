@@ -12,6 +12,7 @@ use std::{
     path::Path,
 };
 
+use jiff::Timestamp;
 use log::{debug, warn};
 
 use super::{Unsupported, path_error, set_flags_best_effort, unsupported};
@@ -548,6 +549,11 @@ pub(super) fn restore_acls(_path: &Path, _node: &Node) -> io::Result<()> {
 
 pub(super) fn restore_symlink_mode(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
+}
+
+/// Linux reads birth times (`statx(2)`), but has no call that sets one.
+pub(super) fn restore_birthtime(_path: &Path, _node: &Node, _birth: Timestamp) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "Linux can't set birth times"))
 }
 
 #[cfg(test)]

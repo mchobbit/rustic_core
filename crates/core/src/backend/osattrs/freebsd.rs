@@ -3,7 +3,11 @@
 
 use std::{io, os::freebsd::fs::MetadataExt, path::Path};
 
-use super::{c_path, check, freebsd_netbsd, path_error, set_flags_best_effort};
+use jiff::Timestamp;
+
+use super::{
+    c_path, check, freebsd_netbsd, lower_birthtime, path_error, set_flags_best_effort,
+};
 use crate::backend::{
     ignore::mapper::nix_mapper::map_mode_from_go,
     node::{ExtendedAttribute, Node, NodeType, generic_attributes::FREEBSD_FILE_FLAGS},
@@ -117,4 +121,10 @@ pub(super) fn restore_symlink_mode(path: &Path, node: &Node) -> io::Result<()> {
     _ = check(unsafe { lchmod(p.as_ptr(), mode) })
         .map_err(|err| path_error("lchmod", path, &err))?;
     Ok(())
+}
+
+/// Sets the birth time as an earlier mtime, which the final times replace
+/// (`osattrs.rs`).
+pub(super) fn restore_birthtime(path: &Path, node: &Node, birth: Timestamp) -> io::Result<()> {
+    lower_birthtime(path, node, birth)
 }

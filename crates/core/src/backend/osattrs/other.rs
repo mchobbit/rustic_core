@@ -2,6 +2,8 @@
 
 use std::{fs::File, io, path::Path};
 
+use jiff::Timestamp;
+
 use crate::backend::node::{ExtendedAttribute, Node, NodeType};
 
 pub(super) const FILE_FLAGS: Option<&str> = None;
@@ -58,4 +60,8 @@ pub(super) fn restore_acls(_path: &Path, _node: &Node) -> io::Result<()> {
 
 pub(super) fn restore_symlink_mode(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
+}
+
+pub(super) fn restore_birthtime(_path: &Path, _node: &Node, _birth: Timestamp) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "no birth times on this system"))
 }

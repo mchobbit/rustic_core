@@ -9,6 +9,7 @@ use std::{
     sync::Mutex,
 };
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Linux's `chattr(1)` flags (`FS_IOC_GETFLAGS`), those a user can set.
@@ -52,6 +53,10 @@ pub const DRAGONFLY_FILE_FLAGS: &str = "dragonfly.file_flags";
 /// `linux.inode_flags` doesn't carry: a 64-bit mask, 0 included, when it
 /// isn't archive alone.
 pub const LINUX_ZFS_DOS_FLAGS: &str = "linux.zfs_dos_flags";
+/// A file's birth (creation) time, on FreeBSD and NetBSD (`st_birthtim`)
+/// and illumos (ZFS's `crtime`): RFC 3339 in UTC with its nanoseconds, the
+/// form of a node's mtime.
+pub const UNIX_BIRTHTIME: &str = "unix.birthtime";
 
 /// The generic attributes restic and BackOtter's restic know: an attribute
 /// of another system is skipped quietly, an unknown one with a warning.
@@ -77,6 +82,7 @@ pub const KNOWN: &[&str] = &[
     NETBSD_ACL_NFS4,
     DRAGONFLY_FILE_FLAGS,
     LINUX_ZFS_DOS_FLAGS,
+    UNIX_BIRTHTIME,
 ];
 
 /// A node's generic attributes, by name.
@@ -177,6 +183,36 @@ impl GenericAttributes {
     pub fn set_true(&mut self, name: &str) {
         _ = self.0.insert(name.to_string(), true.into());
     }
+
+    /// The time (a birth time) in the attribute `name`, if there is one: any
+    /// RFC 3339 time, whatever its offset and number of fractional digits.
+    /// One that isn't is skipped, with a warning once per attribute name.
+    #[must_use]
+    pub fn timestamp(&self, name: &str) -> Option<Timestamp> {
+        match self.get(name)? {
+            Ok(t) => Some(t),
+            Err(err) => {
+                warn_malformed(name, &err);
+                None
+            }
+        }
+    }
+
+    /// Stores a time (a birth time) as the attribute `name`, as Go writes
+    /// one: in UTC, with its nanoseconds and no trailing zeros
+    /// (`"2001-09-09T01:46:40.5Z"`). Seconds 0 and -1, which file systems
+    /// without birth times report (UFS1, NetBSD's first FFS), get no
+    /// attribute, nor does a year before 0, which Go can't read.
+    pub fn set_timestamp(&mut self, name: &str, t: Timestamp) {
+        // 0000-01-01T00:00:00Z
+        const YEAR_0: Timestamp = Timestamp::constant(-62_167_219_200, 0);
+        // The second as C's tv_sec has it, rounded down.
+        let sec = t.as_second() - i64::from(t.subsec_nanosecond() < 0);
+        if matches!(sec, 0 | -1) || t < YEAR_0 {
+            return;
+        }
+        _ = self.0.insert(name.to_string(), t.to_string().into());
+    }
 }
 
 /// Warns that the generic attribute `name` can't be read, once per name, as
@@ -270,6 +306,50 @@ mod tests {
             let attrs: GenericAttributes =
                 serde_json::from_str(&format!(r#"{{"linux.zfs_dos_flags":{bad}}}"#)).unwrap();
             assert_eq!(attrs.number_u64(LINUX_ZFS_DOS_FLAGS), None, "{bad}");
+        }
+    }
+
+    // Birth times, in the form Go gives a node's mtime.
+    #[test]
+    fn birthtime_json() {
+        for (sec, nsec, json) in [
+            (1_000_000_000, 123_456_789, "2001-09-09T01:46:40.123456789Z"),
+            (1_000_000_000, 0, "2001-09-09T01:46:40Z"),
+            (1_000_000_000, 5, "2001-09-09T01:46:40.000000005Z"),
+            (-1_000_000_000, 500_000_000, "1938-04-24T22:13:20.5Z"),
+        ] {
+            let mut node = Node::default();
+            let t = Timestamp::new(sec, nsec).unwrap();
+            node.meta.generic_attributes.set_timestamp(UNIX_BIRTHTIME, t);
+            let text = serde_json::to_string(&node).unwrap();
+            assert!(
+                text.contains(&format!(r#""generic_attributes":{{"unix.birthtime":"{json}"}}"#)),
+                "{text}"
+            );
+            let node: Node = serde_json::from_str(&text).unwrap();
+            assert_eq!(node.meta.generic_attributes.timestamp(UNIX_BIRTHTIME), Some(t));
+        }
+
+        let attrs: GenericAttributes =
+            serde_json::from_str(r#"{"unix.birthtime":"2001-09-09T03:46:40.5+02:00"}"#).unwrap();
+        assert_eq!(
+            attrs.timestamp(UNIX_BIRTHTIME),
+            Some(Timestamp::new(1_000_000_000, 500_000_000).unwrap())
+        );
+
+        // tv_sec 0 and -1, whatever the nanoseconds, and a year Go can't read.
+        let mut attrs = GenericAttributes::default();
+        for (sec, nsec) in [(0, 0), (0, 999_999_999), (-1, 0), (0, -1), (-62_167_219_201, 0)] {
+            attrs.set_timestamp(UNIX_BIRTHTIME, Timestamp::new(sec, nsec).unwrap());
+        }
+        assert!(attrs.is_empty());
+        attrs.set_timestamp(UNIX_BIRTHTIME, Timestamp::new(-2, 999_999_999).unwrap());
+        assert!(!attrs.is_empty(), "tv_sec -2 not written");
+
+        for bad in ["1000000000", r#""x""#, r#""2001-09-09T01:46:40""#, "true"] {
+            let attrs: GenericAttributes =
+                serde_json::from_str(&format!(r#"{{"unix.birthtime":{bad}}}"#)).unwrap();
+            assert_eq!(attrs.timestamp(UNIX_BIRTHTIME), None, "{bad}");
         }
     }
 
