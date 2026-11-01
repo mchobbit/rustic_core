@@ -283,6 +283,52 @@ pub(crate) fn prepare_dir(path: &Path, node: &Node) -> io::Result<()> {
     os::prepare_dir_for_flags(path, file_flags(node).unwrap_or(0) & os::FLAGS_BEFORE_ENTRIES)
 }
 
+/// Whether listing a directory can leave its access time as it was: on Linux
+/// and Android, with `O_NOATIME` (where the user may ask for it). Elsewhere
+/// on Unix every listing moves it, unless the file system doesn't keep
+/// access times (read-only, `noatime`, ZFS's `atime=off`), so a backup
+/// doesn't scan the source for its size first (`--no-scan`), as BackOtter's
+/// restic doesn't: the scan would list each directory before the backup
+/// takes its metadata, and the snapshot would have the scan's time as its
+/// access time. Not a Unix (Windows): as stock rustic.
+pub(crate) const LISTING_KEEPS_ATIMES: bool =
+    cfg!(any(target_os = "linux", target_os = "android")) || !cfg!(unix);
+
+/// Clears the flags of the file at `path` (not following a symlink) that
+/// would keep the restore from rewriting, replacing or changing it, before
+/// the restore touches a file it finds in its way, as BackOtter's restic
+/// does: immutable, append-only and undeletable on the BSDs (`schg`,
+/// `uchg`, `sappnd`, `uappnd`, `sunlnk`, `uunlnk`) and ZFS's DOS read-only
+/// on FreeBSD (`urdonly`), immutable and append-only on Linux (`i`, `a`). The
+/// others stay as they are; the late flags pass gives the file its node's.
+/// Nothing there, or no such flags, is nothing to do. A failure (a
+/// securelevel above 0, not root) is only logged: what the restore does
+/// next to the file fails and says why.
+pub(crate) fn clear_restricting_flags(path: &Path) {
+    match os::clear_restricting_flags(path) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => {
+            debug!("restricting flags of {} not cleared: {err}", path.display());
+        }
+        _ => {}
+    }
+}
+
+/// [`clear_restricting_flags`] for `path` and, if it is a directory, all
+/// below it (not following symlinks), outermost first: before the restore
+/// removes it (`--delete`, or a node of another type in its place).
+pub(crate) fn clear_restricting_flags_tree(path: &Path) {
+    clear_restricting_flags(path);
+    if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+        return;
+    }
+    for entry in walkdir::WalkDir::new(path).min_depth(1).follow_links(false) {
+        match entry {
+            Ok(entry) => clear_restricting_flags(entry.path()),
+            Err(err) => debug!("restricting flags below {}: {err}", path.display()),
+        }
+    }
+}
+
 /// The extended attributes of `node` that [`restore_file_flags`] needs:
 /// btrfs's `btrfs.compression` on Linux, which setting the flags rewrites.
 pub(crate) fn flags_xattrs(node: &Node) -> Vec<ExtendedAttribute> {

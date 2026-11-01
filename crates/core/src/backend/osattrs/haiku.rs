@@ -306,6 +306,11 @@ pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) 
     Ok(())
 }
 
+/// No flags here keep a restore from changing a file.
+pub(super) fn clear_restricting_flags(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }

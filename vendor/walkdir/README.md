@@ -7,7 +7,11 @@ BackOtter's rustic_core and swapped in for crates.io's through
 read with `open(2)` with `O_NOATIME` (`src/noatime.rs`) instead of
 `std::fs::read_dir`, so that a backup leaves their access times as they were,
 as BackOtter's restic does; without permission for `O_NOATIME` (a directory
-the user doesn't own), they are read as before. Each change is marked
+the user doesn't own), they are read as before. And on every Unix a
+directory's metadata is taken before it is listed and kept in its entry
+(`DirEntry::keep_metadata`), for `metadata()` to give: where a listing
+moves the access time (no `O_NOATIME`: FreeBSD and the other BSDs,
+illumos, Haiku), a backup keeps the one it had. Each change is marked
 `BackOtter:`. Everything else is walkdir as released.
 A cross platform Rust library for efficiently walking a directory recursively.
 Comes with support for following symbolic links, controlling the number of

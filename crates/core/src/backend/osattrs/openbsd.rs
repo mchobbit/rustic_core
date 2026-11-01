@@ -4,7 +4,10 @@ use std::{io, os::openbsd::fs::MetadataExt, path::Path};
 
 use jiff::Timestamp;
 
-use super::{XattrErrors, c_path, check, chmod_symlink, set_flags_best_effort};
+use super::{
+    XattrErrors, bsd_flags::NETBSD_OPENBSD_RESTRICTING_FLAGS, c_path, check, chmod_symlink,
+    path_error, set_flags_best_effort,
+};
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType, generic_attributes::OPENBSD_FILE_FLAGS,
 };
@@ -86,6 +89,28 @@ pub(super) fn restore_file_flags(
 
 pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) -> io::Result<()> {
     Ok(())
+}
+
+/// Clears the flags of the file at `path` that keep a restore from
+/// rewriting, replacing or changing it
+/// ([`NETBSD_OPENBSD_RESTRICTING_FLAGS`]), leaving the others as they are;
+/// the late flags pass sets the node's.
+pub(super) fn clear_restricting_flags(path: &Path) -> io::Result<()> {
+    let flags = std::fs::symlink_metadata(path)?.st_flags();
+    if flags & NETBSD_OPENBSD_RESTRICTING_FLAGS == 0 {
+        return Ok(());
+    }
+    let p = c_path(path)?;
+    // SAFETY: p is a C string.
+    let r = unsafe {
+        chflagsat(
+            libc::AT_FDCWD,
+            p.as_ptr(),
+            flags & !NETBSD_OPENBSD_RESTRICTING_FLAGS,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    check(r).map(drop).map_err(|err| path_error("chflagsat", path, &err))
 }
 
 pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {

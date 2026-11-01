@@ -541,6 +541,13 @@ pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) 
     Ok(())
 }
 
+/// No flags keep a restore from changing a file here that it clears
+/// (illumos' immutable, appendonly and nounlink system attributes are left
+/// as they are: see BACKOTTER.md).
+pub(super) fn clear_restricting_flags(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 /// Gives the file at `path` the owner and group its SIDs have here, after
 /// the restore has given it its numbers, which may now be another SID's or
 /// none (nobody). A SID idmap can't map gives nobody (60001), with a

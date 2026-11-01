@@ -68,6 +68,9 @@ pub const ILLUMOS_XATTR_META: &str = "illumos.xattr_meta";
 /// An illumos file's ZFS project ID and whether it hands it down
 /// (`zfs project -p ID -s`), when it has either.
 pub const ILLUMOS_ZFS_PROJECT: &str = "illumos.zfs_project";
+/// A FreeBSD file's ZFS project ID and whether it hands it down (`zfs
+/// project -p ID -s`), when it has either, as [`ILLUMOS_ZFS_PROJECT`].
+pub const FREEBSD_ZFS_PROJECT: &str = "freebsd.zfs_project";
 /// The size in bytes of a regular file whose contents weren't backed up,
 /// because illumos quarantined it (`av_quarantined`) and no one, root
 /// included, could read it: its node has no contents and size 0.
@@ -109,6 +112,7 @@ pub const KNOWN: &[&str] = &[
     ILLUMOS_ZFS_PROJECT,
     ILLUMOS_UNREAD_SIZE,
     HAIKU_ATTRIBUTES,
+    FREEBSD_ZFS_PROJECT,
 ];
 
 /// A node's generic attributes, by name.

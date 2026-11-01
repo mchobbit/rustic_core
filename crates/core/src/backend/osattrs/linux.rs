@@ -418,6 +418,40 @@ pub(super) fn restore_zfs_dos_flags(path: &Path, typ: &NodeType, flags: u64) -> 
     restore_dos_flags_with(path, current, flags, |flags| set_dos_flags(&f, flags))
 }
 
+/// Clears immutable and append-only (`i`, `a`) on the regular file or
+/// directory at `path`, which keep a restore from rewriting, replacing or
+/// changing it, leaving its other flags as they are; the late flags pass
+/// sets the node's. Through `FS_IOC_FSSETXATTR`, which leaves btrfs's
+/// `btrfs.compression` property alone (`FS_IOC_SETFLAGS` rewrites it), or
+/// `FS_IOC_SETFLAGS` where the file system has no `FS_IOC_FSSETXATTR`.
+/// Symlinks and special files have no flags.
+pub(super) fn clear_restricting_flags(path: &Path) -> io::Result<()> {
+    let m = std::fs::symlink_metadata(path)?;
+    let typ = if m.is_dir() {
+        NodeType::Dir
+    } else if m.is_file() {
+        NodeType::File
+    } else {
+        return Ok(());
+    };
+    let f = open_for_flags(path, &typ, Some(&m))?;
+    let current = get_flags(&f).map_err(|err| path_error("FS_IOC_GETFLAGS", path, &err))?;
+    if current & (FS_IMMUTABLE_FL | FS_APPEND_FL) == 0 {
+        return Ok(());
+    }
+    let by_xattr = get_fsxattr(&f).and_then(|mut attr| {
+        attr.xflags &= !(FS_XFLAG_IMMUTABLE | FS_XFLAG_APPEND);
+        set_fsxattr(&f, &attr)
+    });
+    match by_xattr {
+        Err(err) if unsupported(&err) => {
+            set_flags(&f, current & !(FS_IMMUTABLE_FL | FS_APPEND_FL))
+                .map_err(|err| path_error("FS_IOC_SETFLAGS", path, &err))
+        }
+        result => result.map_err(|err| path_error("FS_IOC_FSSETXATTR", path, &err)),
+    }
+}
+
 /// The DOS flags a file that has `current` gets for `flags`: the
 /// [`ZFS_DOS_KEPT`] flags of `flags`, and immutable, append-only, nodump and
 /// reparse as they are, since `ZFS_IOC_SETDOSFLAGS` sets them all.
@@ -968,5 +1002,28 @@ mod tests {
         std::os::unix::fs::symlink(&path, dir.path().join("l")).unwrap();
         let lm = std::fs::symlink_metadata(dir.path().join("l")).unwrap();
         assert!(open_for_attrs(&dir.path().join("l"), &NodeType::File, &lm).is_none());
+    }
+
+    #[test]
+    fn clear_restricting_flags_clears_i_and_a_only() {
+        // Nothing there and a symlink: nothing to do.
+        assert!(clear_restricting_flags(Path::new("/nonexistent/bko")).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("nowhere", dir.path().join("l")).unwrap();
+        clear_restricting_flags(&dir.path().join("l")).unwrap();
+        // Setting i or a takes CAP_LINUX_IMMUTABLE (root), and a file
+        // system with flags.
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        let f = open_for_flags(&path, &NodeType::File, None).unwrap();
+        let Ok(current) = get_flags(&f) else { return };
+        if set_flags(&f, current | FS_IMMUTABLE_FL | FS_APPEND_FL | NODUMP).is_err() {
+            return;
+        }
+        clear_restricting_flags(&path).unwrap();
+        let after = get_flags(&f).unwrap();
+        assert_eq!(after & (FS_IMMUTABLE_FL | FS_APPEND_FL), 0, "{after:#x}");
+        assert_ne!(after & NODUMP, 0, "nodump cleared: {after:#x}");
+        std::fs::write(&path, b"rewritten").unwrap();
     }
 }

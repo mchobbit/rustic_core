@@ -48,6 +48,13 @@ pub struct DirEntry {
     /// The underlying inode number (Unix only).
     #[cfg(unix)]
     ino: u64,
+    /// BackOtter: the metadata of a directory, taken before it was listed
+    /// (`DirEntry::keep_metadata`): listing a directory moves its access
+    /// time where it can't be opened with `O_NOATIME` (every Unix but Linux,
+    /// and Linux for a directory the user doesn't own), and a backup keeps
+    /// the access time it had.
+    #[cfg(unix)]
+    listed_metadata: Option<fs::Metadata>,
     /// The underlying metadata (Windows only). We store this on Windows
     /// because this comes for free while reading a directory.
     ///
@@ -139,6 +146,11 @@ impl DirEntry {
 
     #[cfg(not(windows))]
     fn metadata_internal(&self) -> Result<fs::Metadata> {
+        // BackOtter: a directory's metadata from before it was listed.
+        #[cfg(unix)]
+        if let Some(md) = &self.listed_metadata {
+            return Ok(md.clone());
+        }
         if self.follow_link {
             fs::metadata(&self.path)
         } else {
@@ -181,6 +193,19 @@ impl DirEntry {
         self.ty.is_dir()
     }
 
+    /// BackOtter: takes the metadata of this entry, a directory about to be
+    /// listed, for [`DirEntry::metadata`] to give from now on: the listing
+    /// moves the directory's access time where it isn't read with
+    /// `O_NOATIME` (FreeBSD and every other Unix but Linux), and a backup
+    /// keeps the one it had, as BackOtter's restic, which takes a
+    /// directory's lstat before listing it. If it can't be taken, the
+    /// metadata is looked up when asked for, as before.
+    #[cfg(unix)]
+    pub(crate) fn keep_metadata(&mut self) {
+        self.listed_metadata = None;
+        self.listed_metadata = self.metadata_internal().ok();
+    }
+
     #[cfg(windows)]
     pub(crate) fn from_entry(
         depth: usize,
@@ -210,6 +235,7 @@ impl DirEntry {
             follow_link: false,
             depth,
             ino: ent.ino,
+            listed_metadata: None,
         })
     }
 
@@ -229,6 +255,7 @@ impl DirEntry {
             follow_link: false,
             depth,
             ino: ent.ino(),
+            listed_metadata: None,
         })
     }
 
@@ -286,6 +313,7 @@ impl DirEntry {
             follow_link: follow,
             depth,
             ino: md.ino(),
+            listed_metadata: None,
         })
     }
 
@@ -370,6 +398,7 @@ impl Clone for DirEntry {
             follow_link: self.follow_link,
             depth: self.depth,
             ino: self.ino,
+            listed_metadata: self.listed_metadata.clone(),
         }
     }
 
