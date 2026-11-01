@@ -719,23 +719,34 @@ pub(crate) fn set_metadata(
         osattrs::restore_owner(&target, node)
             .unwrap_or_else(|err| osattrs::warn_restore(path, &err));
     }
+    // BackOtter: the attributes osattrs keeps; ACLs after the mode. One
+    // warning naming each attribute not set, and its error.
+    let set_attributes = || {
+        dest.set_extended_attributes(path, &node.meta.extended_attributes)
+            .unwrap_or_else(|err| {
+                warn!(
+                    "restore {}: setting extended attributes failed: {err}",
+                    path.display()
+                );
+            });
+        osattrs::restore_attributes(&target, node)
+            .unwrap_or_else(|err| osattrs::warn_restore(path, &err));
+    };
+    // On Haiku before the mode: BFS wants write access to the file for
+    // each attribute it writes, which a restore by a user other than root
+    // wouldn't have on a read-only file.
+    if cfg!(target_os = "haiku") {
+        set_attributes();
+    }
     dest.set_permission(path, node)
         .unwrap_or_else(|_| warn!("restore {}: chmod failed.", path.display()));
-    // BackOtter: the attributes osattrs keeps; ACLs after the mode.
     if node.is_symlink() {
         osattrs::restore_symlink_mode(&target, node)
             .unwrap_or_else(|err| warn!("restore {}: {err}", path.display()));
     }
-    // BackOtter: one warning naming each attribute not set, and its error.
-    dest.set_extended_attributes(path, &node.meta.extended_attributes)
-        .unwrap_or_else(|err| {
-            warn!(
-                "restore {}: setting extended attributes failed: {err}",
-                path.display()
-            );
-        });
-    osattrs::restore_attributes(&target, node)
-        .unwrap_or_else(|err| osattrs::warn_restore(path, &err));
+    if !cfg!(target_os = "haiku") {
+        set_attributes();
+    }
     osattrs::restore_acls(&target, node)
         .unwrap_or_else(|err| osattrs::warn_restore(path, &err));
     // BackOtter: the birth time just before the times, which on FreeBSD and

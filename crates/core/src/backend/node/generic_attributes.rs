@@ -72,9 +72,14 @@ pub const ILLUMOS_ZFS_PROJECT: &str = "illumos.zfs_project";
 /// because illumos quarantined it (`av_quarantined`) and no one, root
 /// included, could read it: its node has no contents and size 0.
 pub const ILLUMOS_UNREAD_SIZE: &str = "illumos.unread_size";
+/// Haiku's file attributes (BFS), with their type codes, other than those
+/// of type `B_XATTR_TYPE`, which are the extended attributes: an object of
+/// `{"NAME":{"type":TYPE_CODE,"value":"BASE64"}}`.
+pub const HAIKU_ATTRIBUTES: &str = "haiku.attributes";
 
-/// The generic attributes restic and BackOtter's restic know: an attribute
-/// of another system is skipped quietly, an unknown one with a warning.
+/// The generic attributes restic and BackOtter's restic know, and Haiku's
+/// (restic doesn't run on Haiku): an attribute of another system is skipped
+/// quietly, an unknown one with a warning.
 pub const KNOWN: &[&str] = &[
     "windows.creation_time",
     "windows.file_attributes",
@@ -103,6 +108,7 @@ pub const KNOWN: &[&str] = &[
     ILLUMOS_XATTR_META,
     ILLUMOS_ZFS_PROJECT,
     ILLUMOS_UNREAD_SIZE,
+    HAIKU_ATTRIBUTES,
 ];
 
 /// A node's generic attributes, by name.

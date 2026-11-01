@@ -77,6 +77,7 @@ pub enum LocalDestinationErrorKind {
         target_os = "macos",
         target_os = "openbsd",
         target_os = "dragonfly",
+        target_os = "haiku",
         all(target_os = "android", target_pointer_width = "32")
     ))]
     /// `DeviceID` could not be converted to other type `{target}` of device `{device}`: `{source}`
@@ -486,10 +487,10 @@ impl LocalDestination {
         Ok(())
     }
 
-    #[cfg(target_os = "illumos")]
+    #[cfg(any(target_os = "illumos", target_os = "haiku"))]
     /// BackOtter: set extended attributes for `item` (relative to the base
-    /// path): on illumos, named attribute files (osattrs), which the xattr
-    /// crate doesn't support.
+    /// path): on illumos, named attribute files, and on Haiku, attributes of
+    /// type `B_XATTR_TYPE` (osattrs), which the xattr crate doesn't support.
     ///
     /// # Errors
     ///
@@ -499,11 +500,11 @@ impl LocalDestination {
         item: impl AsRef<Path>,
         extended_attributes: &[ExtendedAttribute],
     ) -> LocalDestinationResult<()> {
-        osattrs::set_illumos_xattrs(&self.path(item), extended_attributes)
+        osattrs::set_native_xattrs(&self.path(item), extended_attributes)
             .map_err(LocalDestinationErrorKind::XattrsNotSet)
     }
 
-    #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
+    #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
     /// Set extended attributes for `item` (relative to the base path)
     ///
     /// # Arguments
@@ -715,10 +716,12 @@ impl LocalDestination {
                     target_os = "macos",
                     target_os = "openbsd",
                     target_os = "dragonfly",
+                    target_os = "haiku",
                     all(target_os = "android", target_pointer_width = "32")
                 )))]
                 let device = *device;
-                #[cfg(any(target_os = "macos", target_os = "openbsd"))]
+                // BackOtter: Haiku's dev_t is an i32 too.
+                #[cfg(any(target_os = "macos", target_os = "openbsd", target_os = "haiku"))]
                 let device = i32::try_from(*device).map_err(|err| {
                     LocalDestinationErrorKind::DeviceIdConversionFailed {
                         target: "i32".to_string(),
@@ -746,10 +749,12 @@ impl LocalDestination {
                     target_os = "macos",
                     target_os = "openbsd",
                     target_os = "dragonfly",
+                    target_os = "haiku",
                     all(target_os = "android", target_pointer_width = "32")
                 )))]
                 let device = *device;
-                #[cfg(any(target_os = "macos", target_os = "openbsd"))]
+                // BackOtter: Haiku's dev_t is an i32 too.
+                #[cfg(any(target_os = "macos", target_os = "openbsd", target_os = "haiku"))]
                 let device = i32::try_from(*device).map_err(|err| {
                     LocalDestinationErrorKind::DeviceIdConversionFailed {
                         target: "i32".to_string(),
