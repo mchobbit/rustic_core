@@ -249,6 +249,8 @@ fn test_backup_stdin_command(
     let mut content = Vec::new();
     repo.dump(&node, &mut content)?;
     assert_eq!(content, b"test\n");
+    // BackOtter: the size is the bytes read, as restic records it
+    assert_eq!(node.meta.size, 5);
     Ok(())
 }
 
