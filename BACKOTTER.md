@@ -520,6 +520,13 @@ that either program restores what the other backed up.
   them. Now all 64 bytes are hashed, as in restic, and the chunks are the
   same. A file that met the case is cut differently from an older rustic
   snapshot of it, so its data after that cut is stored again once.
+- A file's size in the snapshot is the number of bytes the backup read
+  (`archiver/file_archiver.rs`), as restic's is, not the size `lstat` gave
+  when the file was listed. A file cut short (or grown) while it was read
+  kept its listed size, which its content no longer had, and the tools
+  restored it to different lengths: restic to that size, padded with zeros,
+  rustic to the content's. A file backed up from stdin had size 0; it now
+  has the length read.
 - The version reads `X.Y.Z+backotter.N`.
 
 The system calls need `unsafe`, which the workspace lints now deny (not

@@ -170,6 +170,10 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
 
         let mut node = node;
         node.content = Some(content);
+        // BackOtter: the size is what was read, as restic's is, not what
+        // lstat said; a file cut short or grown since then still has a size
+        // that is its content's length (and stdin, which had none, gets one).
+        node.meta.size = filesize;
         Ok((node, filesize))
     }
 
