@@ -146,9 +146,14 @@ impl<R: Read + Send> Iterator for ChunkIter<R> {
             return if vec.is_empty() { None } else { Some(Ok(vec)) };
         }
 
-        _ = self
-            .rabin
-            .reset_and_prefill_window(&mut vec[vec.len() - 64..vec.len()].iter().copied());
+        // Hash all of the last 64 bytes (the window) before the minimum size, as
+        // restic's chunker does: rustic_cdc's reset_and_prefill_window takes
+        // only 63 of them, leaving the byte before the minimum size out of the
+        // hash, which could cut in [min_size, min_size + 63] where restic doesn't.
+        self.rabin.reset();
+        for &byte in &vec[vec.len() - 64..] {
+            self.rabin.slide(byte);
+        }
 
         loop {
             if vec.len() >= self.max_size {
@@ -382,5 +387,58 @@ mod tests {
 
         let chunk = chunker.next().unwrap().unwrap();
         assert_eq!(MIN_SIZE, chunk.len());
+    }
+
+    /// The chunk lengths of `data` with the given split mask, minimum and
+    /// maximum size (the mask may be smaller than the minimum size here).
+    fn lengths(data: Vec<u8>, split_mask: u64, min: usize, max: usize) -> Vec<usize> {
+        let rabin = Rabin64::new_with_polynom(6, &0x003D_A335_8B4D_C173);
+        let mut chunker = ChunkIter::new(rabin, min, min, max, Cursor::new(data), 0).unwrap();
+        chunker.split_mask = split_mask;
+        chunker.map(|chunk| chunk.unwrap().len()).collect()
+    }
+
+    /// `n` bytes from a xorshift generator.
+    fn xorshift(n: usize, mut state: u64) -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 56) as u8
+            })
+            .collect()
+    }
+
+    // The lengths restic's chunker (github.com/restic/chunker v0.4.0) gives
+    // the same data: the window at the minimum size holds all of its last 64
+    // bytes, the one before the minimum size included.
+    #[test]
+    fn chunk_like_restic() {
+        const KB: usize = constants::KB;
+        assert_eq!(
+            lengths(xorshift(256 * KB, 1), 127, 8 * KB, 64 * KB),
+            [
+                8254, 8216, 8371, 8288, 8388, 8413, 8232, 8495, 8321, 8324, 8324, 8689, 8262, 8593,
+                8404, 8194, 8273, 8292, 8390, 8459, 8422, 8195, 8206, 8287, 8314, 8192, 8375, 8608,
+                8538, 8306, 8356, 3163
+            ]
+        );
+
+        let mut zeros = vec![0; 3 * MIN_SIZE];
+        zeros[2 * MIN_SIZE - 1] = 1;
+        assert_eq!(
+            lengths(zeros, SIZE as u64 - 1, MIN_SIZE, MAX_SIZE),
+            [MIN_SIZE, MIN_SIZE + 3, MIN_SIZE - 3]
+        );
+
+        for (offset, want) in [(-65, 0), (-64, 1), (-63, 2), (-2, 0), (-1, 1), (0, 0), (64, 0)] {
+            let mut zeros = vec![0; 64 * KB];
+            zeros[(8 * KB).checked_add_signed(offset).unwrap()] = 0x5a;
+            let mut lengths = lengths(zeros, 127, 8 * KB, 64 * KB);
+            assert_eq!(lengths.remove(0), 8 * KB + want, "byte at {offset}");
+            assert_eq!(lengths.pop(), Some(8 * KB - want), "byte at {offset}");
+            assert!(lengths.iter().all(|&l| l == 8 * KB), "byte at {offset}");
+        }
     }
 }

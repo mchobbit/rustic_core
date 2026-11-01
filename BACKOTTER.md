@@ -509,6 +509,17 @@ that either program restores what the other backed up.
   (`error getting user from uid 0: ENOENT`). Now it warns once per id. A
   name not found on restore falls back to the saved id, as the warning
   now says (it said UID 0).
+- The chunker cuts where restic's does (`chunker/rabin.rs`). It hashed only
+  63 of the 64 bytes before a chunk's minimum size (rustic_cdc's
+  `reset_and_prefill_window`), leaving out the last of them, which restic
+  hashes, so a cut in the 64 bytes after the minimum size could differ: a
+  file of zeros with one other byte just before the minimum size of a chunk
+  (likelier in sparse images) was cut at the minimum size where restic cut
+  a few bytes later, and every later blob of the file differed. Either tool
+  restored the other's snapshots, but the file's data wasn't shared between
+  them. Now all 64 bytes are hashed, as in restic, and the chunks are the
+  same. A file that met the case is cut differently from an older rustic
+  snapshot of it, so its data after that cut is stored again once.
 - The version reads `X.Y.Z+backotter.N`.
 
 The system calls need `unsafe`, which the workspace lints now deny (not
