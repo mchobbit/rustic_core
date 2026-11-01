@@ -127,6 +127,11 @@ that either program restores what the other backed up.
        system). `EINVAL`, `ENOTSUP`, `EOPNOTSUPP` or `ENOTTY` (a file system
        that can't answer) leave it to the blocks: holes. Any other error (a
        file that can't be opened, `ENXIO`, `EACCES`, ...) means none.
+       On Linux's JFS and nilfs2 (`statfs` `f_type` `0x3153464a` and
+       `0x3434`), whose `SEEK_HOLE` is the kernel's generic one and always
+       answers the size, the probe isn't made and the blocks decide too:
+       neither compresses nor keeps data in the inode, so fewer blocks than
+       the size mean holes.
     4. On Linux the probe uses the descriptor the file is opened with for
        its flags and project ID, once per file; if that open failed, the
        file has none. Elsewhere the file is opened for the probe, with
@@ -142,13 +147,6 @@ that either program restores what the other backed up.
     On ZFS a probe of a file with unwritten changes waits for them to be
     written (a transaction group), as it does for BackOtter's restic, which
     probes the same files.
-    On Linux's JFS and nilfs2, and any other Linux file system that answers
-    `SEEK_HOLE` with the kernel's generic one, the probe finds no hole
-    before the end of any file, so no file there is marked, in both tools
-    alike: a file with holes is backed up as a whole (its holes read as
-    zeros) and restored with the same contents but allocated in full.
-    That is accepted: telling such a file system from a compressing one
-    (where none means none) would take a list of file system types.
   - `unix.birthtime`: a file's birth (creation) time, on FreeBSD and NetBSD
     (`st_birthtim`, every type of file) and illumos (ZFS's `crtime` from
     the `SUNWattr_rw` view, regular files and directories), as a string in
@@ -224,9 +222,11 @@ that either program restores what the other backed up.
   ends at the size `fstat` gives then: a file cut short there gives the
   zeros up to its new end and no more, and at or past it the rest is read
   plainly (the end of file). Other files, and every file elsewhere,
-  are read plainly. Each all-zero chunk (holes give many, all of the
-  chunker's minimum size) is hashed once per file and length: the same
-  bytes give the same ID. The rolling hash isn't skipped over long zero
+  are read plainly. On JFS and nilfs2 (`unix.sparse`, above),
+  `SEEK_HOLE` gives the size, so a file there is read whole, holes and
+  all. Each all-zero chunk (holes give many, all of the chunker's
+  minimum size) is hashed once per file and length: the same bytes give
+  the same ID. The rolling hash isn't skipped over long zero
   runs: all-zero data already gives a boundary at the minimum chunk size,
   with no rolling over its bytes.
 - A file is restored sparse if, and only if, it is marked `unix.sparse` (or
