@@ -31,7 +31,9 @@ pub(super) fn maybe_sparse(size: u64, blocks: u64) -> bool {
 /// - `first_hole` gives the offset of the first hole (the size where there
 ///   is none): holes if it's before the end;
 /// - `first_hole` fails with `EINVAL`, `ENOTSUP`, `EOPNOTSUPP` or `ENOTTY`
-///   (a file system that can't answer): the blocks decide, so holes;
+///   (a file system that can't answer): the blocks decide, so holes; on
+///   Linux's JFS and nilfs2 ([`GENERIC_SEEK_HOLE`]) it fails so, without a
+///   probe;
 /// - it fails otherwise (the file couldn't be opened, `ENXIO`, `EACCES`,
 ///   ...): no holes.
 ///
@@ -62,15 +64,18 @@ pub(super) fn decide(
 /// Whether the regular file at `path`, with metadata `m` (its lstat), has
 /// holes, by [`decide`]. On Linux `SEEK_HOLE` goes to `f`, the file as
 /// opened for its flags (`open_for_attrs`): without it the file couldn't be
-/// opened, and is taken to have none. Elsewhere the file is opened here.
+/// opened, and is taken to have none; on JFS and nilfs2, whose `SEEK_HOLE`
+/// always answers the size, it isn't asked, and the blocks decide
+/// ([`generic_seek_hole`]). Elsewhere the file is opened here.
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 pub(super) fn has_holes(path: &Path, m: &Metadata, f: Option<&File>) -> bool {
     #[cfg(target_os = "linux")]
-    let first_hole = Some(|| {
-        f.map_or_else(
-            || Err(io::Error::other(format!("{} not opened", path.display()))),
-            seek_hole,
-        )
+    let first_hole = Some(|| match f {
+        None => Err(io::Error::other(format!("{} not opened", path.display()))),
+        // SEEK_HOLE would answer the size: the file system can't answer,
+        // and the blocks decide.
+        Some(f) if generic_seek_hole(f) => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+        Some(f) => seek_hole(f),
     });
     #[cfg(any(
         target_os = "android",
@@ -94,6 +99,38 @@ pub(super) fn has_holes(path: &Path, m: &Metadata, f: Option<&File>) -> bool {
     )))]
     let first_hole = None::<fn() -> io::Result<u64>>;
     decide(m.len(), m.blocks(), first_hole)
+}
+
+/// statfs(2)'s `f_type` of the Linux file systems whose `SEEK_HOLE` is the
+/// kernel's generic one, which finds no hole before the size (Linux 6.12,
+/// 6.17): JFS (`JFS_SUPER_MAGIC`) and nilfs2 (`NILFS_SUPER_MAGIC`). Neither
+/// compresses nor keeps data in the inode, so their blocks tell holes apart:
+/// fewer blocks than the size mean holes.
+#[cfg(any(test, target_os = "linux"))]
+const GENERIC_SEEK_HOLE: [u32; 2] = [0x3153_464a, 0x3434];
+
+/// Whether the file system whose statfs(2) `f_type` is `f_type` can't find
+/// holes with `SEEK_HOLE` ([`GENERIC_SEEK_HOLE`]).
+#[cfg(any(test, target_os = "linux"))]
+fn generic_seek_hole_type(f_type: u32) -> bool {
+    GENERIC_SEEK_HOLE.contains(&f_type)
+}
+
+/// Whether the file `f` is on a file system whose `SEEK_HOLE` can't find
+/// holes ([`GENERIC_SEEK_HOLE`]), by `fstatfs(2)`; not if that fails.
+#[cfg(target_os = "linux")]
+fn generic_seek_hole(f: &File) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: f is an open file, and st is written by fstatfs.
+    if unsafe { libc::fstatfs(f.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        debug!("fstatfs: {}", io::Error::last_os_error());
+        return false;
+    }
+    // SAFETY: fstatfs succeeded.
+    let st = unsafe { st.assume_init() };
+    u32::try_from(st.f_type).is_ok_and(generic_seek_hole_type)
 }
 
 /// The offset of the first hole in the regular file `f`, which is its size
@@ -240,8 +277,9 @@ pub(super) fn backup_reader(f: File, sparse: bool) -> Box<dyn io::Read + Send> {
 /// by `SEEK_HOLE`. The file marked when it was listed may have been replaced
 /// since, or compressed by its file system: macOS answers `ENXIO` to
 /// `SEEK_HOLE` and `SEEK_DATA` at every offset of a file compressed by the
-/// file system (`UF_COMPRESSED`), whose data plain reading gives. Moves the
-/// offset of `f`.
+/// file system (`UF_COMPRESSED`), whose data plain reading gives. On JFS and
+/// nilfs2 `SEEK_HOLE` gives the size, so a file there is read whole, holes
+/// and all. Moves the offset of `f`.
 #[cfg(any(
     target_os = "linux",
     target_os = "android",
@@ -658,6 +696,54 @@ mod tests {
             // A file system that takes fallocate without allocating (ZFS).
             return;
         }
+        assert!(!has_holes(&path, &m, Some(&File::open(&path).unwrap())));
+    }
+
+    // On JFS and nilfs2, SEEK_HOLE finds no hole before the size, so the
+    // blocks decide.
+    #[test]
+    fn generic_seek_hole_types() {
+        for (name, f_type, want) in [
+            ("JFS", 0x3153_464a, true),
+            ("nilfs2", 0x3434, true),
+            ("ext4", 0xef53, false),
+            ("tmpfs", 0x0102_1994, false),
+            ("ZFS", 0x2fc1_2fc1, false),
+        ] {
+            assert_eq!(generic_seek_hole_type(f_type), want, "{name}");
+        }
+    }
+
+    /// `BKO_TEST_GENERIC_SEEK_HOLE_DIR` names a directory on JFS or nilfs2:
+    /// a file with holes there is marked sparse though `SEEK_HOLE` finds
+    /// none, and read plainly.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn has_holes_generic_seek_hole() {
+        let Some(dir) = std::env::var_os("BKO_TEST_GENERIC_SEEK_HOLE_DIR") else {
+            eprintln!("BKO_TEST_GENERIC_SEEK_HOLE_DIR not set");
+            return;
+        };
+        let dir = tempfile::Builder::new().prefix("bko-").tempdir_in(dir).unwrap();
+        let fill = |name: &str, off: u64, data: &[u8]| {
+            let path = dir.path().join(name);
+            let mut f = File::create(&path).unwrap();
+            _ = f.seek(SeekFrom::Start(off)).unwrap();
+            f.write_all(data).unwrap();
+            drop(f);
+            let m = std::fs::symlink_metadata(&path).unwrap();
+            (path, m)
+        };
+
+        let (path, m) = fill("holes", 32 << 20, b"y");
+        let f = File::open(&path).unwrap();
+        assert!(generic_seek_hole(&f), "not on JFS or nilfs2");
+        assert_eq!(seek_hole(&f).unwrap(), m.len(), "not a generic SEEK_HOLE");
+        assert!(maybe_sparse(m.len(), m.blocks()), "no holes: {} blocks", m.blocks());
+        assert!(has_holes(&path, &m, Some(&File::open(&path).unwrap())));
+        assert!(!holes_now(&f));
+
+        let (path, m) = fill("dense", 0, &vec![0; 1 << 20]);
         assert!(!has_holes(&path, &m, Some(&File::open(&path).unwrap())));
     }
 
