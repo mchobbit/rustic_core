@@ -139,6 +139,13 @@ that either program restores what the other backed up.
     On ZFS a probe of a file with unwritten changes waits for them to be
     written (a transaction group), as it does for BackOtter's restic, which
     probes the same files.
+    On Linux's JFS and nilfs2, and any other Linux file system that answers
+    `SEEK_HOLE` with the kernel's generic one, the probe finds no hole
+    before the end of any file, so no file there is marked, in both tools
+    alike: a file with holes is backed up as a whole (its holes read as
+    zeros) and restored with the same contents but allocated in full.
+    That is accepted: telling such a file system from a compressing one
+    (where none means none) would take a list of file system types.
   - `unix.birthtime`: a file's birth (creation) time, on FreeBSD and NetBSD
     (`st_birthtim`, every type of file) and illumos (ZFS's `crtime` from
     the `SUNWattr_rw` view, regular files and directories), as a string in
