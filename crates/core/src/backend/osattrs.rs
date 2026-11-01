@@ -1,8 +1,8 @@
 //! BackOtter: metadata some systems keep that rustic otherwise doesn't save:
 //! file flags (Linux's `chattr(1)` flags, the BSDs' `chflags(1)` flags,
-//! illumos' system attributes), ACLs (FreeBSD's, NetBSD's and illumos') and
-//! FreeBSD's and NetBSD's system extended attributes. They are kept as
-//! restic generic attributes
+//! illumos' system attributes), ACLs (FreeBSD's, NetBSD's and illumos'),
+//! FreeBSD's and NetBSD's system extended attributes and Haiku's typed file
+//! attributes. They are kept as restic generic attributes
 //! ([`generic_attributes`](super::node::generic_attributes)), in the same
 //! form as BackOtter's restic.
 //!
@@ -49,6 +49,7 @@ mod bsd_flags;
 mod freebsd_acl;
 #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
 mod freebsd_netbsd;
+mod haiku_attrs;
 mod illumos_acl;
 #[cfg(target_os = "illumos")]
 mod illumos_idmap;
@@ -66,6 +67,10 @@ use dragonfly as os;
 mod freebsd;
 #[cfg(target_os = "freebsd")]
 use freebsd as os;
+#[cfg(target_os = "haiku")]
+mod haiku;
+#[cfg(target_os = "haiku")]
+use haiku as os;
 #[cfg(target_os = "illumos")]
 mod illumos;
 #[cfg(target_os = "illumos")]
@@ -85,6 +90,7 @@ use openbsd as os;
 #[cfg(not(any(
     target_os = "dragonfly",
     target_os = "freebsd",
+    target_os = "haiku",
     target_os = "illumos",
     target_os = "linux",
     target_os = "netbsd",
@@ -94,6 +100,7 @@ mod other;
 #[cfg(not(any(
     target_os = "dragonfly",
     target_os = "freebsd",
+    target_os = "haiku",
     target_os = "illumos",
     target_os = "linux",
     target_os = "netbsd",
@@ -678,8 +685,8 @@ pub(crate) fn restore_owner(path: &Path, node: &Node) -> io::Result<()> {
 
 /// Restores the attributes that go along with the extended attributes
 /// (FreeBSD's and NetBSD's system extended attributes, illumos' extended
-/// attributes' own metadata and ZFS project IDs), and warns once about each
-/// generic attribute that isn't known at all.
+/// attributes' own metadata and ZFS project IDs, Haiku's typed attributes),
+/// and warns once about each generic attribute that isn't known at all.
 ///
 /// # Errors
 ///
@@ -837,28 +844,29 @@ pub(crate) fn restore_symlink_mode(path: &Path, node: &Node) -> io::Result<()> {
     os::restore_symlink_mode(path, node)
 }
 
-/// The extended attributes of the file at `path`, on illumos: named
-/// attribute files (`runat(1)`), which the xattr crate doesn't support.
-/// Elsewhere they go through the xattr crate.
+/// The extended attributes of the file at `path`, where the xattr crate
+/// doesn't support them: on illumos, named attribute files (`runat(1)`); on
+/// Haiku, the file's attributes of type `B_XATTR_TYPE`. Elsewhere they go
+/// through the xattr crate.
 ///
 /// # Errors
 ///
-/// * If they can't be read, or this isn't illumos.
-#[cfg_attr(not(target_os = "illumos"), allow(dead_code))]
-pub(crate) fn illumos_xattrs(path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
+/// * If they can't be read, or this is neither illumos nor Haiku.
+#[cfg_attr(not(any(target_os = "illumos", target_os = "haiku")), allow(dead_code))]
+pub(crate) fn native_xattrs(path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
     os::xattrs(path)
 }
 
 /// Gives the file at `path` exactly the extended attributes `attrs`, on
-/// illumos. One that can't be set or removed doesn't keep the others from
-/// being set or removed.
+/// illumos and Haiku. One that can't be set or removed doesn't keep the
+/// others from being set or removed.
 ///
 /// # Errors
 ///
 /// * Each attribute that couldn't be set or removed; or that the file system
-///   has none, or this isn't illumos.
-#[cfg_attr(not(target_os = "illumos"), allow(dead_code))]
-pub(crate) fn set_illumos_xattrs(
+///   has none, or this is neither illumos nor Haiku.
+#[cfg_attr(not(any(target_os = "illumos", target_os = "haiku")), allow(dead_code))]
+pub(crate) fn set_native_xattrs(
     path: &Path,
     attrs: &[ExtendedAttribute],
 ) -> Result<(), XattrErrors> {
@@ -874,7 +882,7 @@ pub(crate) fn set_illumos_xattrs(
 /// # Errors
 ///
 /// * If they can't be listed.
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
 pub(crate) fn xattr_list(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
     #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     let names = freebsd_netbsd::user_extattr_names(path)?
@@ -894,7 +902,7 @@ pub(crate) fn xattr_list(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
 /// Linux, bcachefs' `bcachefs_effective.*` aren't kept: they show the
 /// options a file has, its own (`bcachefs.*`, kept) or inherited, and its
 /// project ID, and setting one does nothing.
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
 pub(crate) fn xattr_node_name(name: &std::ffi::OsStr) -> Option<String> {
     let name = name.to_string_lossy();
     if cfg!(any(target_os = "freebsd", target_os = "netbsd")) {
@@ -908,12 +916,12 @@ pub(crate) fn xattr_node_name(name: &std::ffi::OsStr) -> Option<String> {
 
 /// The prefix of bcachefs' extended attributes that show a file's options as
 /// they apply to it, whether its own or inherited ([`xattr_node_name`]).
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
 pub(crate) const BCACHEFS_EFFECTIVE: &str = "bcachefs_effective.";
 
 /// The name the xattr crate takes for a node's extended attribute; see
 /// [`xattr_node_name`].
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos")))]
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
 pub(crate) fn xattr_os_name(name: &str) -> String {
     if cfg!(any(target_os = "freebsd", target_os = "netbsd")) {
         format!("user.{name}")
@@ -956,6 +964,7 @@ fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
 #[cfg(any(
     target_os = "dragonfly",
     target_os = "freebsd",
+    target_os = "haiku",
     target_os = "illumos",
     target_os = "netbsd",
     target_os = "openbsd"
@@ -1000,6 +1009,7 @@ fn chmod_symlink(path: &Path, node: &Node) -> io::Result<()> {
     not(any(
         target_os = "dragonfly",
         target_os = "freebsd",
+        target_os = "haiku",
         target_os = "illumos",
         target_os = "linux",
         target_os = "netbsd",

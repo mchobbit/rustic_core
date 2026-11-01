@@ -218,15 +218,16 @@ impl LocalSourceSaveOptions {
     }
 
     /// BackOtter: list [`ExtendedAttribute`] for a [`Node`] located at
-    /// `path`: on illumos, named attribute files (osattrs), which the xattr
-    /// crate doesn't support.
+    /// `path`: on illumos, named attribute files, and on Haiku, attributes
+    /// of type `B_XATTR_TYPE` (osattrs), which the xattr crate doesn't
+    /// support.
     ///
     /// # Errors
     ///
     /// * If they couldn't be listed or read
-    #[cfg(target_os = "illumos")]
+    #[cfg(any(target_os = "illumos", target_os = "haiku"))]
     fn xattrs(path: &Path) -> IgnoreResult<Vec<ExtendedAttribute>> {
-        osattrs::illumos_xattrs(path).map_err(|err| IgnoreErrorKind::ErrorXattr {
+        osattrs::native_xattrs(path).map_err(|err| IgnoreErrorKind::ErrorXattr {
             path: path.to_path_buf(),
             source: err,
         })
@@ -241,7 +242,7 @@ impl LocalSourceSaveOptions {
     /// # Errors
     ///
     /// * If Xattr couldn't be listed or couldn't be read
-    #[cfg(not(any(target_os = "openbsd", target_os = "illumos")))]
+    #[cfg(not(any(target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
     fn xattrs(path: &Path) -> IgnoreResult<Vec<ExtendedAttribute>> {
         // BackOtter: no warning for each file where the xattr crate has no
         // support.
