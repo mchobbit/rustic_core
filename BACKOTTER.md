@@ -585,8 +585,12 @@ that either program restores what the other backed up.
   those directories' own metadata (their `lstat`). The paths rustic
   archives may not be where those directories are (`--as-path`, stdin), so
   this is left as it is; it only matters for what a restore of the whole
-  snapshot gives the directories above the backed-up one. The backed-up
-  directory itself has its own metadata (see above).
+  snapshot gives the directories above the backed-up one: a restore sets
+  no times for a node without an mtime (the directory keeps those the
+  restore gave it), in either tool; restic-bko used to set the zero time,
+  which DragonFly refuses. A node without an atime gets its mtime as its
+  atime, in either tool. The backed-up directory itself has its own
+  metadata (see above).
 - Partial restores (`--glob`, `--iglob`): directories above the matches
   that aren't matched themselves aren't streamed, so the restore creates
   them without any metadata, casefolding included, as stock rustic does.
