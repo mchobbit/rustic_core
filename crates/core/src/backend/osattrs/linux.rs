@@ -619,12 +619,31 @@ pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
 }
 
 /// Restores the project ID, along with the extended attributes. A project
-/// ID of 0 is the default, and left as it is.
+/// ID of 0 is the default, and left as it is; but on bcachefs a file without
+/// one gets 0, where it inherited another from its directory (whose project
+/// ID the restore gives it before its entries, [`prepare_dir_for_options`]),
+/// as in BackOtter's restic.
 pub(super) fn restore_attributes(path: &Path, node: &Node) -> io::Result<()> {
     let projid = match node.meta.generic_attributes.number(LINUX_PROJECT_ID) {
-        None | Some(0) => return Ok(()),
+        None | Some(0) => {
+            if matches!(node.node_type, NodeType::File | NodeType::Dir)
+                && is_bcachefs_path(path)
+                && let Err(err) =
+                    open_for_flags(path, &node.node_type, None).and_then(|f| set_projid(path, &f, 0))
+            {
+                debug!("project ID 0 not restored on {}: {err}", path.display());
+            }
+            return Ok(());
+        }
         Some(projid) => projid,
     };
+    let f = open_for_flags(path, &node.node_type, None)?;
+    set_projid(path, &f, projid)
+}
+
+/// Gives the regular file or directory `f`, at `path`, the project ID
+/// `projid`, unless it has it already ([`file_projid`]).
+fn set_projid(path: &Path, f: &File, projid: u32) -> io::Result<()> {
     let classify = |op: &str, err: io::Error| {
         if unsupported(&err) {
             Unsupported::error(LINUX_PROJECT_ID, 0, err)
@@ -632,13 +651,67 @@ pub(super) fn restore_attributes(path: &Path, node: &Node) -> io::Result<()> {
             path_error(op, path, &err)
         }
     };
-    let f = open_for_flags(path, &node.node_type, None)?;
-    let mut attr = get_fsxattr(&f).map_err(|err| classify("FS_IOC_FSGETXATTR", err))?;
-    if file_projid(&f, &attr) != projid {
+    let mut attr = get_fsxattr(f).map_err(|err| classify("FS_IOC_FSGETXATTR", err))?;
+    if file_projid(f, &attr) != projid {
         attr.projid = projid;
-        set_fsxattr(&f, &attr).map_err(|err| classify("FS_IOC_FSSETXATTR", err))?;
+        set_fsxattr(f, &attr).map_err(|err| classify("FS_IOC_FSSETXATTR", err))?;
     }
     Ok(())
+}
+
+/// Whether `path` (followed, if a symlink) is on bcachefs.
+fn is_bcachefs_path(path: &Path) -> bool {
+    let Ok(path) = super::c_path(path) else {
+        return false;
+    };
+    let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: path is a C string; statfs writes a struct statfs to the pointer.
+    if unsafe { libc::statfs(path.as_ptr(), st.as_mut_ptr()) } < 0 {
+        return false;
+    }
+    // SAFETY: statfs succeeded, so it wrote the struct.
+    let st = unsafe { st.assume_init() };
+    u32::try_from(st.f_type).is_ok_and(|t| t == BCACHEFS_SUPER_MAGIC)
+}
+
+/// Whether the extended attribute `name` is one of a bcachefs file's own
+/// options (`bcachefs.compression`, `.data_replicas`, `.background_target`,
+/// `.nocow` and the rest) that the restore sets.
+fn is_bcachefs_option(name: &str) -> bool {
+    name.starts_with("bcachefs.") && super::xattr_node_name(name.as_ref()).is_some()
+}
+
+/// Gives the directory at `path`, which the restore has just created or
+/// found empty, the options its node has that bcachefs passes to the
+/// entries a directory gets after they are set: its own `bcachefs.*`
+/// options and its project ID, 0 where it has none. Its entries then
+/// inherit them as in the original, so their data is stored as it was
+/// (compressed, replicated, on the same targets) and their project ID comes
+/// back inherited. Only on bcachefs; errors are left for the directory's
+/// metadata, which sets them all again, to report.
+pub(super) fn prepare_dir_for_options(path: &Path, node: &Node) {
+    if !matches!(node.node_type, NodeType::Dir) || !is_bcachefs_path(path) {
+        return;
+    }
+    let f = match open_for_flags(path, &NodeType::Dir, None) {
+        Ok(f) => f,
+        Err(err) => {
+            debug!("options of {} not set early: {err}", path.display());
+            return;
+        }
+    };
+    for ExtendedAttribute { name, value } in &node.meta.extended_attributes {
+        if !is_bcachefs_option(name) {
+            continue;
+        }
+        if let Err(err) = set_xattr(&f, name, value.as_deref().unwrap_or_default()) {
+            debug!("{name} of {} not set early: {err}", path.display());
+        }
+    }
+    let projid = node.meta.generic_attributes.number(LINUX_PROJECT_ID).unwrap_or(0);
+    if let Err(err) = set_projid(path, &f, projid) {
+        debug!("project ID of {} not set early: {err}", path.display());
+    }
 }
 
 pub(super) fn restore_acls(_path: &Path, _node: &Node) -> io::Result<()> {
@@ -669,9 +742,10 @@ pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::{cell::RefCell, ffi::OsStr, os::unix::fs::PermissionsExt};
 
     use super::*;
+    use crate::backend::node::Metadata as NodeMetadata;
 
     const EXTENTS: u32 = 0x0008_0000; // FS_EXTENT_FL, ext4's own
     const COMPR: u32 = 0x0000_0004;
@@ -1025,5 +1099,95 @@ mod tests {
         assert_eq!(after & (FS_IMMUTABLE_FL | FS_APPEND_FL), 0, "{after:#x}");
         assert_ne!(after & NODUMP, 0, "nodump cleared: {after:#x}");
         std::fs::write(&path, b"rewritten").unwrap();
+    }
+
+    #[test]
+    fn bcachefs_options_and_own_project() {
+        assert!(is_bcachefs_option("bcachefs.compression"));
+        assert!(is_bcachefs_option("bcachefs.background_target"));
+        assert!(!is_bcachefs_option("bcachefs.project"));
+        assert!(!is_bcachefs_option("bcachefs_effective.compression"));
+        assert!(!is_bcachefs_option("user.bcachefs.compression"));
+        assert_eq!(super::super::xattr_node_name("bcachefs.project".as_ref()), None);
+        assert_eq!(
+            super::super::xattr_node_name("bcachefs.projectx".as_ref()).as_deref(),
+            Some("bcachefs.projectx")
+        );
+        assert_eq!(
+            super::super::xattr_node_name("bcachefs.compression".as_ref()).as_deref(),
+            Some("bcachefs.compression")
+        );
+    }
+
+    /// Off bcachefs a directory gets nothing early, and a file without a
+    /// project ID isn't opened for one.
+    #[test]
+    fn no_options_early_off_bcachefs() {
+        let dir = tempfile::tempdir().unwrap();
+        if is_bcachefs_path(dir.path()) {
+            return;
+        }
+        let mut node = Node::new_node(OsStr::new("d"), NodeType::Dir, NodeMetadata::default());
+        node.meta.extended_attributes =
+            vec![ExtendedAttribute { name: "user.backotter".into(), value: Some(b"x".to_vec()) }];
+        prepare_dir_for_options(dir.path(), &node);
+        assert!(xattr::get(dir.path(), "user.backotter").unwrap().is_none());
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let file = Node::new_node(OsStr::new("f"), NodeType::File, NodeMetadata::default());
+        restore_attributes(&path, &file).unwrap();
+    }
+
+    /// The effective project ID of the file at `path`, on bcachefs.
+    fn effective_projid(path: &Path) -> u32 {
+        let f = File::open(path).unwrap();
+        file_projid(&f, &get_fsxattr(&f).unwrap())
+    }
+
+    /// On bcachefs (an empty directory on one in `$BKO_BCACHEFS_TEST_DIR`,
+    /// as root) a directory's options and project ID go on before its
+    /// entries, which inherit them; an entry whose project ID is its
+    /// directory's isn't given it again (it stays inherited, with no
+    /// `bcachefs.project` of its own), one without a project ID gets 0, and
+    /// a snapshot's `bcachefs.project` is neither set nor an error.
+    #[test]
+    fn bcachefs_dir_options_inherited() {
+        let Some(base) = std::env::var_os("BKO_BCACHEFS_TEST_DIR") else {
+            return;
+        };
+        let d = Path::new(&base).join("rustic-d");
+        std::fs::create_dir(&d).unwrap();
+        assert!(is_bcachefs_path(&d), "{} is not on bcachefs", d.display());
+        let mut dir = Node::new_node(OsStr::new("d"), NodeType::Dir, NodeMetadata::default());
+        dir.meta.extended_attributes = vec![
+            ExtendedAttribute { name: "bcachefs.compression".into(), value: Some(b"zstd".to_vec()) },
+            ExtendedAttribute { name: "bcachefs.project".into(), value: Some(b"43".to_vec()) },
+        ];
+        dir.meta.generic_attributes.set_number(LINUX_PROJECT_ID, 43);
+        prepare_dir_for_options(&d, &dir);
+        assert_eq!(effective_projid(&d), 43);
+
+        let kid = d.join("kid");
+        std::fs::write(&kid, b"data").unwrap();
+        let zero = d.join("zero");
+        std::fs::write(&zero, b"data").unwrap();
+        let compression = xattr::get(&kid, "bcachefs_effective.compression").unwrap().unwrap();
+        assert!(compression.starts_with(b"zstd"), "{compression:?}");
+
+        let mut kid_node = Node::new_node(OsStr::new("kid"), NodeType::File, NodeMetadata::default());
+        kid_node.meta.generic_attributes.set_number(LINUX_PROJECT_ID, 43);
+        restore_attributes(&kid, &kid_node).unwrap();
+        let zero_node = Node::new_node(OsStr::new("zero"), NodeType::File, NodeMetadata::default());
+        restore_attributes(&zero, &zero_node).unwrap();
+        restore_attributes(&d, &dir).unwrap();
+
+        assert_eq!(effective_projid(&kid), 43);
+        assert_eq!(effective_projid(&zero), 0);
+        let names: Vec<_> = xattr::list(&kid).unwrap().collect();
+        assert!(!names.iter().any(|n| n == "bcachefs.project"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "bcachefs.compression"), "{names:?}");
+        assert_eq!(xattr::get(&d, "bcachefs.compression").unwrap().as_deref(), Some(&b"zstd"[..]));
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

@@ -276,11 +276,19 @@ pub(crate) fn prepare_file(path: &Path, node: &Node) -> io::Result<()> {
 /// # Errors
 ///
 /// * If the flags couldn't be set.
+///
+/// BackOtter: on bcachefs (Linux) it then gives the directory its options
+/// and project ID too, which bcachefs passes only to entries created after
+/// them, as BackOtter's restic does (`linux::prepare_dir_for_options`).
 pub(crate) fn prepare_dir(path: &Path, node: &Node) -> io::Result<()> {
     if os::FLAGS_BEFORE_ENTRIES == 0 {
         return Ok(());
     }
-    os::prepare_dir_for_flags(path, file_flags(node).unwrap_or(0) & os::FLAGS_BEFORE_ENTRIES)
+    let flags =
+        os::prepare_dir_for_flags(path, file_flags(node).unwrap_or(0) & os::FLAGS_BEFORE_ENTRIES);
+    #[cfg(target_os = "linux")]
+    os::prepare_dir_for_options(path, node);
+    flags
 }
 
 /// Whether listing a directory can leave its access time as it was: on Linux
@@ -947,14 +955,20 @@ pub(crate) fn xattr_list(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
 /// `system.NAME`; their system namespace is kept as a generic attribute. On
 /// Linux, bcachefs' `bcachefs_effective.*` aren't kept: they show the
 /// options a file has, its own (`bcachefs.*`, kept) or inherited, and its
-/// project ID, and setting one does nothing.
+/// project ID, and setting one does nothing; nor is `bcachefs.project`, a
+/// project ID the file was given (bcachefs 1.39 lists it, Linux 6.12's
+/// doesn't), which `linux.project_id` carries and bcachefs won't have set to
+/// anything but 0 (`EINVAL`). A restore neither sets nor removes them,
+/// whatever a snapshot holds, as in BackOtter's restic.
 #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
 pub(crate) fn xattr_node_name(name: &std::ffi::OsStr) -> Option<String> {
     let name = name.to_string_lossy();
     if cfg!(any(target_os = "freebsd", target_os = "netbsd")) {
         return name.strip_prefix("user.").map(str::to_string);
     }
-    if cfg!(target_os = "linux") && name.starts_with(BCACHEFS_EFFECTIVE) {
+    if cfg!(target_os = "linux")
+        && (name.starts_with(BCACHEFS_EFFECTIVE) || name == BCACHEFS_OWN_PROJECT)
+    {
         return None;
     }
     Some(name.into_owned())
@@ -964,6 +978,11 @@ pub(crate) fn xattr_node_name(name: &std::ffi::OsStr) -> Option<String> {
 /// they apply to it, whether its own or inherited ([`xattr_node_name`]).
 #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
 pub(crate) const BCACHEFS_EFFECTIVE: &str = "bcachefs_effective.";
+
+/// The extended attribute in which bcachefs shows a project ID a file was
+/// given, not inherited ([`xattr_node_name`]).
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+pub(crate) const BCACHEFS_OWN_PROJECT: &str = "bcachefs.project";
 
 /// The name the xattr crate takes for a node's extended attribute; see
 /// [`xattr_node_name`].
@@ -997,6 +1016,7 @@ fn warn_unknown(node: &Node) {
     target_os = "dragonfly",
     target_os = "freebsd",
     target_os = "illumos",
+    target_os = "linux",
     target_os = "netbsd",
     target_os = "openbsd"
 ))]
