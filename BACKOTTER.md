@@ -25,7 +25,15 @@ that either program restores what the other backed up.
     the ID it has in the extended attribute `bcachefs_effective.project`:
     on bcachefs that is read instead, where there is one. The restore sets
     it with `FS_IOC_FSSETXATTR`, as anywhere (setting the attribute does
-    nothing, `bcachefs.project` is refused).
+    nothing, `bcachefs.project` is refused). On bcachefs a directory gets
+    its project ID, with its own options, as soon as the restore creates it
+    (below, with casefolding), and its entries inherit it then; the restore
+    gives no file an ID it has already, so an entry that inherited its ID
+    in the original comes back inheriting it, with no `bcachefs.project` of
+    its own, and there a node without `linux.project_id` gets 0 where the
+    file inherited another. Elsewhere a node without one leaves the file's
+    ID as it is. Accepted difference (both tools): a bcachefs file given its
+    directory's project ID by hand comes back inheriting it.
   - `freebsd.file_flags`: FreeBSD's `chflags(1)` flags (`st_flags`). ZFS
     (`statfs(2)`'s `f_fstypename` `zfs`, looked up once per file system; a
     symlink's is its directory's) sets `uarch` on every file it writes, as
@@ -422,7 +430,12 @@ that either program restores what the other backed up.
   skipped): they show the options a file has, its own (`bcachefs.*`, kept
   as any other) or inherited from its directory, and its project ID
   (`linux.project_id`), and setting one returns 0 and does nothing (Linux
-  6.12).
+  6.12). Nor is `bcachefs.project`, which bcachefs 1.39 (not Linux 6.12's)
+  lists for a file given a project ID rather than inheriting it:
+  `linux.project_id` carries the ID, and bcachefs refuses to have the
+  attribute set to anything but 0 (`EINVAL`), so a restore of a snapshot
+  that holds it (from an earlier build) skips it, as BackOtter's restic
+  does.
 - A file with illumos' `av_quarantined` can't be opened for reading, by
   root either (`EACCES`), nor its extended attributes, but its metadata can
   be read: a backup keeps its node without its contents, as BackOtter's
@@ -531,6 +544,15 @@ that either program restores what the other backed up.
   where it still differs from the node ("casefolding (F) not restored on
   DIR: directory not empty or not supported"). The destination of a whole
   snapshot has no node, and is left as it is.
+- On bcachefs the same directories (those created, or found empty) get
+  their own options then too, before anything goes in: their `bcachefs.*`
+  extended attributes and their project ID, 0 where the node has none.
+  bcachefs passes a directory's options only to entries created after they
+  are set, so set at the end with the other metadata the entries would
+  lose the compression, replicas, targets or nocow they inherited, and get
+  their project ID as their own. Errors there are silent: the directory's
+  metadata at the end sets them all again, and reports them. As
+  BackOtter's restic does.
 - A restore over an existing tree removes what has a node's name but
   another type, with or without `--delete`, as BackOtter's restic does: a
   symlink where the snapshot has a directory is replaced by the directory
