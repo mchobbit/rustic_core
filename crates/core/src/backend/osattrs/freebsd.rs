@@ -1,12 +1,18 @@
-//! FreeBSD: file flags (`st_flags`), and the ACLs and system extended
-//! attributes it shares with NetBSD (`freebsd_netbsd.rs`).
+//! FreeBSD: file flags (`st_flags`), ZFS project IDs, and the ACLs and
+//! system extended attributes it shares with NetBSD (`freebsd_netbsd.rs`).
 
 use std::{
     collections::BTreeMap,
     ffi::CStr,
+    fs::{File, OpenOptions},
     io,
-    os::freebsd::fs::MetadataExt,
+    os::{
+        fd::AsRawFd,
+        freebsd::fs::MetadataExt,
+        unix::fs::{MetadataExt as _, OpenOptionsExt},
+    },
     path::{Path, PathBuf},
+    ptr,
     sync::Mutex,
 };
 
@@ -14,13 +20,20 @@ use jiff::Timestamp;
 use log::debug;
 
 use super::{
-    XattrErrors,
-    bsd_flags::{FREEBSD_KEPT_FLAGS as KEPT_FLAGS, freebsd_file_flags},
-    c_path, check, freebsd_netbsd, lower_birthtime, path_error, set_flags_best_effort,
+    Unsupported, XattrErrors,
+    bsd_flags::{
+        FREEBSD_KEPT_FLAGS as KEPT_FLAGS, FREEBSD_RESTRICTING_FLAGS, freebsd_file_flags,
+    },
+    c_path, check, freebsd_netbsd,
+    illumos_project::ZfsProject,
+    lower_birthtime, path_error, set_flags_best_effort,
 };
 use crate::backend::{
     ignore::mapper::nix_mapper::map_mode_from_go,
-    node::{ExtendedAttribute, Node, NodeType, generic_attributes::FREEBSD_FILE_FLAGS},
+    node::{
+        ExtendedAttribute, Node, NodeType,
+        generic_attributes::{FREEBSD_FILE_FLAGS, FREEBSD_ZFS_PROJECT},
+    },
 };
 
 pub(super) const FILE_FLAGS: Option<&str> = Some(FREEBSD_FILE_FLAGS);
@@ -34,13 +47,117 @@ unsafe extern "C" {
     fn lchmod(path: *const libc::c_char, mode: libc::mode_t) -> libc::c_int;
 }
 
-/// No file is opened for its attributes ahead of them here.
-pub(super) fn open_for_attrs(
-    _path: &Path,
-    _typ: &NodeType,
-    _m: &std::fs::Metadata,
-) -> Option<std::fs::File> {
-    None
+/// Opens a regular file or directory on ZFS for its ZFS project
+/// ([`fill_attributes`]). `None` for other types of file, on other file
+/// systems, and where it can't be opened (not readable, gone, replaced).
+pub(super) fn open_for_attrs(path: &Path, typ: &NodeType, m: &std::fs::Metadata) -> Option<File> {
+    if !matches!(typ, NodeType::File | NodeType::Dir) || !on_zfs(path, m) {
+        return None;
+    }
+    open_for_project(path, typ, Some(m))
+        .inspect_err(|err| debug!("no ZFS project for {}: {err}", path.display()))
+        .ok()
+        .flatten()
+}
+
+/// `zfsxattr`, the struct OpenZFS's project ioctls take on FreeBSD: Linux's
+/// `struct fsxattr`, 28 bytes, with ioctls `'X'` 31 and 32, as `truss(1)`
+/// shows `zfs project` calling them on FreeBSD 15.1. Of the flags, only
+/// inheritance (`ZFS_PROJINHERIT_FL`) is changed; the others are given back
+/// as read.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct ZfsXattr {
+    xflags: u32,
+    extsize: u32,
+    nextents: u32,
+    projid: u32,
+    cowextsize: u32,
+    pad: [u8; 8],
+}
+
+// The ioctls carry the struct's size (28): it must be that.
+const _: () = assert!(size_of::<ZfsXattr>() == 28);
+
+const ZFS_IOC_FSGETXATTR: libc::c_ulong = 0x401c_581f; // _IOR('X', 31, zfsxattr_t)
+const ZFS_IOC_FSSETXATTR: libc::c_ulong = 0x801c_5820; // _IOW('X', 32, zfsxattr_t)
+
+fn zfs_xattr(f: &File, request: libc::c_ulong, zx: &mut ZfsXattr) -> io::Result<()> {
+    // SAFETY: both ioctls take a ZfsXattr.
+    check(unsafe { libc::ioctl(f.as_raw_fd(), request, ptr::from_mut(zx)) }).map(drop)
+}
+
+/// Opens the regular file or directory at `path`, of type `typ`, for its
+/// project ioctls, with `O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_NOCTTY|O_CLOEXEC`
+/// (and `O_DIRECTORY`), so as not to follow a symlink, wait on a lock or take
+/// a terminal. `None` if it isn't of type `typ`, or, given `listed` (at
+/// backup: the lstat), not that file.
+fn open_for_project(
+    path: &Path,
+    typ: &NodeType,
+    listed: Option<&std::fs::Metadata>,
+) -> io::Result<Option<File>> {
+    let mut how = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY;
+    let dir = matches!(typ, NodeType::Dir);
+    if dir {
+        how |= libc::O_DIRECTORY;
+    } else if !matches!(typ, NodeType::File) {
+        return Ok(None);
+    }
+    let f = OpenOptions::new().read(true).custom_flags(how).open(path)?;
+    let m = f.metadata()?;
+    let same_type = if dir { m.is_dir() } else { m.is_file() };
+    if !same_type || listed.is_some_and(|l| (l.dev(), l.ino()) != (m.dev(), m.ino())) {
+        return Ok(None);
+    }
+    Ok(Some(f))
+}
+
+/// Records the ZFS project of a regular file or directory on ZFS (`f`,
+/// opened by [`open_for_attrs`]), when it has one: an ID or inheritance.
+fn fill_zfs_project(path: &Path, node: &mut Node, f: &File) {
+    let mut zx = ZfsXattr::default();
+    if let Err(err) = zfs_xattr(f, ZFS_IOC_FSGETXATTR, &mut zx) {
+        debug!("no ZFS project for {}: {err}", path.display());
+        return;
+    }
+    if let Some(p) = ZfsProject::of(zx.xflags, zx.projid) {
+        _ = node.meta.generic_attributes.set(FREEBSD_ZFS_PROJECT, &p);
+    }
+}
+
+/// Gives the regular file or directory at `path` its ZFS project: its own
+/// ID and inheritance, whatever it got from the directory it was created
+/// in, as on illumos. It goes before the file flags. A file system other
+/// than ZFS (UFS: `ENOTTY`) gives an [`Unsupported`] error.
+fn restore_zfs_project(path: &Path, node: &Node) -> io::Result<()> {
+    let Some(p) = node.meta.generic_attributes.get::<ZfsProject>(FREEBSD_ZFS_PROJECT) else {
+        return Ok(());
+    };
+    let p = p.map_err(io::Error::other)?;
+    let Some(f) = open_for_project(path, &node.node_type, None)
+        .map_err(|err| path_error("open", path, &err))?
+    else {
+        return Ok(());
+    };
+    let error = |op, err| {
+        if super::unsupported(&err) {
+            Unsupported::error(FREEBSD_ZFS_PROJECT, 0, err)
+        } else {
+            path_error(op, path, &err)
+        }
+    };
+    let mut zx = ZfsXattr::default();
+    zfs_xattr(&f, ZFS_IOC_FSGETXATTR, &mut zx).map_err(|err| error("ioctl get ZFS project", err))?;
+    let mut want = ZfsXattr {
+        xflags: p.xflags(zx.xflags),
+        projid: p.id,
+        ..zx
+    };
+    if want == zx {
+        return Ok(());
+    }
+    zfs_xattr(&f, ZFS_IOC_FSSETXATTR, &mut want).map_err(|err| error("ioctl set ZFS project", err))
 }
 
 pub(super) fn file_flags(
@@ -93,11 +210,10 @@ fn fs_type(path: &Path) -> io::Result<String> {
     Ok(name.to_string_lossy().into_owned())
 }
 
-pub(super) fn fill_attributes(
-    path: &Path,
-    node: &mut Node,
-    _f: Option<&std::fs::File>,
-) -> io::Result<()> {
+pub(super) fn fill_attributes(path: &Path, node: &mut Node, f: Option<&File>) -> io::Result<()> {
+    if let Some(f) = f {
+        fill_zfs_project(path, node, f);
+    }
     freebsd_netbsd::fill_attributes(path, node)
 }
 
@@ -143,9 +259,25 @@ pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
 
-/// Restores the system extended attributes.
+/// Restores the system extended attributes and the ZFS project.
 pub(super) fn restore_attributes(path: &Path, node: &Node) -> io::Result<()> {
-    freebsd_netbsd::restore_system_extattrs(path, node)
+    let extattrs = freebsd_netbsd::restore_system_extattrs(path, node);
+    restore_zfs_project(path, node).and(extattrs)
+}
+
+/// Clears the flags of the file at `path` that keep a restore from
+/// rewriting, replacing or changing it ([`FREEBSD_RESTRICTING_FLAGS`]),
+/// leaving the others as they are; the late flags pass sets the node's.
+pub(super) fn clear_restricting_flags(path: &Path) -> io::Result<()> {
+    let flags = std::fs::symlink_metadata(path)?.st_flags();
+    if flags & FREEBSD_RESTRICTING_FLAGS == 0 {
+        return Ok(());
+    }
+    let p = c_path(path)?;
+    // SAFETY: p is a C string.
+    check(unsafe { libc::lchflags(p.as_ptr(), (flags & !FREEBSD_RESTRICTING_FLAGS).into()) })
+        .map(drop)
+        .map_err(|err| path_error("lchflags", path, &err))
 }
 
 /// Restores the ACLs (FreeBSD has none on symlinks).

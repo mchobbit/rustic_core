@@ -853,6 +853,12 @@ impl IntoIter {
             dent = itry!(self.follow(dent));
         }
         let is_normal_dir = !dent.file_type().is_symlink() && dent.is_dir();
+        // BackOtter: a directory's metadata is taken before it is listed,
+        // which moves its access time where that can't be helped.
+        #[cfg(unix)]
+        if is_normal_dir {
+            dent.keep_metadata();
+        }
         if is_normal_dir {
             if self.opts.same_file_system && dent.depth() > 0 {
                 if itry!(self.is_same_file_system(&dent)) {

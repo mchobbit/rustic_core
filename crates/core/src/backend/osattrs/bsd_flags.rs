@@ -29,6 +29,42 @@ pub(super) fn freebsd_file_flags(st_flags: u32, zfs: bool) -> Option<u32> {
     (flags != new_file).then_some(flags)
 }
 
+// The flags that keep a file from being written, appended to only, or
+// removed and renamed (<sys/stat.h>), the same bits on every BSD that has
+// them.
+const UF_IMMUTABLE: u32 = 0x0000_0002; // "uchg"
+const UF_APPEND: u32 = 0x0000_0004; // "uappnd"
+const UF_NOUNLINK: u32 = 0x0000_0010; // "uunlnk" (FreeBSD, DragonFly)
+const FREEBSD_UF_READONLY: u32 = 0x0000_1000; // "urdonly" (ZFS: DOS read-only)
+const SF_IMMUTABLE: u32 = 0x0002_0000; // "schg"
+const SF_APPEND: u32 = 0x0004_0000; // "sappnd"
+const SF_NOUNLINK: u32 = 0x0010_0000; // "sunlnk" (FreeBSD, DragonFly)
+
+/// The flags a restore clears from a file it finds in its way before it
+/// changes it (`osattrs::clear_restricting_flags`), on FreeBSD: immutable,
+/// append-only and undeletable, the owner's and the system's, and ZFS's DOS
+/// read-only, which refuses writes too. The late flags pass sets the node's.
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+pub(super) const FREEBSD_RESTRICTING_FLAGS: u32 = UF_IMMUTABLE
+    | UF_APPEND
+    | UF_NOUNLINK
+    | FREEBSD_UF_READONLY
+    | SF_IMMUTABLE
+    | SF_APPEND
+    | SF_NOUNLINK;
+
+/// As [`FREEBSD_RESTRICTING_FLAGS`], on NetBSD and OpenBSD, which have no
+/// undeletable or read-only flags.
+#[cfg_attr(not(any(target_os = "netbsd", target_os = "openbsd")), allow(dead_code))]
+pub(super) const NETBSD_OPENBSD_RESTRICTING_FLAGS: u32 =
+    UF_IMMUTABLE | UF_APPEND | SF_IMMUTABLE | SF_APPEND;
+
+/// As [`FREEBSD_RESTRICTING_FLAGS`], on DragonFly, which has no read-only
+/// flag.
+#[cfg_attr(not(target_os = "dragonfly"), allow(dead_code))]
+pub(super) const DRAGONFLY_RESTRICTING_FLAGS: u32 =
+    UF_IMMUTABLE | UF_APPEND | UF_NOUNLINK | SF_IMMUTABLE | SF_APPEND | SF_NOUNLINK;
+
 // NetBSD's <sys/stat.h>: the flags the kernel manages.
 const NETBSD_SF_SNAPSHOT: u32 = 0x0020_0000; // an FFS snapshot
 const NETBSD_SF_LOG: u32 = 0x0040_0000; // the WAPBL journal
@@ -90,6 +126,18 @@ mod tests {
         // arch, uchg, nodump
         assert_eq!(0x0001_0003 & NETBSD_KEPT_FLAGS, 0x0001_0003);
         assert_eq!(NETBSD_KEPT_FLAGS, 0xff1f_ffff);
+    }
+
+    #[test]
+    fn restricting_flags() {
+        // chflags(1): uchg uappnd uunlnk urdonly schg sappnd sunlnk.
+        assert_eq!(FREEBSD_RESTRICTING_FLAGS, 0x0016_1016);
+        assert_eq!(NETBSD_OPENBSD_RESTRICTING_FLAGS, 0x0006_0006);
+        assert_eq!(DRAGONFLY_RESTRICTING_FLAGS, 0x0016_0016);
+        // nodump, uarch, hidden and the snapshot bit stay.
+        for keep in [0x1, 0x800, 0x8000, 0x0020_0000] {
+            assert_eq!(keep & FREEBSD_RESTRICTING_FLAGS, 0, "{keep:#x}");
+        }
     }
 
     #[test]

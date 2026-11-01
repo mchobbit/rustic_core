@@ -1090,3 +1090,41 @@ fn regression_skip_current_dir() {
     wd.skip_current_dir();
     wd.next();
 }
+
+// BackOtter: a directory's metadata is the one it had before it was listed
+// (a listing moves its atime where it can't be read with O_NOATIME). The
+// sorter runs while the directory is listed: what it changes (the mode, here)
+// must not show in the directory's metadata.
+#[cfg(unix)]
+#[test]
+fn dir_metadata_from_before_listing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = Dir::tmp();
+    dir.mkdirp("d");
+    dir.touch_all(&["d/a", "d/b", "d/c"]);
+    fs::set_permissions(dir.join("d"), fs::Permissions::from_mode(0o755))
+        .unwrap();
+    let d = dir.join("d");
+    let changed = std::sync::atomic::AtomicBool::new(false);
+    let wd = WalkDir::new(dir.path()).sort_by(move |a, b| {
+        if a.path().parent() == Some(d.as_path())
+            && !changed.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            fs::set_permissions(&d, fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        a.file_name().cmp(b.file_name())
+    });
+    let ents: Vec<_> = wd.into_iter().map(|e| e.unwrap()).collect();
+    let d_ent = ents.iter().find(|e| e.path() == dir.join("d")).unwrap();
+    assert_eq!(d_ent.metadata().unwrap().permissions().mode() & 0o777, 0o755);
+    // It changed, all the same, and a file's metadata is looked up as before.
+    assert_eq!(
+        fs::symlink_metadata(dir.join("d")).unwrap().permissions().mode()
+            & 0o777,
+        0o700
+    );
+    let a = ents.iter().find(|e| e.path() == dir.join("d/a")).unwrap();
+    assert!(a.metadata().unwrap().is_file());
+}

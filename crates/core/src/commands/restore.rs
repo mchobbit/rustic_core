@@ -157,7 +157,7 @@ pub(crate) fn restore_repository<S: IndexedTree>(
     dest: &LocalDestination,
 ) -> RusticResult<()> {
     repo.warm_up_wait(file_infos.to_packs().into_iter())?;
-    restore_contents(
+    let failed = restore_contents(
         repo,
         dest,
         &file_infos.names,
@@ -175,6 +175,16 @@ pub(crate) fn restore_repository<S: IndexedTree>(
         dest,
     )?;
     p.finish();
+
+    // BackOtter: files whose contents couldn't be written fail the restore,
+    // as in BackOtter's restic (exit 1), once everything else is restored.
+    if failed > 0 {
+        return Err(RusticError::new(
+            ErrorKind::InputOutput,
+            "The contents of `{count}` files could not be restored; see the errors above.",
+        )
+        .attach_context("count", failed.to_string()));
+    }
 
     Ok(())
 }
@@ -251,11 +261,14 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                     );
                 }
                 (true, false, true) => {
+                    // BackOtter: flags that refuse removal come off first.
+                    osattrs::clear_restricting_flags_tree(entry.path());
                     if let Err(err) = dest.remove_dir(entry.path()) {
                         error!("error removing {}: {err}", entry.path().display());
                     }
                 }
                 (true, false, false) => {
+                    osattrs::clear_restricting_flags(entry.path());
                     if let Err(err) = dest.remove_file(entry.path()) {
                         error!("error removing {}: {err}", entry.path().display());
                     }
@@ -288,6 +301,9 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                 info!("would have replaced {}", entry.path().display());
                 true
             } else {
+                if is_dir {
+                    osattrs::clear_restricting_flags_tree(entry.path());
+                }
                 match (is_dir, opts.delete) {
                     (false, _) => dest.remove_file(entry.path()).map_err(|err| err.to_string()),
                     (true, true) => dest.remove_dir(entry.path()).map_err(|err| err.to_string()),
@@ -468,6 +484,14 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         next_dst = process_existing(&mut walker, destination)?;
                     }
                     Ordering::Equal => {
+                        // BackOtter: what the restore finds in its way loses
+                        // the flags that would refuse its being rewritten,
+                        // replaced or given its metadata (immutable,
+                        // append-only, undeletable), as in BackOtter's
+                        // restic; the late flags pass sets the node's.
+                        if !dry_run {
+                            osattrs::clear_restricting_flags(destination.path());
+                        }
                         // process existing node
                         if (node.is_dir() && !destination.file_type().is_dir())
                             || (node.is_file() && !destination.file_type().is_file())
@@ -800,8 +824,14 @@ impl PackInfo {
 ///
 /// # Errors
 ///
-/// * If the length of a file could not be set.
-/// * If the restore failed.
+/// * If the thread pool could not be made.
+///
+/// # Returns
+///
+/// BackOtter: the number of files whose contents couldn't be written (one
+/// that can't be opened for writing, say), each reported once, with an
+/// error, and left as they are; stock rustic stopped at the first, or
+/// panicked.
 #[allow(clippy::too_many_lines)]
 fn restore_contents<S: Open>(
     repo: &Repository<S>,
@@ -811,21 +841,27 @@ fn restore_contents<S: Open>(
     sparse: &[bool],
     restore_info: RestoreInfo,
     restore_size: u64,
-) -> RusticResult<()> {
+) -> RusticResult<usize> {
     let be = repo.dbe();
+
+    // BackOtter: the files that couldn't be written, each reported once.
+    let failed = &Mutex::new(BTreeSet::new());
+    let fail = &|file_idx: usize, err: &dyn std::fmt::Display| {
+        if failed.lock().unwrap().insert(file_idx) {
+            error!(
+                "restore {}: contents not restored: {err}",
+                filenames[file_idx].display()
+            );
+        }
+    };
 
     // first create needed empty files, as they are not created later.
     for (i, size) in file_lengths.iter().enumerate() {
         if *size == 0 {
             let path = &filenames[i];
-            dest.set_length(path, *size, sparse[i]).map_err(|err| {
-                RusticError::with_source(
-                    ErrorKind::InputOutput,
-                    "Failed to set the length of the file `{path}`. Please check the path and try again.",
-                    err,
-                )
-                .attach_context("path", path.display().to_string())
-            })?;
+            if let Err(err) = dest.set_length(path, *size, sparse[i]) {
+                fail(i, &err);
+            }
         }
     }
 
@@ -932,22 +968,36 @@ fn restore_contents<S: Open>(
                                 let mut sizes_guard = sizes.lock().unwrap();
                                 let filesize = sizes_guard[file_idx];
                                 if filesize > 0 {
-                                    dest.set_length(path, filesize, is_sparse).unwrap();
+                                    // BackOtter: a file that can't be
+                                    // sized (opened for writing) is
+                                    // reported and left, not a panic.
+                                    if let Err(err) = dest.set_length(path, filesize, is_sparse) {
+                                        fail(file_idx, &err);
+                                    }
                                     sizes_guard[file_idx] = 0;
                                 }
                                 drop(sizes_guard);
+                                if failed.lock().unwrap().contains(&file_idx) {
+                                    p.inc(size);
+                                    return;
+                                }
                                 // BackOtter: in a file restored sparse
                                 // (write_sparse), the blob's all-zero parts
                                 // of the file system's blocks stay holes, as
                                 // BackOtter's restic leaves them; any other
                                 // file gets every byte, so that it is
                                 // allocated.
-                                if is_sparse {
-                                    if !zeros {
-                                        dest.write_sparse_at(path, start, &data).unwrap();
+                                let written = if is_sparse {
+                                    if zeros {
+                                        Ok(())
+                                    } else {
+                                        dest.write_sparse_at(path, start, &data)
                                     }
                                 } else {
-                                    dest.write_at(path, start, &data).unwrap();
+                                    dest.write_at(path, start, &data)
+                                };
+                                if let Err(err) = written {
+                                    fail(file_idx, &err);
                                 }
                                 p.inc(size);
                             });
@@ -960,7 +1010,7 @@ fn restore_contents<S: Open>(
 
     p.finish();
 
-    Ok(())
+    Ok(failed.lock().unwrap().len())
 }
 
 /// Information about what will be restored.

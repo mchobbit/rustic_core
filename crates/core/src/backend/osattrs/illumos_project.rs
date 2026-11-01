@@ -1,9 +1,10 @@
-//! ZFS project IDs on illumos (`zfs project`), which ZFS's project quotas
-//! count a file's blocks against (`zfs projectspace`), and whether a
-//! directory hands its project ID down to the files created in it. Portable,
-//! so that it is tested on any system; the ioctls are in `illumos.rs`.
+//! ZFS project IDs on illumos and FreeBSD (`zfs project`), which ZFS's
+//! project quotas count a file's blocks against (`zfs projectspace`), and
+//! whether a directory hands its project ID down to the files created in it.
+//! Portable, so that it is tested on any system; the ioctls are in
+//! `illumos.rs` and `freebsd.rs`.
 
-#![cfg_attr(not(target_os = "illumos"), allow(dead_code))]
+#![cfg_attr(not(any(target_os = "illumos", target_os = "freebsd")), allow(dead_code))]
 
 use serde::{Deserialize, Serialize};
 
@@ -16,7 +17,8 @@ const fn is_false(v: &bool) -> bool {
     !*v
 }
 
-/// A file's project ID and inheritance, as `illumos.zfs_project` keeps them.
+/// A file's project ID and inheritance, as `illumos.zfs_project` and
+/// `freebsd.zfs_project` keep them.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ZfsProject {
     pub id: u32,

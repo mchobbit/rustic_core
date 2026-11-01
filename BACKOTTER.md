@@ -73,6 +73,15 @@ that either program restores what the other backed up.
     down (`zfs project -p 77 -s`), as `{"id":77,"inherit":true}`
     (`"inherit"` left out when false), when it has either; regular files
     and directories.
+  - `freebsd.zfs_project`: the same on FreeBSD's ZFS (`zfs project`), in
+    the same form, of regular files and directories on ZFS (`statfs(2)`'s
+    `f_fstypename`, as for the archive flag), read through a descriptor
+    opened as on Linux (`O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_NOCTTY|O_CLOEXEC`,
+    and `O_DIRECTORY`; the file the lstat saw). OpenZFS takes Linux's
+    `struct fsxattr` (28 bytes) there, with ioctls `'X'` 31 and 32
+    (`0x401c581f`, `0x801c5820`, as `truss(1)` shows `zfs project` calling
+    them on FreeBSD 15.1); only inheritance (`0x20000000`) of its flags is
+    used. Project quotas (`projectquota@N`) count by it.
   - `illumos.unread_size`: the size in bytes (a JSON number) of a regular
     file whose contents weren't backed up, because illumos quarantined it
     (`av_quarantined`) and no one could read it: its node has no contents
@@ -167,7 +176,7 @@ that either program restores what the other backed up.
   rustic doesn't know at all gets a warning, once; one of another system is
   skipped quietly. A known attribute with a value that can't be read
   (`linux.inode_flags`, `linux.project_id`, `unix.sparse`,
-  `unix.birthtime`, `*.file_flags`)
+  `unix.birthtime`, `*.file_flags`, `*.zfs_project`)
   is skipped with a warning once per attribute name, as in BackOtter's
   restic; it isn't an error. A project ID of 0 is left as the file has it.
 - On Linux, regular files and directories are opened for their flags,
@@ -189,8 +198,17 @@ that either program restores what the other backed up.
   them back. Directories are listed by a vendored walkdir
   2.5.0 (`vendor/walkdir`, swapped in with `[patch.crates-io]`, which
   reaches the ignore crate's walker too): std's `read_dir` has no way to
-  pass `O_NOATIME`. Other systems have no `O_NOATIME`, and update access
-  times as BackOtter's restic does.
+  pass `O_NOATIME`. Other systems have no `O_NOATIME`: there listing a
+  directory moves its access time (where the file system keeps them: not
+  read-only, `noatime` or ZFS's `atime=off`), so the walker takes a
+  directory's metadata before it reads it, the backup's root included
+  (`DirEntry::keep_metadata` in the vendored walkdir; stock walkdir and
+  rustic took it after, and stored the listing's time), as BackOtter's
+  restic does, and a backup doesn't scan the source for its size there
+  (as `--no-scan`; `osattrs::LISTING_KEEPS_ATIMES`): the scan runs beside
+  the backup, and would list directories before the backup takes their
+  metadata. Progress then shows no total or ETA, in both tools. Files'
+  access times are those before the backup read them.
 - A restore gives files the uid and gid they were saved with, as restic
   does: stock rustic looks the owners' names up in the users of the system
   it runs on, which on a rescue system are the wrong ones. `restore
@@ -284,6 +302,35 @@ that either program restores what the other backed up.
   alone. This goes before the file's own times (writing an attribute file
   leaves them) and flags. A snapshot without the attribute restores as
   before.
+- FreeBSD ZFS project IDs (`freebsd.zfs_project`) are restored with the
+  system extended attributes, before the flags, as each node's own ID and
+  inheritance, as on illumos; on UFS (`ENOTTY`) they get one warning per
+  restore, as other unsupported metadata.
+- Before the restore touches a file or directory it finds at a node's path
+  (to rewrite it, give it its metadata, replace it, link over it, put
+  entries in it, or remove it with `--delete`), it clears the flags that
+  would refuse that, keeping the others (`osattrs::clear_restricting_flags`):
+  on FreeBSD immutable, append-only and undeletable, the owner's and the
+  system's (`uchg`, `uappnd`, `uunlnk`, `schg`, `sappnd`, `sunlnk`), and
+  ZFS's DOS read-only (`urdonly`), which refuses writes too; on NetBSD and
+  OpenBSD `uchg`, `uappnd`, `schg`, `sappnd`; on DragonFly those and
+  `uunlnk`, `sunlnk`; on Linux immutable and append-only (`i`, `a`), through
+  `FS_IOC_FSSETXATTR` where the file system has it (it leaves btrfs's
+  `btrfs.compression` alone), else `FS_IOC_SETFLAGS`. The late flag pass
+  then gives every file its node's flags, so a restore over an installed
+  FreeBSD (whose `libc.so.7`, `ld-elf.so.1`, `init` and `su` are `schg`)
+  puts back the snapshot's contents and metadata, as BackOtter's restic
+  does. Clearing a system flag takes root at securelevel 0 or below (a
+  rescue system's is -1); where it is refused (only logged), what the
+  restore does next fails, with its error. illumos' immutable, appendonly
+  and nounlink system attributes are not cleared yet, in either tool.
+- A file whose contents can't be written (one the restore can't open for
+  writing) is reported once (`restore PATH: contents not restored: ...`)
+  and left as it is; the restore goes on with every other file and all the
+  metadata, then fails (`The contents of N files could not be restored`,
+  exit 1), as BackOtter's restic exits 1 for it. Stock rustic panicked at
+  the first (an `unwrap` of the open), aborting the restore and leaving
+  every file still pending stale.
 - illumos ZFS project IDs are restored with the extended attributes'
   metadata, before the flags, as each node's own ID and inheritance,
   whatever a file got from the directory it was created in; on another file
