@@ -579,18 +579,27 @@ that either program restores what the other backed up.
   the program makes it again when it starts, and a restored one has
   nobody listening.
 - Directories above the backed-up path (`/home` in a backup of
-  `/home/m`) get nodes of rustic's own making, as in stock rustic
-  (`archiver/tree.rs`): a directory with mode `0o755`, without Go's
-  directory bit in it, and no owner, times or anything else. restic stores
-  those directories' own metadata (their `lstat`). The paths rustic
-  archives may not be where those directories are (`--as-path`, stdin), so
-  this is left as it is; it only matters for what a restore of the whole
-  snapshot gives the directories above the backed-up one: a restore sets
-  no times for a node without an mtime (the directory keeps those the
-  restore gave it), in either tool; restic-bko used to set the zero time,
-  which DragonFly refuses. A node without an atime gets its mtime as its
-  atime, in either tool. The backed-up directory itself has its own
-  metadata (see above).
+  `/home/m`) are stored with their own metadata (their `lstat`: mode,
+  owner, times, inode, extended attributes, ACLs, flags and the rest), as
+  restic stores them and as a backed-up directory is stored, so that the
+  two tools' snapshots are the same and a restore of the whole snapshot,
+  by either tool, gives those directories their own mode, owner and times
+  (`ReadSource::dir_node`, `archiver/tree.rs`). Stock rustic made nodes of
+  its own for them: mode `0o755`, without Go's directory bit, and no
+  owner, times or anything else, so they came back `0755`, owned by
+  root, with the restore's time. rustic still makes those for a directory
+  above the snapshot's path that isn't one on disk: under `--as-path`, for
+  stdin, and where the directory can't be read or isn't a directory (with
+  a warning; restic's backup fails there). A restore sets no times for a
+  node without an mtime (the directory keeps those the restore gave it),
+  in either tool, so snapshots stock rustic made restore so; restic-bko
+  used to set the zero time, which DragonFly refuses. A node without an
+  atime gets its mtime as its atime, in either tool.
+- A block or character device whose device number is 0 (`/dev/console`
+  and `/dev/wd0a` on NetBSD and OpenBSD, or `mknod c 0 0`) has no
+  `device` in its node, as restic leaves it out (Go's `omitempty`), so
+  that the two tools' nodes are the same; stock rustic wrote
+  `"device":0`. A node without one is device 0 to either tool.
 - Partial restores (`--glob`, `--iglob`): directories above the matches
   that aren't matched themselves aren't streamed, so the restore creates
   them without any metadata, casefolding included, as stock rustic does.

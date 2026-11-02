@@ -194,7 +194,12 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                 }
             });
             // handle beginning and ending of trees
-            let iter = TreeIterator::new(iter);
+            // BackOtter: the directories above the backed-up paths with their
+            // own metadata, as restic stores them, where they are the
+            // snapshot's paths (not "--as-path").
+            let iter = TreeIterator::with_dir_nodes(iter, |path: &Path| {
+                as_path.is_none().then(|| src.dir_node(path)).flatten()
+            });
 
             // use parent snapshot
             iter.filter_map(

@@ -144,14 +144,20 @@ pub enum NodeType {
     /// Node is a block device file
     #[strum(to_string = "dev:{device}")]
     Dev {
-        #[serde(default)]
+        // BackOtter: none for device 0, as restic leaves it out (Go's
+        // omitempty); stock rustic wrote `"device":0`. A node without one
+        // reads as device 0 in either tool.
+        #[serde(default, skip_serializing_if = "is_default")]
         /// Device id
         device: u64,
     },
     /// Node is a char device file
     #[strum(to_string = "chardev:{device}")]
     Chardev {
-        #[serde(default)]
+        // BackOtter: none for device 0, as restic leaves it out (Go's
+        // omitempty); stock rustic wrote `"device":0`. A node without one
+        // reads as device 0 in either tool.
+        #[serde(default, skip_serializing_if = "is_default")]
         /// Device id
         device: u64,
     },
@@ -638,5 +644,28 @@ mod tests {
             let node = NodeType::from_link(path);
             prop_assert_eq!(path, node.to_link());
     }
+    }
+
+    #[test]
+    fn device_zero_is_left_out() {
+        // BackOtter: as restic stores device nodes (Go's omitempty).
+        for (node_type, tpe) in [
+            (NodeType::Dev { device: 0 }, "dev"),
+            (NodeType::Chardev { device: 0 }, "chardev"),
+        ] {
+            let node = Node::new_node(OsStr::new("d"), node_type.clone(), Metadata::default());
+            let json = serde_json::to_string(&node).unwrap();
+            assert!(!json.contains("device"), "{json}");
+            assert!(json.contains(&format!("\"type\":\"{tpe}\"")), "{json}");
+            let back: Node = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.node_type, node_type);
+        }
+        let node = Node::new_node(
+            OsStr::new("d"),
+            NodeType::Chardev { device: 0x0102 },
+            Metadata::default(),
+        );
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains("\"device\":258"), "{json}");
     }
 }

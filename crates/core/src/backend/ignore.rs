@@ -20,7 +20,7 @@ use std::num::TryFromIntError;
 
 use crate::{
     Excludes,
-    backend::{ReadSource, ReadSourceEntry, ReadSourceOpen, osattrs},
+    backend::{ReadSource, ReadSourceEntry, ReadSourceOpen, node::Node, osattrs},
     error::{ErrorKind, RusticError, RusticResult},
 };
 
@@ -320,6 +320,28 @@ impl ReadSource for LocalSource {
             save_opts: self.save_opts,
         }
     }
+
+    /// BackOtter: the node of a directory above the backed-up paths, from
+    /// its own `lstat`, as an entry's node is made, as restic stores it. A
+    /// path that can't be read, or isn't a directory, gets none (a node of
+    /// rustic's own making), with a warning.
+    fn dir_node(&self, path: &Path) -> Option<Node> {
+        let name = path.file_name()?;
+        let m = std::fs::symlink_metadata(path)
+            .inspect_err(|err| warn!("{}: {err}, saved without its metadata", path.display()))
+            .ok()?;
+        if !m.is_dir() {
+            warn!(
+                "{} is not a directory, saved without its metadata",
+                path.display()
+            );
+            return None;
+        }
+        self.save_opts
+            .map_path(path, name, &m)
+            .inspect_err(|err| warn!("{}: {err}, saved without its metadata", path.display()))
+            .ok()
+    }
 }
 
 // Walk doesn't implement Debug
@@ -426,5 +448,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(source.entries().count(), 0);
+    }
+
+    #[test]
+    fn dir_node_is_the_directory_s_own() {
+        use std::os::unix::fs::PermissionsExt;
+        // BackOtter: a directory above the backed-up path gets the node an
+        // entry of the walk would get, as restic stores it.
+        let dir = tempfile::tempdir().unwrap();
+        let anc = dir.path().join("anc");
+        std::fs::create_dir_all(anc.join("data")).unwrap();
+        std::fs::set_permissions(&anc, std::fs::Permissions::from_mode(0o751)).unwrap();
+        std::fs::write(dir.path().join("a-file"), b"data").unwrap();
+
+        let source = LocalSource::new(
+            LocalSourceSaveOptions::default(),
+            &Excludes::default(),
+            &LocalSourceFilterOptions::default(),
+            &[anc.join("data")],
+        )
+        .unwrap();
+        let node = source.dir_node(&anc).unwrap();
+        assert!(node.is_dir());
+        assert_eq!(node.name(), std::ffi::OsStr::new("anc"));
+        let walked = LocalSource::new(
+            LocalSourceSaveOptions::default(),
+            &Excludes::default(),
+            &LocalSourceFilterOptions::default(),
+            &[&anc],
+        )
+        .unwrap()
+        .entries()
+        .next()
+        .unwrap()
+        .unwrap()
+        .node;
+        // (the walk may list it before, which can move its atime)
+        let mut walked = walked;
+        walked.meta.atime = node.meta.atime;
+        assert_eq!(node, walked);
+        assert_eq!(node.meta.mode, Some(0o20_000_000_751));
+        assert!(node.meta.uid.is_some() && node.meta.mtime.is_some());
+
+        // Not a directory, or missing: none.
+        assert!(source.dir_node(&dir.path().join("a-file")).is_none());
+        assert!(source.dir_node(&dir.path().join("missing")).is_none());
     }
 }
