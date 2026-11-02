@@ -175,8 +175,8 @@ pub(crate) fn backup_reader(f: File, _sparse: bool) -> Box<dyn io::Read + Send> 
 }
 
 /// The size of the blocks a file restored sparse, `f`, has its holes in:
-/// its file system's block size (else its `st_blksize`), at least 4096
-/// bytes, as BackOtter's restic.
+/// its file system's block size (else its `st_blksize`), at least 512
+/// bytes, 4096 where neither is known, as BackOtter's restic.
 #[cfg(unix)]
 pub(crate) fn hole_block_size(f: &File) -> u64 {
     sparse::hole_block_size(f)
@@ -1087,6 +1087,24 @@ pub(crate) const BCACHEFS_EFFECTIVE: &str = "bcachefs_effective.";
 #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
 pub(crate) const BCACHEFS_OWN_PROJECT: &str = "bcachefs.project";
 
+/// bcachefs' casefolding option of a directory, which bcachefs sets, clears
+/// and even sets again to the value it has only while the directory is
+/// empty (`ENOTEMPTY`). A restore gives it to each directory it creates, or
+/// finds empty, before anything goes in, and later leaves it alone where it
+/// is right, as every extended attribute.
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+pub(crate) const BCACHEFS_CASEFOLD: &str = "bcachefs.casefold";
+
+/// Whether `err`, from setting or removing the extended attribute `name` (a
+/// node's name for it), is bcachefs refusing to change the casefolding of a
+/// directory with entries: a warning, "casefolding (bcachefs.casefold) not
+/// restored on PATH: directory not empty", as for chattr's F, and not one
+/// of the file's errors, as in BackOtter's restic.
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+pub(crate) fn casefold_not_empty(name: &str, err: &io::Error) -> bool {
+    name == BCACHEFS_CASEFOLD && err.kind() == io::ErrorKind::DirectoryNotEmpty
+}
+
 /// The name the xattr crate takes for a node's extended attribute; see
 /// [`xattr_node_name`].
 #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
@@ -1308,6 +1326,24 @@ fn unsupported(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+    #[test]
+    fn casefold_not_empty_is_bcachefs_casefold_refused() {
+        let not_empty = io::Error::from(io::ErrorKind::DirectoryNotEmpty);
+        assert!(casefold_not_empty("bcachefs.casefold", &not_empty));
+        assert!(!casefold_not_empty("bcachefs.compression", &not_empty));
+        assert!(!casefold_not_empty("user.casefold", &not_empty));
+        assert!(!casefold_not_empty(
+            "bcachefs.casefold",
+            &io::Error::from(io::ErrorKind::PermissionDenied)
+        ));
+        #[cfg(target_os = "linux")]
+        assert!(casefold_not_empty(
+            "bcachefs.casefold",
+            &io::Error::from_raw_os_error(libc::ENOTEMPTY)
+        ));
+    }
 
     // A file illumos quarantined, as the backup builds its node from the
     // lstat and the system attributes: no contents, size 0, its size in
