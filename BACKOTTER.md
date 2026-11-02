@@ -510,7 +510,23 @@ that either program restores what the other backed up.
   Neither changes the exit status: like stock rustic's, the restore only
   warns about metadata it can't set, where BackOtter's restic fails (exit
   1) for failures other than unsupported ones. That is the one difference in
-  exit status left between the two.
+  exit status left between the two. ACLs the file system can't hold
+  (`EOPNOTSUPP`/`ENOTSUP`; on illumos an NFSv4 ACL, `illumos.acl` or one in
+  `illumos.xattr_meta`, refused with `ENOSYS` by tmpfs and UFS, which have
+  only POSIX-draft ACLs) are warned about per file, and the file keeps the
+  mode restored before it; BackOtter's restic now does the same and exits
+  0 (it had failed, exit 1).
+- A restore not running as root says nothing about an owner it isn't
+  permitted to set (`EPERM`, `EACCES`; debug log only), as BackOtter's
+  restic and stock restic (and `cp -a`, `rsync -a`) don't: stock rustic
+  warned `setting UID/GID failed` for each such file, such as the
+  root-owned directories above the restored path that rustic-bko now
+  stores. Any other failure, and every one as root, is still warned about.
+- A restore over a hard-linked file whose contents changed gives each of
+  its names the snapshot's contents, as rustic always did. BackOtter's
+  restic now does too: it replaced such a file by a new one before writing
+  it, but kept the blobs that still matched out of it, so the group came
+  back with NULs, or empty (stock restic still does).
   Where flags as a whole are refused (one only root may set, as the owner),
   the restore changes them from what the file has, one at a time, keeping
   each change accepted, and warns naming the bits it couldn't set or clear
