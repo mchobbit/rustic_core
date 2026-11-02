@@ -161,6 +161,13 @@ impl LocalSourceSaveOptions {
         }
         if matches!(node.node_type, NodeType::Fifo | NodeType::Socket) {
             node.meta.links = 0;
+            // BackOtter: and so no device ID by default (only for hard
+            // links, which are never restored for these), whatever its
+            // link count, as BackOtter's restic stores them.
+            node.meta.device_id = self
+                .set_devid
+                .unwrap_or_default()
+                .map_or_else(|| Self::device_id(m), false);
         }
         // BackOtter: the extended attributes' values after osattrs, which on
         // illumos reads their metadata first: reading a value moves its atime.

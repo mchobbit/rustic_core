@@ -649,7 +649,21 @@ that either program restores what the other backed up.
   device's mode has Go's `ModeDevice` and `ModeCharDevice` (stock rustic
   ANDs the two bits, which gives none), only a regular file has a size
   (stock rustic stores a symlink's target length), and a FIFO or a socket
-  has no link count.
+  has no link count, and so no device ID (below).
+- A node has a device ID (`device_id`) only where a restore needs one, to
+  make hard links: a file, symlink or device with more than one link, as
+  with stock rustic's default (`--set-devid hardlink`); not a directory, a
+  file with one link, or a FIFO, whose link count isn't stored (stock
+  rustic stored one for a hard-linked FIFO). BackOtter's restic stores it
+  by the same rule (restic's `device-id-for-hardlinks`, which it turns on
+  by default), so the two tools' snapshots of one tree have the same nodes,
+  and the same tree IDs in one repository; stock restic stores it on every
+  node. A device ID changes when the same files are seen through another
+  device (a btrfs subvolume or snapshot, an LVM snapshot, the disk a rescue
+  restored to), which would change every node, and so every tree, of the
+  next backup. Restores use it as before: only for nodes with more than
+  one link, so snapshots that have it on every node (stock restic's,
+  BackOtter's restic's before) restore as they did.
 - Sockets are skipped, as restic skips them: a backup leaves them out
   (stock rustic stored them), and a restore leaves out the socket nodes
   of older snapshots (stock rustic made them with `mknod`, which works on

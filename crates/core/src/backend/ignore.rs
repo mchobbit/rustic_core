@@ -491,6 +491,48 @@ mod tests {
     }
 
     #[test]
+    fn device_id_only_for_hard_links() {
+        // BackOtter: by default (--set-devid hardlink) a device ID only for
+        // a hard-linked file, not a directory, a file with one link, or a
+        // FIFO, hard-linked or not (its link count isn't stored), as
+        // BackOtter's restic stores them (device-id-for-hardlinks).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), b"data").unwrap();
+        std::fs::write(dir.path().join("linked"), b"data").unwrap();
+        std::fs::hard_link(dir.path().join("linked"), dir.path().join("linked2")).unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        nix::unistd::mkfifo(&dir.path().join("fifo"), nix::sys::stat::Mode::S_IRWXU).unwrap();
+        std::fs::hard_link(dir.path().join("fifo"), dir.path().join("fifo2")).unwrap();
+
+        let source = LocalSource::new(
+            LocalSourceSaveOptions::default(),
+            &Excludes::default(),
+            &LocalSourceFilterOptions::default(),
+            &[dir.path()],
+        )
+        .unwrap();
+        let mut ids: Vec<_> = source
+            .entries()
+            .map(|entry| {
+                let node = entry.unwrap().node;
+                (node.name().into_owned(), node.meta.device_id != 0)
+            })
+            .collect();
+        ids.sort();
+        let dir_name = dir.path().file_name().unwrap().to_owned();
+        let want = [
+            (dir_name, false),
+            ("fifo".into(), false),
+            ("fifo2".into(), false),
+            ("file".into(), false),
+            ("linked".into(), true),
+            ("linked2".into(), true),
+            ("sub".into(), false),
+        ];
+        assert_eq!(ids, want);
+    }
+
+    #[test]
     fn dir_node_is_the_directory_s_own() {
         use std::os::unix::fs::PermissionsExt;
         // BackOtter: a directory above the backed-up path gets the node an
