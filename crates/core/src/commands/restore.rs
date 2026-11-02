@@ -729,15 +729,28 @@ pub(crate) fn set_metadata(
     // BackOtter: numeric ids, unless names are asked for (--by-name); then
     // on illumos the ids an owner and group that are SIDs have here, before
     // the mode, which a change of owner can clear the setuid bit of.
+    // A change of owner refused to a restore not running as root is no
+    // warning, as in restic.
     let target = dest.path(path);
+    let chown_failed = |what: &str, err: &local_destination::LocalDestinationErrorKind| {
+        if LocalDestination::chown_refused_not_root(err) {
+            debug!(
+                "not running as root, {} of {} not set: {err}",
+                what,
+                path.display()
+            );
+        } else {
+            warn!("restore {}: setting {what} failed.", path.display());
+        }
+    };
     match ownership(opts) {
         Ownership::None => {}
         Ownership::Numeric => dest
             .set_uid_gid(path, &node.meta)
-            .unwrap_or_else(|_| warn!("restore {}: setting UID/GID failed.", path.display())),
+            .unwrap_or_else(|err| chown_failed("UID/GID", &err)),
         Ownership::ByName => dest
             .set_user_group(path, &node.meta)
-            .unwrap_or_else(|_| warn!("restore {}: setting User/Group failed.", path.display())),
+            .unwrap_or_else(|err| chown_failed("User/Group", &err)),
     }
     if ownership(opts) != Ownership::None {
         osattrs::restore_owner(&target, node)

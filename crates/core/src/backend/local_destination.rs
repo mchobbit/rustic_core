@@ -409,6 +409,28 @@ impl LocalDestination {
         Ok(())
     }
 
+    // BackOtter's.
+    /// Whether `err`, from [`Self::set_uid_gid`] or
+    /// [`Self::set_user_group`], is one a restore says nothing about: a
+    /// change of owner refused (`EPERM`, `EACCES`) to a restore not running
+    /// as root. Like restic (and `cp -a`, `rsync -a`), which reports such
+    /// errors only when it runs as root: a user can't give files away, so
+    /// the root-owned directories above the restored path, say, keep their
+    /// owners quietly.
+    #[cfg(not(windows))]
+    pub(crate) fn chown_refused_not_root(err: &LocalDestinationErrorKind) -> bool {
+        matches!(
+            err,
+            LocalDestinationErrorKind::FromErrnoError(Errno::EPERM | Errno::EACCES)
+        ) && !nix::unistd::geteuid().is_root()
+    }
+
+    /// Windows sets no owners.
+    #[cfg(windows)]
+    pub(crate) fn chown_refused_not_root(_err: &LocalDestinationErrorKind) -> bool {
+        false
+    }
+
     #[cfg(windows)]
     // TODO: Windows support
     /// Set permissions for `item` (relative to the base path) from `node`
@@ -1131,6 +1153,33 @@ mod tests {
         ExtendedAttribute {
             name: name.to_string(),
             value: Some(value.to_vec()),
+        }
+    }
+
+    /// BackOtter: a change of owner refused to a restore not running as root
+    /// is quiet (as in restic); any other failure, and every failure as
+    /// root, isn't.
+    #[test]
+    fn chown_refused_quiet_only_not_root() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f"), b"").unwrap();
+        let dest = LocalDestination::new(dir.path().to_str().unwrap(), false, false).unwrap();
+        let meta = Metadata {
+            uid: Some(0),
+            gid: Some(0),
+            ..Default::default()
+        };
+        let res = dest.set_uid_gid("f", &meta);
+        let eperm = LocalDestinationErrorKind::FromErrnoError(Errno::EPERM);
+        let eio = LocalDestinationErrorKind::FromErrnoError(Errno::EIO);
+        assert!(!LocalDestination::chown_refused_not_root(&eio));
+        if nix::unistd::geteuid().is_root() {
+            res.unwrap();
+            assert!(!LocalDestination::chown_refused_not_root(&eperm));
+        } else {
+            let err = res.unwrap_err();
+            assert!(LocalDestination::chown_refused_not_root(&err), "{err}");
+            assert!(LocalDestination::chown_refused_not_root(&eperm));
         }
     }
 
