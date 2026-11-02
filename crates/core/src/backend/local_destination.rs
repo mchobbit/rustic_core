@@ -575,10 +575,12 @@ impl LocalDestination {
                 // BackOtter: one with the right value already is left; one
                 // that can't be read is set below, as are the others.
                 Some((index, ExtendedAttribute { value, .. })) => {
-                    if xattr::get(&filename, &curr_name).is_ok_and(|curr| value == &curr) {
+                    if osattrs::xattr_get(&filename, &curr_name).is_ok_and(|curr| value == &curr) {
                         done[index] = true;
                     }
                 }
+                // BackOtter: nor the SELinux label (osattrs::xattr_never_removed).
+                None if osattrs::xattr_never_removed(&curr_node_name) => {}
                 None => {
                     if let Err(err) = xattr::remove(&filename, &curr_name) {
                         errors.push(format!("removing {curr_node_name}"), err);
@@ -1171,6 +1173,31 @@ mod tests {
         // A node without any removes them all.
         dest.set_extended_attributes("f", &[]).unwrap();
         assert_eq!(xattr::list(&file).unwrap().count(), 0);
+    }
+
+    /// BackOtter: a node without an SELinux label leaves the file's alone,
+    /// which SELinux never lets anyone remove, and removes the others.
+    /// Setting security.selinux takes root (and SELinux's leave, where it
+    /// runs): the test does nothing where it can't.
+    #[test]
+    fn selinux_label_never_removed() {
+        assert!(osattrs::xattr_never_removed("security.selinux"));
+        assert!(!osattrs::xattr_never_removed("security.capability"));
+        assert!(!osattrs::xattr_never_removed("user.selinux"));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        fs::write(&file, b"").unwrap();
+        let label = b"system_u:object_r:etc_t:s0\0";
+        if xattr::set(&file, "user.old", b"x").is_err()
+            || xattr::set(&file, "security.selinux", label).is_err()
+        {
+            eprintln!("can't set security.selinux in {}", dir.path().display());
+            return;
+        }
+        let dest = LocalDestination::new(dir.path().to_str().unwrap(), false, false).unwrap();
+        dest.set_extended_attributes("f", &[]).unwrap();
+        let names: Vec<_> = xattr::list(&file).unwrap().collect();
+        assert_eq!(names, ["security.selinux"]);
     }
 
     /// BackOtter: a file restored sparse, blob by blob, has the blobs'

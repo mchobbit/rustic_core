@@ -943,9 +943,27 @@ pub(crate) fn xattr_list(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
         .into_iter()
         .map(|name| format!("user.{name}").into())
         .collect();
-    #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
+    #[cfg(target_os = "linux")]
+    let names = os::xattr_list(path)?;
+    #[cfg(not(any(target_os = "freebsd", target_os = "netbsd", target_os = "linux")))]
     let names = xattr::list(path)?.collect();
     Ok(names)
+}
+
+/// The value of the extended attribute `name` (as the xattr crate names it)
+/// of the file at `path`, not following a symlink; `None` where it has
+/// none. On Linux, read whole here: the xattr crate read a value over 4 KiB
+/// as empty (`os::xattr_get`).
+///
+/// # Errors
+///
+/// * If it can't be read.
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+pub(crate) fn xattr_get(path: &Path, name: &std::ffi::OsStr) -> io::Result<Option<Vec<u8>>> {
+    #[cfg(target_os = "linux")]
+    return os::xattr_get(path, name);
+    #[cfg(not(target_os = "linux"))]
+    xattr::get(path, name)
 }
 
 /// The name an extended attribute has in a node, from the name the xattr
@@ -972,6 +990,24 @@ pub(crate) fn xattr_node_name(name: &std::ffi::OsStr) -> Option<String> {
         return None;
     }
     Some(name.into_owned())
+}
+
+/// The extended attribute that holds a file's SELinux label.
+pub(crate) const SELINUX_LABEL: &str = "security.selinux";
+
+/// Whether a restore leaves the extended attribute `name` (a node's name for
+/// it) alone on a file whose node hasn't got it, rather than removing it:
+/// the SELinux label, which the system gives every new file and SELinux
+/// never lets anyone remove (`EACCES`, even as root). A node without one
+/// (from a system without SELinux, a btrfs subvolume's root, a directory
+/// above the backed-up path in an older rustic-bko snapshot) keeps the label
+/// the restored file got, as in BackOtter's restic. A node with one sets it.
+#[cfg_attr(
+    any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku"),
+    allow(dead_code)
+)]
+pub(crate) fn xattr_never_removed(name: &str) -> bool {
+    name == SELINUX_LABEL
 }
 
 /// The prefix of bcachefs' extended attributes that show a file's options as

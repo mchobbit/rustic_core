@@ -578,6 +578,13 @@ that either program restores what the other backed up.
   Linux only). A socket is only the name a running program listens on;
   the program makes it again when it starts, and a restored one has
   nobody listening.
+- So are illumos doors (`S_IFDOOR`: `/etc/sysevent`, `/var/run`,
+  `/etc/svc/volatile`), quietly (debug log), as in BackOtter's restic: a
+  door is a running program's door server, made again when it starts, and
+  a restored one would have nobody behind it. Stock rustic took one for a
+  regular file, couldn't read it (`ENOSYS`) and warned about its
+  directory; stock restic failed (exit 3). `skipped_type` in
+  `backend/ignore.rs` skips any file of none of a node's types.
 - Directories above the backed-up path (`/home` in a backup of
   `/home/m`) are stored with their own metadata (their `lstat`: mode,
   owner, times, inode, extended attributes, ACLs, flags and the rest), as
@@ -600,6 +607,36 @@ that either program restores what the other backed up.
   `device` in its node, as restic leaves it out (Go's `omitempty`), so
   that the two tools' nodes are the same; stock rustic wrote
   `"device":0`. A node without one is device 0 to either tool.
+- Likewise a regular file whose mode is 0 (permissions `0000`, as
+  `/etc/shadow` has on Red Hat's and SUSE's systems) has no `mode` in its
+  node, as restic leaves it out; stock rustic wrote `"mode":0`. A restore
+  gives a regular file without one permissions `0000`, in either tool.
+- Extended attributes are read whole, however large, on Linux
+  (`osattrs::xattr_get`, `xattr_list`: `lgetxattr(2)` and `llistxattr(2)`
+  with the size they give, again on `ERANGE`). The xattr crate (1.6, on
+  rustix 1.1) reads a first 4 KiB and asks rustix for a larger value's
+  size with an empty buffer, which rustix 1.1 answers with 0: every value
+  over 4 KiB was backed up empty (a 15000-byte `user.*` on btrfs, 60000
+  bytes on XFS), and so were ACLs that long. Elsewhere the xattr crate
+  reads them (its BSD code has no such step).
+- A restore never removes a file's SELinux label (`security.selinux`)
+  where its node has none (`osattrs::xattr_never_removed`): the system
+  gives every new file one, and SELinux lets nobody remove it (`EACCES`,
+  root too), so a restore onto Rocky or openSUSE warned for every file of
+  a snapshot from a system without SELinux, a btrfs subvolume's root
+  (which has none), and the directories above the backed-up path of an
+  older snapshot; restic exited 1 there. The file keeps the label the
+  restore gave it. A node with a label sets it, as before. The same in
+  BackOtter's restic.
+- Before a restore rewrites or gives metadata to an existing file, it
+  clears its immutable and append-only flags through `FS_IOC_FSSETXATTR`,
+  then through `FS_IOC_SETFLAGS` where that left either set
+  (`clear_restricting_with` in `osattrs/linux.rs`): on Ubuntu 24.04's
+  OpenZFS (2.2) `FS_IOC_FSSETXATTR` cleared immutable but left
+  append-only, as if it read `fsx_xflags` as `FS_IOC_GETFLAGS`'s flags
+  (where `FS_XFLAG_APPEND` is immutable), and a restore over an
+  append-only file on ZFS couldn't change it (a warning per step; restic
+  exited 1); OpenZFS 2.3.9 clears both. The same in BackOtter's restic.
 - Partial restores (`--glob`, `--iglob`): directories above the matches
   that aren't matched themselves aren't streamed, so the restore creates
   them without any metadata, casefolding included, as stock rustic does.
@@ -616,8 +653,10 @@ that either program restores what the other backed up.
   filetime crate drops them where it goes through `utimes(2)`); the real
   times, set next, leave it. One that isn't earlier comes back as the
   mtime, the closest those systems can get. Elsewhere, and on a file system
-  without them (illumos' UFS and tmpfs: `ENOENT`, `EINVAL`, `ENOTSUP` on
-  the view), the attribute is only noted in the debug log. A failure
+  without them (illumos' UFS: `ENOENT`, `EINVAL`, `ENOTSUP` on the view;
+  tmpfs, which has the view but refuses a `crtime` in it with `EINVAL`),
+  the attribute is only noted in the debug log, in either tool (both had
+  reported each file on tmpfs, restic as an error). A failure
   (`EPERM` as neither owner nor root) is warned about, as for the times.
 - A restored symlink keeps its own permissions on FreeBSD (`lchmod(2)`) and
   on OpenBSD, NetBSD and DragonFly (`fchmodat(2)` with

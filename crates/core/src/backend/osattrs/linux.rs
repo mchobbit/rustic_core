@@ -423,8 +423,9 @@ pub(super) fn restore_zfs_dos_flags(path: &Path, typ: &NodeType, flags: u64) -> 
 /// changing it, leaving its other flags as they are; the late flags pass
 /// sets the node's. Through `FS_IOC_FSSETXATTR`, which leaves btrfs's
 /// `btrfs.compression` property alone (`FS_IOC_SETFLAGS` rewrites it), or
-/// `FS_IOC_SETFLAGS` where the file system has no `FS_IOC_FSSETXATTR`.
-/// Symlinks and special files have no flags.
+/// `FS_IOC_SETFLAGS` where the file system has no `FS_IOC_FSSETXATTR` or
+/// that left either set ([`clear_restricting_with`]). Symlinks and special
+/// files have no flags.
 pub(super) fn clear_restricting_flags(path: &Path) -> io::Result<()> {
     let m = std::fs::symlink_metadata(path)?;
     let typ = if m.is_dir() {
@@ -435,21 +436,51 @@ pub(super) fn clear_restricting_flags(path: &Path) -> io::Result<()> {
         return Ok(());
     };
     let f = open_for_flags(path, &typ, Some(&m))?;
-    let current = get_flags(&f).map_err(|err| path_error("FS_IOC_GETFLAGS", path, &err))?;
-    if current & (FS_IMMUTABLE_FL | FS_APPEND_FL) == 0 {
+    clear_restricting_with(
+        path,
+        || get_flags(&f),
+        |flags| set_flags(&f, flags),
+        |xflags| {
+            get_fsxattr(&f).and_then(|mut attr| {
+                attr.xflags &= !xflags;
+                set_fsxattr(&f, &attr)
+            })
+        },
+    )
+}
+
+/// Clears immutable and append-only of the file at `path` with `get`
+/// (`FS_IOC_GETFLAGS`) and `set` (`FS_IOC_SETFLAGS`) and `clear_xflags`
+/// (`FS_IOC_FSSETXATTR` without the `fsx_xflags` given): by its
+/// `fsx_xflags`, then by its flags where the file system has no
+/// `FS_IOC_FSSETXATTR`, or where that left either set. On Ubuntu 24.04's
+/// OpenZFS (2.2) `FS_IOC_FSSETXATTR` cleared immutable alone and left
+/// append-only, as if it took `fsx_xflags` for `FS_IOC_GETFLAGS`'s flags, in
+/// which `FS_XFLAG_APPEND` is `FS_IMMUTABLE_FL`; a restore over an
+/// append-only file couldn't change it there (ubuntu24, round 15). OpenZFS
+/// 2.3.9 clears both. As in BackOtter's restic.
+fn clear_restricting_with(
+    path: &Path,
+    mut get: impl FnMut() -> io::Result<u32>,
+    set: impl FnOnce(u32) -> io::Result<()>,
+    clear_xflags: impl FnOnce(u32) -> io::Result<()>,
+) -> io::Result<()> {
+    let restricting = FS_IMMUTABLE_FL | FS_APPEND_FL;
+    let mut current = get().map_err(|err| path_error("FS_IOC_GETFLAGS", path, &err))?;
+    if current & restricting == 0 {
         return Ok(());
     }
-    let by_xattr = get_fsxattr(&f).and_then(|mut attr| {
-        attr.xflags &= !(FS_XFLAG_IMMUTABLE | FS_XFLAG_APPEND);
-        set_fsxattr(&f, &attr)
-    });
-    match by_xattr {
-        Err(err) if unsupported(&err) => {
-            set_flags(&f, current & !(FS_IMMUTABLE_FL | FS_APPEND_FL))
-                .map_err(|err| path_error("FS_IOC_SETFLAGS", path, &err))
+    match clear_xflags(FS_XFLAG_IMMUTABLE | FS_XFLAG_APPEND) {
+        Ok(()) => {
+            current = get().map_err(|err| path_error("FS_IOC_GETFLAGS", path, &err))?;
+            if current & restricting == 0 {
+                return Ok(());
+            }
         }
-        result => result.map_err(|err| path_error("FS_IOC_FSSETXATTR", path, &err)),
+        Err(err) if unsupported(&err) => {}
+        Err(err) => return Err(path_error("FS_IOC_FSSETXATTR", path, &err)),
     }
+    set(current & !restricting).map_err(|err| path_error("FS_IOC_SETFLAGS", path, &err))
 }
 
 /// The DOS flags a file that has `current` gets for `flags`: the
@@ -738,6 +769,67 @@ pub(super) fn xattrs(_path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
 /// Extended attributes go through the xattr crate here.
 pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr").into())
+}
+
+/// Reads what `getxattr(2)`-like `call` gives into a buffer of the size it
+/// gives for none, again while the value grows in between (`ERANGE`): the
+/// whole value, however large. The xattr crate (1.6, on rustix 1.1) takes a
+/// first 4 KiB and, for a larger value, asks rustix for its size with an
+/// empty buffer, which rustix 1.1 answers with 0: every value over 4 KiB
+/// was read as empty, and a backup kept a 15000-byte `user.*` attribute as
+/// empty (rocky10, tumbleweed). restic reads it whole.
+fn read_whole(mut call: impl FnMut(*mut libc::c_void, usize) -> isize) -> io::Result<Vec<u8>> {
+    loop {
+        let size = call(std::ptr::null_mut(), 0);
+        let size = usize::try_from(size).map_err(|_| io::Error::last_os_error())?;
+        let mut buf = vec![0_u8; size];
+        let got = call(buf.as_mut_ptr().cast(), buf.len());
+        match usize::try_from(got) {
+            // (with an empty buffer, the call gives the size again)
+            Ok(got) if got <= buf.len() => {
+                buf.truncate(got);
+                return Ok(buf);
+            }
+            Ok(_) => {}
+            Err(_) => {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ERANGE) {
+                    return Err(err);
+                }
+            }
+        }
+    }
+}
+
+/// The value of the extended attribute `name` of the file at `path`, not
+/// following a symlink, whole ([`read_whole`]); `None` where it has none.
+pub(super) fn xattr_get(path: &Path, name: &std::ffi::OsStr) -> io::Result<Option<Vec<u8>>> {
+    use std::os::unix::ffi::OsStrExt;
+    let p = super::c_path(path)?;
+    let n = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::from)?;
+    // SAFETY: p and n are C strings, and value has room for size bytes.
+    let value = read_whole(|value, size| unsafe {
+        libc::lgetxattr(p.as_ptr(), n.as_ptr(), value, size)
+    });
+    match value {
+        Err(err) if err.raw_os_error() == Some(libc::ENODATA) => Ok(None),
+        result => result.map(Some),
+    }
+}
+
+/// The names of the extended attributes of the file at `path`, not
+/// following a symlink, all of them ([`read_whole`]).
+pub(super) fn xattr_list(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
+    use std::os::unix::ffi::OsStrExt;
+    let p = super::c_path(path)?;
+    // SAFETY: p is a C string, and list has room for size bytes.
+    let names =
+        read_whole(|list, size| unsafe { libc::llistxattr(p.as_ptr(), list.cast(), size) })?;
+    Ok(names
+        .split(|&b| b == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| std::ffi::OsStr::from_bytes(name).to_os_string())
+        .collect())
 }
 
 #[cfg(test)]
@@ -1102,6 +1194,57 @@ mod tests {
     }
 
     #[test]
+    fn clear_restricting_with_zfs_xflags() {
+        // BackOtter: OpenZFS 2.2 behaves as if it took fsx_xflags for
+        // FS_IOC_GETFLAGS's flags, where FS_XFLAG_APPEND clears immutable and
+        // append-only stays: the flags clear it then. Elsewhere fsx_xflags clear both, or a file
+        // system without FS_IOC_FSSETXATTR (ENOTTY) takes the flags.
+        const EXTENTS: u32 = 0x0008_0000;
+        let ia = FS_IMMUTABLE_FL | FS_APPEND_FL;
+        for (name, start, zfs, no_xattr, want_sets) in [
+            ("ext4 i+a", EXTENTS | ia, false, false, 0),
+            ("ext4 none", EXTENTS, false, false, 0),
+            ("no FSSETXATTR", EXTENTS | FS_APPEND_FL, false, true, 1),
+            ("zfs a", FS_APPEND_FL, true, false, 1),
+            ("zfs i+a", ia, true, false, 1),
+            ("zfs i", FS_IMMUTABLE_FL, true, false, 0),
+        ] {
+            let flags = std::cell::Cell::new(start);
+            let sets = std::cell::Cell::new(0);
+            clear_restricting_with(
+                Path::new("f"),
+                || Ok(flags.get()),
+                |f| {
+                    sets.set(sets.get() + 1);
+                    flags.set(f);
+                    Ok(())
+                },
+                |xflags| {
+                    if no_xattr {
+                        return Err(io::Error::from_raw_os_error(libc::ENOTTY));
+                    }
+                    let mut f = flags.get();
+                    if zfs {
+                        f &= !xflags;
+                    } else {
+                        if xflags & FS_XFLAG_IMMUTABLE != 0 {
+                            f &= !FS_IMMUTABLE_FL;
+                        }
+                        if xflags & FS_XFLAG_APPEND != 0 {
+                            f &= !FS_APPEND_FL;
+                        }
+                    }
+                    flags.set(f);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(flags.get(), start & !ia, "{name}");
+            assert_eq!(sets.get(), want_sets, "{name}");
+        }
+    }
+
+    #[test]
     fn bcachefs_options_and_own_project() {
         assert!(is_bcachefs_option("bcachefs.compression"));
         assert!(is_bcachefs_option("bcachefs.background_target"));
@@ -1189,5 +1332,36 @@ mod tests {
         assert!(!names.iter().any(|n| n == "bcachefs.compression"), "{names:?}");
         assert_eq!(xattr::get(&d, "bcachefs.compression").unwrap().as_deref(), Some(&b"zstd"[..]));
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn xattr_values_are_read_whole() {
+        // BackOtter: values over the xattr crate's first 4 KiB, which it read
+        // as empty, and every name.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"data").unwrap();
+        assert_eq!(xattr_get(&path, "user.none".as_ref()).unwrap(), None);
+        assert!(xattr_get(&dir.path().join("nonexistent"), "user.x".as_ref()).is_err());
+        let small = b"small".to_vec();
+        if xattr::set(&path, "user.small", &small).is_err() {
+            return; // no user.* attributes here
+        }
+        assert_eq!(xattr_get(&path, "user.small".as_ref()).unwrap(), Some(small));
+        assert_eq!(xattr_get(&path, "user.empty".as_ref()).unwrap(), None);
+        xattr::set(&path, "user.empty", b"").unwrap();
+        assert_eq!(xattr_get(&path, "user.empty".as_ref()).unwrap(), Some(Vec::new()));
+        let mut names = xattr_list(&path).unwrap();
+        names.sort();
+        assert_eq!(names, ["user.empty", "user.small"]);
+        // ext4 without ea_inode holds a block's worth; XFS, btrfs and tmpfs
+        // more.
+        for size in [4095, 4096, 4097, 15000, 60000] {
+            let big: Vec<u8> = (0..size).map(|i| u8::try_from(i % 251 + 1).unwrap()).collect();
+            if xattr::set(&path, "user.big", &big).is_err() {
+                continue;
+            }
+            assert_eq!(xattr_get(&path, "user.big".as_ref()).unwrap(), Some(big), "{size}");
+        }
     }
 }

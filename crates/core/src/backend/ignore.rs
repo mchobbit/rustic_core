@@ -344,6 +344,31 @@ impl ReadSource for LocalSource {
     }
 }
 
+/// BackOtter: what a file of type `tpe` is, where a backup skips it: a
+/// socket; or a file of none of the types a node has, an illumos door (a
+/// running program's door server, made again when it starts:
+/// /etc/sysevent, /var/run), whose restored copy would have nobody behind
+/// it, and which can't be read (`ENOSYS`), as BackOtter's restic skips
+/// them. Stock rustic took a door for a regular file and warned about its
+/// directory.
+#[cfg(unix)]
+fn skipped_type(tpe: std::fs::FileType) -> Option<&'static str> {
+    use std::os::unix::fs::FileTypeExt;
+    if tpe.is_socket() {
+        Some("a socket")
+    } else if tpe.is_file()
+        || tpe.is_dir()
+        || tpe.is_symlink()
+        || tpe.is_block_device()
+        || tpe.is_char_device()
+        || tpe.is_fifo()
+    {
+        None
+    } else {
+        Some("a door")
+    }
+}
+
 // Walk doesn't implement Debug
 #[allow(missing_debug_implementations)]
 pub struct LocalSourceWalker {
@@ -363,14 +388,13 @@ impl Iterator for LocalSourceWalker {
         let next = self.walker.next();
         // BackOtter: sockets are skipped, as restic skips them: a socket is
         // only the name a running program listens on, made again when it
-        // starts, and a restored one has nobody listening.
+        // starts, and a restored one has nobody listening. So are illumos'
+        // doors (skipped_type).
         #[cfg(unix)]
         while let Some(Ok(entry)) = &next
-            && entry
-                .file_type()
-                .is_some_and(|tpe| std::os::unix::fs::FileTypeExt::is_socket(&tpe))
+            && let Some(what) = entry.file_type().and_then(skipped_type)
         {
-            debug!("{} is a socket, ignoring", entry.path().display());
+            debug!("{} is {what}, ignoring", entry.path().display());
             next = self.walker.next();
         }
         match next {
@@ -416,6 +440,22 @@ mod tests {
 
     use super::*;
     use crate::backend::ReadSource;
+
+    #[test]
+    fn skipped_types() {
+        // BackOtter: sockets, and doors (illumos): types no node has.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f"), b"x").unwrap();
+        let _listener = UnixListener::bind(dir.path().join("s")).unwrap();
+        let tpe = |name: &str| {
+            std::fs::symlink_metadata(dir.path().join(name))
+                .unwrap()
+                .file_type()
+        };
+        assert_eq!(skipped_type(tpe("f")), None);
+        assert_eq!(skipped_type(tpe(".")), None);
+        assert_eq!(skipped_type(tpe("s")), Some("a socket"));
+    }
 
     #[test]
     fn sockets_are_skipped() {

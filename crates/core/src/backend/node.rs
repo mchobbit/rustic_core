@@ -252,6 +252,11 @@ impl NodeType {
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Metadata {
     /// Unix file mode
+    // BackOtter: none for mode 0 (a regular file with permissions 0000, such
+    // as /etc/shadow), as restic leaves it out (Go's omitempty); stock
+    // rustic wrote `"mode":0`. A restore gives a regular file without one
+    // mode 0000, in either tool.
+    #[serde(default, skip_serializing_if = "mode_is_zero")]
     pub mode: Option<u32>,
     /// Unix mtime (last modification time)
     #[serde_as(as = "Option<RusticTime>")]
@@ -289,6 +294,13 @@ pub struct Metadata {
 
 pub(crate) fn is_default<T: Default + PartialEq>(t: &T) -> bool {
     t == &T::default()
+}
+
+/// BackOtter: whether a node's mode is left out: none, or 0, as restic
+/// leaves it out (Go's omitempty).
+#[allow(clippy::ref_option, clippy::trivially_copy_pass_by_ref)]
+fn mode_is_zero(mode: &Option<u32>) -> bool {
+    mode.is_none_or(|mode| mode == 0)
 }
 
 /// Extended attribute of a [`Node`]
@@ -644,6 +656,30 @@ mod tests {
             let node = NodeType::from_link(path);
             prop_assert_eq!(path, node.to_link());
     }
+    }
+
+    #[test]
+    fn mode_zero_is_left_out() {
+        // BackOtter: as restic stores a regular file with permissions 0000
+        // (Go's omitempty).
+        let meta = Metadata {
+            mode: Some(0),
+            ..Default::default()
+        };
+        let node = Node::new_node(OsStr::new("shadow"), NodeType::File, meta);
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(!json.contains("\"mode\""), "{json}");
+        let back: Node = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.meta.mode, None);
+        let meta = Metadata {
+            mode: Some(0o640),
+            ..Default::default()
+        };
+        let node = Node::new_node(OsStr::new("f"), NodeType::File, meta);
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains("\"mode\":416"), "{json}");
+        let back: Node = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.meta.mode, Some(0o640));
     }
 
     #[test]
