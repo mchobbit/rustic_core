@@ -658,9 +658,8 @@ that either program restores what the other backed up.
   file with one link, or a FIFO, whose link count isn't stored (stock
   rustic stored one for a hard-linked FIFO). BackOtter's restic stores it
   by the same rule (restic's `device-id-for-hardlinks`, which it turns on
-  by default), so the two tools' snapshots of one tree have the same nodes,
-  and the same tree IDs in one repository; stock restic stores it on every
-  node. A device ID changes when the same files are seen through another
+  by default), so the two tools' snapshots of one tree have the same nodes
+  (not the same tree IDs: below); stock restic stores it on every node. A device ID changes when the same files are seen through another
   device (a btrfs subvolume or snapshot, an LVM snapshot, the disk a rescue
   restored to), which would change every node, and so every tree, of the
   next backup. Restores use it as before: only for nodes with more than
@@ -774,6 +773,19 @@ that either program restores what the other backed up.
   only the trees' bytes, and so their ids, differed. Other offsets were
   already written alike (`+02:00`). A snapshot's own `time` still has
   `+00:00` (stock rustic).
+- Accepted difference (both tools): the two tools' snapshots of one tree
+  have the same nodes but not the same trees' bytes, so not the same tree
+  IDs, even in one repository. rustic writes a symlink's `linktarget` and
+  `linktarget_raw`, and a device's `device`, right after `type` (serde's
+  `flatten` of `NodeType`); restic writes them after `links`, in its `Node`
+  struct's order. And restic escapes `<`, `>` and `&` in names and other
+  strings (`\u003c`, Go's `json.Marshal`), which serde_json doesn't. So a
+  directory holding a symlink, a device or such a name gets a different
+  tree in each tool, and so does every directory above it, the root
+  included. The files' data blobs, and the trees that hold none of these,
+  are shared between the tools. Either tool restores the other's
+  snapshots; BackOtter's checks compare the two tools' snapshots node by
+  node, never by tree ID.
 - The owner names a backup keeps are looked up once per uid and gid in a
   run, and on restore with `--by-name` the ids once per name, found or not:
   the cached crate (2.x) stopped caching a lookup that found nothing, so
