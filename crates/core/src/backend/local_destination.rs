@@ -555,91 +555,8 @@ impl LocalDestination {
         if !xattr::SUPPORTED_PLATFORM {
             return Ok(());
         }
-        let mut done = vec![false; extended_attributes.len()];
-        let mut errors = osattrs::XattrErrors::default();
-
-        // BackOtter: osattrs::xattr_list, as the xattr crate's list misnames
-        // one on FreeBSD; and a file that can't have any (a FIFO on ZFS)
-        // needs none. Where they can't be listed for another reason, they
-        // are still set, as in restic.
-        let curr_names = match osattrs::xattr_list(&filename) {
-            Ok(names) => names,
-            Err(err)
-                if err.kind() == std::io::ErrorKind::Unsupported
-                    && extended_attributes.is_empty() =>
-            {
-                return Ok(());
-            }
-            // BackOtter: a file system without them; the warning names
-            // each attribute, as it does those that can't be set.
-            Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {
-                for ExtendedAttribute { name, .. } in extended_attributes {
-                    errors.push(name.as_str(), osattrs::same_error(&err));
-                }
-                return Err(LocalDestinationErrorKind::XattrsNotSet(errors));
-            }
-            Err(err) => {
-                errors.push("listing", err);
-                Vec::new()
-            }
-        };
-        for curr_name in curr_names {
-            // BackOtter: restic's names; FreeBSD's system namespace is
-            // restored from a generic attribute (osattrs), and left alone.
-            let Some(curr_node_name) = osattrs::xattr_node_name(&curr_name) else {
-                continue;
-            };
-            match extended_attributes
-                .iter()
-                .enumerate()
-                .find(|(_, ExtendedAttribute { name, .. })| name == &curr_node_name)
-            {
-                // BackOtter: one with the right value already is left; one
-                // that can't be read is set below, as are the others.
-                Some((index, ExtendedAttribute { value, .. })) => {
-                    if osattrs::xattr_get(&filename, &curr_name).is_ok_and(|curr| value == &curr) {
-                        done[index] = true;
-                    }
-                }
-                // BackOtter: nor the SELinux label (osattrs::xattr_never_removed).
-                None if osattrs::xattr_never_removed(&curr_node_name) => {}
-                None => {
-                    if let Err(err) = xattr::remove(&filename, &curr_name) {
-                        // BackOtter: bcachefs refusing to clear casefolding
-                        // on a directory with entries is a warning.
-                        if osattrs::casefold_not_empty(&curr_node_name, &err) {
-                            warn_casefold_not_empty(&curr_node_name, &filename);
-                        } else {
-                            errors.push(format!("removing {curr_node_name}"), err);
-                        }
-                    }
-                }
-            }
-        }
-
-        for (index, ExtendedAttribute { name, value }) in extended_attributes.iter().enumerate() {
-            if !done[index] {
-                let os_name = osattrs::xattr_os_name(name);
-                // BackOtter: not one that isn't kept (bcachefs_effective.*,
-                // which stock restic keeps), whose setting does nothing.
-                if osattrs::xattr_node_name(os_name.as_ref()).is_none() {
-                    continue;
-                }
-                if let Err(err) =
-                    xattr::set(&filename, os_name, value.as_ref().unwrap_or(&Vec::new()))
-                {
-                    // BackOtter: bcachefs refusing casefolding on a
-                    // directory with entries is a warning, as for F.
-                    if osattrs::casefold_not_empty(name, &err) {
-                        warn_casefold_not_empty(name, &filename);
-                    } else {
-                        errors.push(name.as_str(), err);
-                    }
-                }
-            }
-        }
-
-        errors.into_result().map_err(LocalDestinationErrorKind::XattrsNotSet)
+        set_xattrs_with(&SystemXattrs, &filename, extended_attributes)
+            .map_err(LocalDestinationErrorKind::XattrsNotSet)
     }
 
     /// Set length of `item` (relative to the base path)
@@ -1012,6 +929,142 @@ impl LocalDestination {
     }
 }
 
+/// BackOtter: the calls [`set_xattrs_with`] makes to read and change a
+/// file's extended attributes, by the names the xattr crate takes: the
+/// system's ([`SystemXattrs`]), or a test's.
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+trait XattrCalls {
+    fn list(&self, path: &Path) -> std::io::Result<Vec<std::ffi::OsString>>;
+    fn get(&self, path: &Path, name: &std::ffi::OsStr) -> std::io::Result<Option<Vec<u8>>>;
+    fn set(&self, path: &Path, name: &str, value: &[u8]) -> std::io::Result<()>;
+    fn remove(&self, path: &Path, name: &std::ffi::OsStr) -> std::io::Result<()>;
+    /// Says that bcachefs refused to change the casefolding (`name`) of
+    /// `path`, a directory with entries ([`osattrs::casefold_not_empty`]).
+    fn warn_casefold(&self, name: &str, path: &Path);
+}
+
+/// BackOtter: the system's extended attribute calls, through osattrs and
+/// the xattr crate.
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+struct SystemXattrs;
+
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+impl XattrCalls for SystemXattrs {
+    fn list(&self, path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+        osattrs::xattr_list(path)
+    }
+    fn get(&self, path: &Path, name: &std::ffi::OsStr) -> std::io::Result<Option<Vec<u8>>> {
+        osattrs::xattr_get(path, name)
+    }
+    fn set(&self, path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
+        xattr::set(path, name, value)
+    }
+    fn remove(&self, path: &Path, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        xattr::remove(path, name)
+    }
+    fn warn_casefold(&self, name: &str, path: &Path) {
+        warn_casefold_not_empty(name, path);
+    }
+}
+
+/// BackOtter: gives `filename` exactly the extended attributes
+/// `extended_attributes`, with `calls` ([`LocalDestination::set_extended_attributes`]).
+///
+/// # Errors
+///
+/// * Each extended attribute that couldn't be set or removed, and a failure
+///   to list them, all in one.
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+fn set_xattrs_with(
+    calls: &impl XattrCalls,
+    filename: &Path,
+    extended_attributes: &[ExtendedAttribute],
+) -> Result<(), osattrs::XattrErrors> {
+    let mut done = vec![false; extended_attributes.len()];
+    let mut errors = osattrs::XattrErrors::default();
+
+    // BackOtter: osattrs::xattr_list, as the xattr crate's list misnames
+    // one on FreeBSD; and a file that can't have any (a FIFO on ZFS)
+    // needs none. Where they can't be listed for another reason, they
+    // are still set, as in restic.
+    let curr_names = match calls.list(filename) {
+        Ok(names) => names,
+        Err(err)
+            if err.kind() == std::io::ErrorKind::Unsupported
+                && extended_attributes.is_empty() =>
+        {
+            return Ok(());
+        }
+        // BackOtter: a file system without them; the warning names
+        // each attribute, as it does those that can't be set.
+        Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {
+            for ExtendedAttribute { name, .. } in extended_attributes {
+                errors.push(name.as_str(), osattrs::same_error(&err));
+            }
+            return Err(errors);
+        }
+        Err(err) => {
+            errors.push("listing", err);
+            Vec::new()
+        }
+    };
+    for curr_name in curr_names {
+        // BackOtter: restic's names; FreeBSD's system namespace is
+        // restored from a generic attribute (osattrs), and left alone.
+        let Some(curr_node_name) = osattrs::xattr_node_name(&curr_name) else {
+            continue;
+        };
+        match extended_attributes
+            .iter()
+            .enumerate()
+            .find(|(_, ExtendedAttribute { name, .. })| name == &curr_node_name)
+        {
+            // BackOtter: one with the right value already is left; one
+            // that can't be read is set below, as are the others.
+            Some((index, ExtendedAttribute { value, .. })) => {
+                if calls.get(filename, &curr_name).is_ok_and(|curr| value == &curr) {
+                    done[index] = true;
+                }
+            }
+            // BackOtter: nor the SELinux label (osattrs::xattr_never_removed).
+            None if osattrs::xattr_never_removed(&curr_node_name) => {}
+            None => {
+                if let Err(err) = calls.remove(filename, &curr_name) {
+                    // BackOtter: bcachefs refusing to clear casefolding
+                    // on a directory with entries is a warning.
+                    if osattrs::casefold_not_empty(&curr_node_name, &err) {
+                        calls.warn_casefold(&curr_node_name, filename);
+                    } else {
+                        errors.push(format!("removing {curr_node_name}"), err);
+                    }
+                }
+            }
+        }
+    }
+
+    for (index, ExtendedAttribute { name, value }) in extended_attributes.iter().enumerate() {
+        if !done[index] {
+            let os_name = osattrs::xattr_os_name(name);
+            // BackOtter: not one that isn't kept (bcachefs_effective.*,
+            // which stock restic keeps), whose setting does nothing.
+            if osattrs::xattr_node_name(os_name.as_ref()).is_none() {
+                continue;
+            }
+            if let Err(err) = calls.set(filename, &os_name, value.as_deref().unwrap_or_default()) {
+                // BackOtter: bcachefs refusing casefolding on a
+                // directory with entries is a warning, as for F.
+                if osattrs::casefold_not_empty(name, &err) {
+                    calls.warn_casefold(name, filename);
+                } else {
+                    errors.push(name.as_str(), err);
+                }
+            }
+        }
+    }
+
+    errors.into_result()
+}
+
 /// BackOtter: the warning for bcachefs refusing to change the casefolding
 /// (`name`, `bcachefs.casefold`) of `path`, a directory with entries
 /// ([`osattrs::casefold_not_empty`]), as BackOtter's restic gives it.
@@ -1245,6 +1298,123 @@ mod tests {
         // A node without any removes them all.
         dest.set_extended_attributes("f", &[]).unwrap();
         assert_eq!(xattr::list(&file).unwrap().count(), 0);
+    }
+
+    /// BackOtter: extended attribute calls on one file, kept in a map: those
+    /// in `not_empty` are refused, set or removed, with `ENOTEMPTY`, as
+    /// bcachefs refuses `bcachefs.casefold` on a directory with entries.
+    #[derive(Default)]
+    struct FakeXattrs {
+        attrs: std::cell::RefCell<std::collections::BTreeMap<String, Vec<u8>>>,
+        not_empty: Vec<&'static str>,
+        warned: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl FakeXattrs {
+        fn with(attrs: &[(&str, &[u8])], not_empty: &[&'static str]) -> Self {
+            Self {
+                attrs: std::cell::RefCell::new(
+                    attrs
+                        .iter()
+                        .map(|(n, v)| ((*n).to_string(), v.to_vec()))
+                        .collect(),
+                ),
+                not_empty: not_empty.to_vec(),
+                warned: std::cell::RefCell::default(),
+            }
+        }
+
+        fn refuse(&self, name: &str) -> std::io::Result<()> {
+            if self.not_empty.contains(&name) {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY));
+            }
+            Ok(())
+        }
+
+        fn names(&self) -> Vec<String> {
+            self.attrs.borrow().keys().cloned().collect()
+        }
+    }
+
+    impl XattrCalls for FakeXattrs {
+        fn list(&self, _path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+            Ok(self.attrs.borrow().keys().map(Into::into).collect())
+        }
+        fn get(&self, _path: &Path, name: &std::ffi::OsStr) -> std::io::Result<Option<Vec<u8>>> {
+            Ok(self.attrs.borrow().get(&*name.to_string_lossy()).cloned())
+        }
+        fn set(&self, _path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
+            self.refuse(name)?;
+            _ = self
+                .attrs
+                .borrow_mut()
+                .insert(name.to_string(), value.to_vec());
+            Ok(())
+        }
+        fn remove(&self, _path: &Path, name: &std::ffi::OsStr) -> std::io::Result<()> {
+            let name = name.to_string_lossy();
+            self.refuse(&name)?;
+            _ = self.attrs.borrow_mut().remove(&*name);
+            Ok(())
+        }
+        fn warn_casefold(&self, name: &str, path: &Path) {
+            self.warned
+                .borrow_mut()
+                .push(format!("{name} {}", path.display()));
+        }
+    }
+
+    /// BackOtter: bcachefs refusing to set `bcachefs.casefold` on a directory
+    /// with entries (`ENOTEMPTY`) is a warning, not an error, and the
+    /// directory's other attributes are still set and removed; `ENOTEMPTY`
+    /// for any other attribute stays an error.
+    #[test]
+    fn casefold_not_empty_set_is_warning() {
+        let dir = Path::new("/r/d");
+        let calls = FakeXattrs::with(
+            &[("user.old", b"x"), ("user.same", b"s")],
+            &["bcachefs.casefold"],
+        );
+        let attrs = [
+            xattr("bcachefs.casefold", b"1"),
+            xattr("user.new", b"n"),
+            xattr("user.same", b"s"),
+        ];
+        set_xattrs_with(&calls, dir, &attrs).unwrap();
+        assert_eq!(calls.names(), ["user.new", "user.same"]);
+        assert_eq!(*calls.warned.borrow(), ["bcachefs.casefold /r/d"]);
+
+        let calls = FakeXattrs::with(&[], &["user.notempty"]);
+        let attrs = [xattr("user.notempty", b"1"), xattr("user.b", b"2")];
+        let err = set_xattrs_with(&calls, dir, &attrs).unwrap_err().to_string();
+        assert!(err.starts_with("user.notempty: "), "{err}");
+        assert_eq!(calls.names(), ["user.b"]);
+        assert!(calls.warned.borrow().is_empty());
+    }
+
+    /// BackOtter: the same for removing `bcachefs.casefold` from a
+    /// directory whose node hasn't got it.
+    #[test]
+    fn casefold_not_empty_remove_is_warning() {
+        let dir = Path::new("/r/d");
+        let calls = FakeXattrs::with(
+            &[("bcachefs.casefold", b"1"), ("user.old", b"x")],
+            &["bcachefs.casefold"],
+        );
+        set_xattrs_with(&calls, dir, &[xattr("user.new", b"n")]).unwrap();
+        assert_eq!(calls.names(), ["bcachefs.casefold", "user.new"]);
+        assert_eq!(*calls.warned.borrow(), ["bcachefs.casefold /r/d"]);
+
+        let calls = FakeXattrs::with(
+            &[("user.notempty", b"1"), ("user.old", b"x")],
+            &["user.notempty"],
+        );
+        let err = set_xattrs_with(&calls, dir, &[xattr("user.new", b"n")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("removing user.notempty: "), "{err}");
+        assert_eq!(calls.names(), ["user.new", "user.notempty"]);
+        assert!(calls.warned.borrow().is_empty());
     }
 
     /// BackOtter: a node without an SELinux label leaves the file's alone,
