@@ -609,7 +609,7 @@ pub(super) fn restore_symlink_mode(_path: &Path, _node: &Node) -> io::Result<()>
 /// `SUNWattr_rw` view, sets it and leaves everything else. This goes before
 /// the system attributes, since an immutable file refuses it. Symlinks have
 /// no view of their own (it is their target's), the other types none, and
-/// neither has UFS or tmpfs.
+/// UFS has none; tmpfs has one, but refuses a `crtime`.
 pub(super) fn restore_birthtime(path: &Path, node: &Node, birth: Timestamp) -> io::Result<()> {
     let f = match sysattr_view(path, &node.node_type, true) {
         Ok(f) => f,
@@ -624,8 +624,24 @@ pub(super) fn restore_birthtime(path: &Path, node: &Node, birth: Timestamp) -> i
         }
         Err(err) => return Err(path_error("open SUNWattr_rw", path, &err)),
     };
-    f.write_all_at(&illumos_sysattr::crtime_nvlist(birth), 0)
-        .map_err(|err| path_error("write SUNWattr_rw crtime", path, &err))
+    // BackOtter: tmpfs has the view, but refuses a crtime (EINVAL): it keeps
+    // none it can be given, as UFS, which has no view; no error, nor a
+    // warning, as in BackOtter's restic.
+    match f.write_all_at(&illumos_sysattr::crtime_nvlist(birth), 0) {
+        Err(err) if birthtime_unsupported(&err) => {
+            Err(io::Error::new(io::ErrorKind::Unsupported, err))
+        }
+        result => result.map_err(|err| path_error("write SUNWattr_rw crtime", path, &err)),
+    }
+}
+
+/// Whether `err`, from writing a `crtime` to a file's `SUNWattr_rw` view,
+/// says its file system keeps none it can be given (tmpfs: `EINVAL`).
+fn birthtime_unsupported(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EINVAL | libc::ENOTSUP | libc::EOPNOTSUPP | libc::ENOSYS)
+    )
 }
 
 /// The system attribute views in every attribute directory, which aren't

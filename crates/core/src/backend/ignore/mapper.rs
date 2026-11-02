@@ -287,9 +287,11 @@ impl LocalSourceSaveOptions {
             .map(|(node_name, name)| {
                 Ok(ExtendedAttribute {
                     name: node_name,
-                    value: xattr::get(path, name).map_err(|err| IgnoreErrorKind::ErrorXattr {
-                        path: path.to_path_buf(),
-                        source: err,
+                    value: osattrs::xattr_get(path, &name).map_err(|err| {
+                        IgnoreErrorKind::ErrorXattr {
+                            path: path.to_path_buf(),
+                            source: err,
+                        }
                     })?,
                 })
             })
