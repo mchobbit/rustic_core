@@ -343,7 +343,9 @@ that either program restores what the other backed up.
   `osattrs::restore_attributes`); an attribute the restore left out is left
   alone. This goes before the file's own times (writing an attribute file
   leaves them) and flags. A snapshot without the attribute restores as
-  before.
+  before. An attribute the file has already, with its node's value, is
+  left as it is (read and compared first; only one of the same size is
+  read), as on every other system and in BackOtter's restic.
 - FreeBSD ZFS project IDs (`freebsd.zfs_project`) are restored with the
   system extended attributes, before the flags, as each node's own ID and
   inheritance, as on illumos; on UFS (`ENOTTY`) they get one warning per
