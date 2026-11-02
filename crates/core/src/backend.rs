@@ -11,7 +11,12 @@ pub(crate) mod osattrs;
 pub(crate) mod stdin;
 pub(crate) mod warm_up;
 
-use std::{io::Read, ops::Deref, path::PathBuf, sync::Arc};
+use std::{
+    io::Read,
+    ops::Deref,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use bytes::{Buf, Bytes, buf::Reader};
 use enum_map::Enum;
@@ -566,6 +571,14 @@ pub trait ReadSource: Sync + Send {
 
     /// Returns an iterator over the entries of the source.
     fn entries(&self) -> Self::Iter;
+
+    /// BackOtter: the node of the directory at `path`, above the paths the
+    /// source gives (`/home` for a backup of `/home/m`), with its own
+    /// metadata, as restic stores it; `None` where the source has no such
+    /// directory, which then gets a node of rustic's own making.
+    fn dir_node(&self, _path: &Path) -> Option<Node> {
+        None
+    }
 }
 
 /// The backends a repository can be initialized and operated on

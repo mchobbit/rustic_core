@@ -90,31 +90,51 @@ impl LocalSourceSaveOptions {
                 name: name.to_string_lossy().to_string(),
                 source: err,
             })?;
+        let node = self.map_path(entry.path(), name, &m)?;
+        let path = entry.into_path();
+        // BackOtter: a file with holes is read by its data extents.
+        let open = Some(OpenFile::new(path.clone(), osattrs::is_sparse(&node)));
+        Ok(ReadSourceEntry { path, node, open })
+    }
 
+    /// BackOtter: the [`Node`] of the entry at `path`, named `name`, whose
+    /// `lstat` is `m`: what a backup stores for it, for an entry the walk
+    /// gives ([`Self::map_entry`]) and for a directory above the backed-up
+    /// paths (`LocalSource`'s `dir_node`), as restic stores both.
+    ///
+    /// # Errors
+    ///
+    /// * If a symlink's target could not be read.
+    pub(crate) fn map_path(
+        self,
+        path: &Path,
+        name: &OsStr,
+        m: &std::fs::Metadata,
+    ) -> IgnoreResult<Node> {
         let mtime = m.modified().ok().and_then(|t| Timestamp::try_from(t).ok());
         let atime = || m.accessed().ok().and_then(|t| Timestamp::try_from(t).ok());
         let atime = self
             .set_atime
             .unwrap_or(TimeOption::Yes)
             .map_or_else(atime, mtime);
-        let ctime = || Self::ctime(&m);
+        let ctime = || Self::ctime(m);
         let ctime = self
             .set_ctime
             .unwrap_or(TimeOption::Yes)
             .map_or_else(ctime, mtime);
 
-        let (uid, user, gid, group) = Self::user_group(&m);
+        let (uid, user, gid, group) = Self::user_group(m);
         let size = if m.is_dir() { 0 } else { m.len() };
         let device_id = self
             .set_devid
             .unwrap_or_default()
-            .map_or_else(|| Self::device_id(&m), Self::hardlink(&m));
+            .map_or_else(|| Self::device_id(m), Self::hardlink(m));
         let xattr = || {
-            Self::xattrs(entry.path())
+            Self::xattrs(path)
                 .inspect_err(|err| warn!("ignoring error obtaining xargs: {err}"))
                 .unwrap_or_default()
         };
-        let (mode, inode, links) = Self::nix_infos(&m);
+        let (mode, inode, links) = Self::nix_infos(m);
 
         let meta = Metadata {
             mode,
@@ -133,7 +153,7 @@ impl LocalSourceSaveOptions {
             generic_attributes: GenericAttributes::default(),
         };
 
-        let mut node = self.to_node(&entry, &m, meta)?;
+        let mut node = self.to_node(path, name, m, meta)?;
         // BackOtter: a size only for a file, and no link count for a FIFO or
         // a socket, as restic stores them.
         if !node.is_file() {
@@ -145,33 +165,29 @@ impl LocalSourceSaveOptions {
         // BackOtter: the extended attributes' values after osattrs, which on
         // illumos reads their metadata first: reading a value moves its atime.
         let set_xattrs = self.set_xattrs.unwrap_or_default();
-        osattrs::fill(entry.path(), &mut node, &m, set_xattrs == XattrOption::Yes);
+        osattrs::fill(path, &mut node, m, set_xattrs == XattrOption::Yes);
         // BackOtter: a file illumos quarantined (av_quarantined) can't be
         // read, by root either, nor its extended attributes: its node is
         // kept without them or its contents, with a warning, as in
         // BackOtter's restic (the archiver reads no contents for it).
-        if osattrs::is_quarantined(&node) && osattrs::open_refused(entry.path()) {
-            osattrs::keep_unread(entry.path(), &mut node);
+        if osattrs::is_quarantined(&node) && osattrs::open_refused(path) {
+            osattrs::keep_unread(path, &mut node);
         } else {
             node.meta.extended_attributes = set_xattrs.map_or_else(xattr);
         }
-        let path = entry.into_path();
-        // BackOtter: a file with holes is read by its data extents.
-        let open = Some(OpenFile::new(path.clone(), osattrs::is_sparse(&node)));
-        Ok(ReadSourceEntry { path, node, open })
+        Ok(node)
     }
 
     fn to_node(
         self,
-        entry: &DirEntry,
+        path: &Path,
+        name: &OsStr,
         m: &std::fs::Metadata,
         meta: Metadata,
     ) -> IgnoreResult<Node> {
-        let name = entry.file_name();
         let node = if m.is_dir() {
             Node::new_node(name, NodeType::Dir, meta)
         } else if m.is_symlink() {
-            let path = entry.path();
             let target = std::fs::read_link(path).map_err(|err| IgnoreErrorKind::ErrorLink {
                 path: path.to_path_buf(),
                 source: err,
