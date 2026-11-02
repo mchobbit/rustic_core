@@ -53,6 +53,14 @@ pub const DRAGONFLY_FILE_FLAGS: &str = "dragonfly.file_flags";
 /// `linux.inode_flags` doesn't carry: a 64-bit mask, 0 included, when it
 /// isn't archive alone.
 pub const LINUX_ZFS_DOS_FLAGS: &str = "linux.zfs_dos_flags";
+/// The FAT attributes of a file on Linux's vfat or msdos
+/// (`FAT_IOCTL_GET_ATTRIBUTES`): read-only, hidden, system and archive, as a
+/// number, 0 included, when they aren't what a new file (archive alone, its
+/// read-only in its mode) or directory (none) has.
+pub const LINUX_FAT_ATTRS: &str = "linux.fat_attrs";
+/// A file's options on XFS (`FS_IOC_FSGETXATTR`) that `linux.inode_flags`
+/// and `linux.project_id` don't carry: [`XfsOptions`], when it has any.
+pub const LINUX_XFS_OPTIONS: &str = "linux.xfs_options";
 /// A file's birth (creation) time, on FreeBSD and NetBSD (`st_birthtim`)
 /// and illumos (ZFS's `crtime`): RFC 3339 in UTC with its nanoseconds, the
 /// form of a node's mtime.
@@ -113,7 +121,31 @@ pub const KNOWN: &[&str] = &[
     ILLUMOS_UNREAD_SIZE,
     HAIKU_ATTRIBUTES,
     FREEBSD_ZFS_PROJECT,
+    LINUX_FAT_ATTRS,
+    LINUX_XFS_OPTIONS,
 ];
+
+/// The value of [`LINUX_XFS_OPTIONS`]: the kept `fsx_xflags` (extent size
+/// hint `e`, its inheritance `E`, nodefrag `f`, filestream `S`, nosymlinks
+/// `n`, copy-on-write extent size hint `C`), and the two hints' sizes in
+/// bytes, left out when 0, as BackOtter's restic writes them:
+/// `{"cowextsize":2097152,"extsize":1048576,"xflags":67584}`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XfsOptions {
+    /// The copy-on-write extent size hint, in bytes.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cowextsize: u32,
+    /// The extent size hint, in bytes.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub extsize: u32,
+    /// The kept `fsx_xflags`.
+    pub xflags: u32,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if
+const fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
 
 /// A node's generic attributes, by name.
 ///
@@ -192,6 +224,20 @@ impl GenericAttributes {
     /// `name`, 0 too: the caller decides when there is none.
     pub fn set_u64(&mut self, name: &str, n: u64) {
         _ = self.0.insert(name.to_string(), n.into());
+    }
+
+    /// The value of the attribute `name`, decoded as a `T` (an object, such
+    /// as [`XfsOptions`]), if there is one. One that can't be is skipped,
+    /// with a warning once per attribute name.
+    #[must_use]
+    pub fn decoded<T: DeserializeOwned>(&self, name: &str) -> Option<T> {
+        match self.get(name)? {
+            Ok(v) => Some(v),
+            Err(err) => {
+                warn_malformed(name, &err);
+                None
+            }
+        }
     }
 
     /// Whether the attribute `name` (`unix.sparse`) is there and `true`. One
@@ -316,6 +362,37 @@ mod tests {
         assert!(json.contains(r#""freebsd.file_flags":0"#), "{json}");
         let again: Node = serde_json::from_str(&json).unwrap();
         assert_eq!(again.meta.generic_attributes.number(FREEBSD_FILE_FLAGS), Some(0));
+    }
+
+    // FAT attributes, 0 too, and XFS options in the form BackOtter's restic
+    // writes them: keys in byte order, the sizes left out when 0.
+    #[test]
+    fn fat_attrs_and_xfs_options_json() {
+        let mut node = Node::default();
+        node.meta.generic_attributes.set_u64(LINUX_FAT_ATTRS, 0);
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains(r#""generic_attributes":{"linux.fat_attrs":0}"#), "{json}");
+
+        let mut attrs = GenericAttributes::default();
+        attrs.set(LINUX_XFS_OPTIONS, &XfsOptions { xflags: 0x2000, ..XfsOptions::default() }).unwrap();
+        assert_eq!(
+            serde_json::to_string(&attrs).unwrap(),
+            r#"{"linux.xfs_options":{"xflags":8192}}"#
+        );
+        let opts = XfsOptions { cowextsize: 2 << 20, extsize: 1 << 20, xflags: 0x10800 };
+        attrs.set(LINUX_XFS_OPTIONS, &opts).unwrap();
+        let json = serde_json::to_string(&attrs).unwrap();
+        assert_eq!(
+            json,
+            r#"{"linux.xfs_options":{"cowextsize":2097152,"extsize":1048576,"xflags":67584}}"#
+        );
+        let again: GenericAttributes = serde_json::from_str(&json).unwrap();
+        assert_eq!(again.decoded::<XfsOptions>(LINUX_XFS_OPTIONS), Some(opts));
+        for bad in ["8192", r#"{"xflags":-1}"#, r#"{"extsize":"x"}"#] {
+            let attrs: GenericAttributes =
+                serde_json::from_str(&format!(r#"{{"linux.xfs_options":{bad}}}"#)).unwrap();
+            assert_eq!(attrs.decoded::<XfsOptions>(LINUX_XFS_OPTIONS), None, "{bad}");
+        }
     }
 
     #[test]

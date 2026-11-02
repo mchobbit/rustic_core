@@ -10,8 +10,9 @@
 //! file flags last of all, once every file has its contents, hard links and
 //! other metadata: an immutable file refuses new hard links, times and
 //! permissions, and an immutable directory new entries. On Linux, ZFS's DOS
-//! flags go on just before the file flags: a read-only file refuses writes,
-//! and every write sets the archive flag again.
+//! flags, FAT's attributes and XFS's options go on just before the file
+//! flags: a read-only file refuses writes, and every write sets the archive
+//! flag again.
 //!
 //! Every Unix also marks regular files with holes (`unix.sparse`), for the
 //! backup to read them by their data extents and the restore to make them
@@ -41,7 +42,8 @@ use log::{debug, warn};
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType,
     generic_attributes::{
-        ILLUMOS_SYSTEM_ATTRIBUTES, ILLUMOS_UNREAD_SIZE, KNOWN, UNIX_BIRTHTIME, UNIX_SPARSE,
+        ILLUMOS_SYSTEM_ATTRIBUTES, ILLUMOS_UNREAD_SIZE, KNOWN, LINUX_FAT_ATTRS, LINUX_XFS_OPTIONS,
+        UNIX_BIRTHTIME, UNIX_SPARSE, XfsOptions,
     },
 };
 
@@ -197,6 +199,24 @@ pub(crate) fn zfs_dos_flags(node: &Node) -> Option<u64> {
     os::ZFS_DOS_FLAGS.and_then(|name| node.meta.generic_attributes.number_u64(name))
 }
 
+/// The FAT attributes `node` holds, on Linux (`linux.fat_attrs`), if any.
+pub(crate) fn fat_attrs(node: &Node) -> Option<u32> {
+    if cfg!(target_os = "linux") {
+        node.meta.generic_attributes.number(LINUX_FAT_ATTRS)
+    } else {
+        None
+    }
+}
+
+/// The XFS options `node` holds, on Linux (`linux.xfs_options`), if any.
+pub(crate) fn xfs_options(node: &Node) -> Option<XfsOptions> {
+    if cfg!(target_os = "linux") {
+        node.meta.generic_attributes.decoded(LINUX_XFS_OPTIONS)
+    } else {
+        None
+    }
+}
+
 /// Whether `node`, a regular file, has illumos' `av_quarantined` among the
 /// system attributes [`fill`] recorded: no one may open such a file for
 /// reading, root included (`EACCES`), nor its extended attributes; its
@@ -257,12 +277,19 @@ pub(crate) fn unread_size(node: &Node) -> Option<u64> {
 ///
 /// * If the file can't be created, or the flags set.
 pub(crate) fn prepare_file(path: &Path, node: &Node) -> io::Result<()> {
-    match file_flags(node) {
+    let flags = match file_flags(node) {
         Some(flags) if flags & os::FLAGS_BEFORE_DATA != 0 => {
             os::prepare_file_for_flags(path, flags & os::FLAGS_BEFORE_DATA)
         }
         _ => Ok(()),
+    };
+    // BackOtter: XFS's extent size hint too (Linux), which XFS takes on no
+    // file with data. Errors are left for the late pass to report.
+    #[cfg(target_os = "linux")]
+    if let Some(opts) = xfs_options(node) {
+        os::prepare_file_for_xfs(path, &opts);
     }
+    flags
 }
 
 /// Gives the empty directory at `path` (one the restore created, or found
@@ -381,6 +408,46 @@ pub(crate) fn restore_zfs_dos_flags(
     flags: u64,
 ) -> io::Result<()> {
     os::restore_zfs_dos_flags(path, node_type, flags)
+}
+
+/// Sets the FAT attributes (Linux) of the file at `path`, of type
+/// `node_type`, to `attrs`, before [`restore_file_flags`]: any write sets
+/// archive again. Elsewhere nothing.
+///
+/// # Errors
+///
+/// * If they couldn't be set: an [`Unsupported`] error if the file system
+///   isn't FAT, or refuses them as unsupported.
+pub(crate) fn restore_fat_attrs(path: &Path, node_type: &NodeType, attrs: u32) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    return os::restore_fat_attrs(path, node_type, attrs);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, node_type, attrs);
+        Ok(())
+    }
+}
+
+/// Sets the XFS options (Linux) of the file at `path`, of type `node_type`,
+/// to `opts`, before [`restore_file_flags`]. Elsewhere nothing.
+///
+/// # Errors
+///
+/// * If they couldn't be set: an [`Unsupported`] error if the file system
+///   isn't XFS, or refuses them (`EINVAL`: a new extent size hint on a file
+///   that has data).
+pub(crate) fn restore_xfs_options(
+    path: &Path,
+    node_type: &NodeType,
+    opts: &XfsOptions,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    return os::restore_xfs_options(path, node_type, opts);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, node_type, opts);
+        Ok(())
+    }
 }
 
 /// Allocates the first `len` bytes of the file `f`, holes included, where the

@@ -127,6 +127,30 @@ that either program restores what the other backed up.
     ioctl is only noted in the debug log. FreeBSD and illumos keep these
     flags in `freebsd.file_flags` and `illumos.system_attributes`; they
     aren't mapped from one system to another.
+  - `linux.fat_attrs`: on Linux, the attributes of a file on FAT (vfat,
+    msdos: `statfs` type `0x4d44`; `FAT_IOCTL_GET_ATTRIBUTES`, ioctl
+    `0x80047210`, which goes to no other file system), as a number:
+    read-only (`0x01`), hidden (`0x02`), system (`0x04`) and archive
+    (`0x20`); volume label and directory can't be set. Regular files and
+    directories, only when they aren't what Linux gives a new one and the
+    restore would give it anyway: archive alone for a regular file,
+    read-only or not (its mode's write bits say that), none for a directory
+    (whose read-only the mode doesn't show). Archive cleared is kept, as 0.
+    FreeBSD keeps FAT's attributes in `freebsd.file_flags`.
+  - `linux.xfs_options`: on Linux, a file's options on XFS (`statfs` type
+    `0x58465342`; `FS_IOC_FSGETXATTR`) that `linux.inode_flags` and
+    `linux.project_id` don't carry, as
+    `{"cowextsize":2097152,"extsize":1048576,"xflags":67584}`: of
+    `fsx_xflags`, nosymlinks (`n`, `0x400`), the extent size hint (`e`,
+    `0x800`), its inheritance (`E`, `0x1000`), nodefrag (`f`, `0x2000`),
+    filestream (`S`, `0x4000`) and the copy-on-write extent size hint
+    (`C`, `0x10000`), with the hints' sizes in bytes, each left out when 0
+    (XFS gives a size only with its flag); the keys in byte order, as
+    serde_json writes them and BackOtter's restic too. Regular files and
+    directories that have any of them. Not realtime and its inheritance,
+    which need a realtime device, nor DAX; nor preallocated (`p`), which a
+    dense restore gives every file it preallocates, and a sparse one none:
+    an accepted difference, in both tools, as the blocks themselves are.
   - `haiku.attributes`: Haiku's file attributes (BFS, `listattr(1)`) other
     than its extended attributes (below), with their type codes. BackOtter's
     rustic alone writes it, since restic doesn't run on Haiku.
@@ -491,6 +515,26 @@ that either program restores what the other backed up.
   refused. On a file system other than ZFS they aren't set, with one
   warning per restore ("ZFS DOS flags 0x... not restored: not ZFS") and the
   number of files at the end.
+- FAT's attributes (`linux.fat_attrs`) go on in that last pass too, before
+  the file flags, for the same reason (a write sets archive), with
+  `FAT_IOCTL_SET_ATTRIBUTES`, which also sets the mode's write bits from
+  read-only, as a `chmod(2)` would: the restore reads the file's attributes
+  and changes the kept ones only where they differ. A FAT file system's
+  root directory takes none (`EINVAL`, unsupported). On a file system other
+  than FAT they aren't set, with one warning per restore
+  ("linux.fat_attrs not supported by the file system: not FAT") and the
+  number of files at the end.
+- So do XFS's options (`linux.xfs_options`): a directory's go on in that
+  last pass, so the entries the restore makes in it inherit nothing (each
+  has its own node); a regular file's go on also as soon as the restore
+  creates it, while it is empty (with the no-copy-on-write flag), since XFS
+  takes an extent size hint on no file with data (`EINVAL`), and again in
+  the last pass, which leaves options that are right alone. A file the
+  restore writes over (one that was there, with data) can't get a new
+  extent size hint: that is unsupported, one warning per restore. On a file
+  system other than XFS: one warning per restore ("linux.xfs_options not
+  supported by the file system: not XFS") and the number of files. As in
+  BackOtter's restic.
 - An extended attribute the restore can't set (`trusted.*` not as root,
   one the file system refuses) doesn't keep the others from being set, or
   those the node hasn't from being removed, as in BackOtter's restic: each
@@ -501,8 +545,9 @@ that either program restores what the other backed up.
   illumos too, and on a file system without extended attributes (NetBSD's
   FFSv1 and plain FFSv2): each of the file's attributes is named, with
   `Operation not supported`.
-- Metadata the target file system doesn't support (flags, casefolding or a
-  project ID it refuses with `ENOTTY`, `EOPNOTSUPP`/`ENOTSUP` or `EINVAL`)
+- Metadata the target file system doesn't support (flags, casefolding, FAT
+  attributes, XFS options or a project ID it refuses with `ENOTTY`,
+  `EOPNOTSUPP`/`ENOTSUP` or `EINVAL`)
   gets one warning per kind (attribute and refused flags) per restore,
   naming the first file, and the number of files at the end, as do SIDs
   idmap can't map on illumos (per attribute). Any other

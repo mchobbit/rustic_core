@@ -22,7 +22,7 @@ use crate::{
         FileType, ReadBackend,
         decrypt::DecryptReadBackend,
         local_destination::{self, LocalDestination},
-        node::{Node, NodeType},
+        node::{Node, NodeType, generic_attributes::XfsOptions},
         osattrs,
     },
     blob::{BlobLocation, BlobLocations},
@@ -570,16 +570,20 @@ fn restore_metadata(
     let mut flags_linked = BTreeSet::new();
     let mut finish = |path: &PathBuf, node: &Node| {
         let made = set_metadata(dest, opts, path, node);
-        let (flags, dos_flags) = (osattrs::file_flags(node), osattrs::zfs_dos_flags(node));
+        let late = LateAttrs {
+            flags: osattrs::file_flags(node),
+            dos_flags: osattrs::zfs_dos_flags(node),
+            fat_attrs: osattrs::fat_attrs(node),
+            xfs_options: osattrs::xfs_options(node),
+        };
         if made
-            && (flags.is_some() || dos_flags.is_some())
+            && late.any()
             && hardlink_key(node).is_none_or(|key| flags_linked.insert(key))
         {
             file_flags.push((
                 path.clone(),
                 node.node_type.clone(),
-                flags,
-                dos_flags,
+                late,
                 osattrs::flags_xattrs(node),
             ));
         }
@@ -630,8 +634,17 @@ fn restore_metadata(
         finish(&path, &node);
     }
 
-    for (path, node_type, flags, dos_flags, xattrs) in file_flags {
+    for (path, node_type, late, xattrs) in file_flags {
         let target = dest.path(&path);
+        if let Some(attrs) = late.fat_attrs {
+            osattrs::restore_fat_attrs(&target, &node_type, attrs)
+                .unwrap_or_else(|err| osattrs::warn_restore(&path, &err));
+        }
+        if let Some(opts) = &late.xfs_options {
+            osattrs::restore_xfs_options(&target, &node_type, opts)
+                .unwrap_or_else(|err| osattrs::warn_restore(&path, &err));
+        }
+        let (flags, dos_flags) = (late.flags, late.dos_flags);
         if let Some(dos_flags) = dos_flags {
             osattrs::restore_zfs_dos_flags(&target, &node_type, dos_flags)
                 .unwrap_or_else(|err| osattrs::warn_restore(&path, &err));
@@ -646,6 +659,26 @@ fn restore_metadata(
     osattrs::report_unsupported();
 
     Ok(())
+}
+
+/// BackOtter: the metadata the restore sets last, once every file has
+/// everything else: file flags, and before them ZFS's DOS flags, FAT's
+/// attributes and XFS's options (Linux).
+struct LateAttrs {
+    flags: Option<u32>,
+    dos_flags: Option<u64>,
+    fat_attrs: Option<u32>,
+    xfs_options: Option<XfsOptions>,
+}
+
+impl LateAttrs {
+    /// Whether there is any.
+    const fn any(&self) -> bool {
+        self.flags.is_some()
+            || self.dos_flags.is_some()
+            || self.fat_attrs.is_some()
+            || self.xfs_options.is_some()
+    }
 }
 
 /// BackOtter: whether to restore the file `node` sparse: one that had holes
