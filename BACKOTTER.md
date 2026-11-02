@@ -798,6 +798,21 @@ that either program restores what the other backed up.
   restored it to different lengths: restic to that size, padded with zeros,
   rustic to the content's. A file backed up from stdin had size 0; it now
   has the length read.
+- Compression and chunking cost less (`backend/decrypt.rs`, `chunker.rs`),
+  for the same bytes: each thread keeps one zstd compression context and
+  one decompression context from blob to blob (stock rustic made new ones
+  for each), reset to zstd's defaults and given the level before each use,
+  so a blob compresses exactly as with `zstd::stream::encode_all` (a test
+  checks it); and each thread computes the Rabin tables for the
+  repository's polynomial once and clones them for each file, instead of
+  computing them per file (about 0.2 ms, 15% of a backup's CPU time over
+  small files). zstd allocates its workspace (3.5 MiB to compress at level
+  3, 2.4 MiB to decompress) with the C library's malloc; musl's, in the
+  static Linux build, mapped and unmapped it for every blob, compressed and
+  then decompressed again to verify it (about 106,000 `mmap`/`munmap`
+  pairs for a Debian system's backup). A backup of a 35,000-path, 1.4 GB
+  tree took 13.5 s before and takes 4.0 s now, with the same snapshot,
+  tree IDs and all (see BACKOTTER.md in rustic, "Building").
 - The version reads `X.Y.Z+backotter.N`.
 
 The system calls need `unsafe`, which the workspace lints now deny (not

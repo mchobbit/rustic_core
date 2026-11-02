@@ -1,9 +1,9 @@
 use std::{num::NonZeroU32, sync::Arc};
 
+use self::zstd_ctx::{copy_encode, decode_all, encode_all};
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, bounded};
 use rayon::{prelude::*, spawn};
-use zstd::stream::{copy_encode, decode_all, encode_all};
 
 pub use zstd::compression_level_range;
 
@@ -75,7 +75,7 @@ pub trait DecryptReadBackend: ReadBackend + Clone + 'static {
     ) -> RusticResult<Bytes> {
         let mut data = self.decrypt(data)?;
         if let Some(length) = uncompressed_length {
-            data = decode_all(&*data).map_err(|err| {
+            data = decode_all(&data).map_err(|err| {
                 RusticError::with_source(
                     ErrorKind::Internal,
                     "Failed to decode zstd compressed data. The data may be corrupted.",
@@ -686,6 +686,156 @@ impl<C: CryptoKey> WriteBackend for DecryptBackend<C> {
 
     fn remove(&self, tpe: FileType, id: &Id, cacheable: bool) -> RusticResult<()> {
         self.be.remove(tpe, id, cacheable)
+    }
+}
+
+// BackOtter: zstd compression and decompression with one context per thread,
+// kept from call to call.
+//
+// `zstd::stream::{encode_all, copy_encode, decode_all}` create a context
+// for each call, and zstd allocates its workspace (3.5 MiB to compress at
+// level 3, 2.4 MiB to decompress) with the C library's malloc,
+// not Rust's allocator. glibc's malloc keeps those blocks; musl's maps them
+// with mmap and unmaps them again on free, so the static musl build made
+// three mmap/munmap pairs, and page faults over the whole workspace, for
+// every blob (it compresses each one, and decompresses it again to verify
+// it): the backup of a 35,000-path tree took twice as long as with glibc. A
+// reused context keeps its workspace.
+//
+// The output is the same as zstd's functions give: the context is reset to
+// default parameters before each use, then given the level, and the data is
+// written in the same way (one write, then the end of the frame), so a blob
+// compresses to the same bytes as before.
+mod zstd_ctx {
+    use std::{
+        cell::Cell,
+        io::{self, Write},
+    };
+
+    use zstd::{
+        stream::{read::Decoder, write::Encoder},
+        zstd_safe::{CCtx, CParameter, DCtx, ResetDirective, get_error_name},
+    };
+
+    thread_local! {
+        // Taken out while in use, so a nested call (there is none) would
+        // make a context of its own instead of failing.
+        static CCTX: Cell<Option<CCtx<'static>>> = const { Cell::new(None) };
+        static DCTX: Cell<Option<DCtx<'static>>> = const { Cell::new(None) };
+    }
+
+    fn zstd_error(code: usize) -> io::Error {
+        io::Error::other(get_error_name(code))
+    }
+
+    /// Append `data`, compressed at `level`, to `out`, as
+    /// [`zstd::stream::copy_encode`] does.
+    pub(super) fn copy_encode(data: &[u8], out: &mut Vec<u8>, level: i32) -> io::Result<()> {
+        let mut cctx = CCTX.take().unwrap_or_else(CCtx::create);
+        let result = (|| {
+            _ = cctx
+                .reset(ResetDirective::SessionAndParameters)
+                .map_err(zstd_error)?;
+            _ = cctx
+                .set_parameter(CParameter::CompressionLevel(level))
+                .map_err(zstd_error)?;
+            let mut encoder = Encoder::with_context(&mut *out, &mut cctx);
+            encoder.write_all(data)?;
+            _ = encoder.finish()?;
+            Ok(())
+        })();
+        CCTX.set(Some(cctx));
+        result
+    }
+
+    /// `data` compressed at `level`, as [`zstd::stream::encode_all`] gives.
+    pub(super) fn encode_all(data: &[u8], level: i32) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        copy_encode(data, &mut out, level)?;
+        Ok(out)
+    }
+
+    /// `data` decompressed, every frame of it, as [`zstd::stream::decode_all`]
+    /// gives.
+    pub(super) fn decode_all(data: &[u8]) -> io::Result<Vec<u8>> {
+        let mut dctx = DCTX.take().unwrap_or_else(DCtx::create);
+        let result = (|| {
+            _ = dctx
+                .reset(ResetDirective::SessionAndParameters)
+                .map_err(zstd_error)?;
+            let mut out = Vec::new();
+            _ = io::copy(&mut Decoder::with_context(data, &mut dctx), &mut out)?;
+            Ok(out)
+        })();
+        DCTX.set(Some(dctx));
+        result
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn samples() -> Vec<Vec<u8>> {
+            // Empty, tiny, text-like, incompressible, and over a block
+            // (128 KiB) and over the level-3 window (2 MiB) in size.
+            let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+            let mut noise = |n: usize| -> Vec<u8> {
+                (0..n)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        x.to_le_bytes()[0]
+                    })
+                    .collect()
+            };
+            let text: Vec<u8> = (0..300_000u32)
+                .flat_map(|i| format!("line {i} of {}\n", i % 97).into_bytes())
+                .collect();
+            vec![
+                Vec::new(),
+                b"x".to_vec(),
+                b"{\"nodes\":[]}".to_vec(),
+                text,
+                noise(200_000),
+                noise(3 << 20),
+            ]
+        }
+
+        #[test]
+        fn same_bytes_as_zstd_functions() {
+            // Twice per level, so the second use is of a reused context,
+            // and levels in turn, so a context reset to another level is
+            // checked too.
+            for _ in 0..2 {
+                for level in [0, 3, -1, 1, 9, 3] {
+                    for data in samples() {
+                        let ours = encode_all(&data, level).unwrap();
+                        let theirs = zstd::stream::encode_all(&*data, level).unwrap();
+                        assert!(ours == theirs, "level {level}, {} bytes", data.len());
+                        let mut appended = vec![2_u8];
+                        copy_encode(&data, &mut appended, level).unwrap();
+                        assert_eq!(appended[0], 2);
+                        assert!(appended[1..] == theirs[..]);
+                        assert!(decode_all(&ours).unwrap() == data);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn decode_errors_as_zstd_does() {
+            let data = samples().swap_remove(3);
+            let frame = zstd::stream::encode_all(&*data, 3).unwrap();
+            // Two frames decode to both, as zstd's decode_all does.
+            let two = [frame.clone(), frame.clone()].concat();
+            assert!(decode_all(&two).unwrap() == [data.clone(), data].concat());
+            // A cut frame or garbage fails, and the context works after.
+            assert!(decode_all(&frame[..frame.len() / 2]).is_err());
+            assert!(zstd::stream::decode_all(&frame[..frame.len() / 2]).is_err());
+            assert!(decode_all(b"not zstd").is_err());
+            assert!(decode_all(&frame).is_ok());
+        }
     }
 }
 
