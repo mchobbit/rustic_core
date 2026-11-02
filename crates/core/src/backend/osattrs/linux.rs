@@ -1,6 +1,7 @@
 //! Linux: the inode flags `chattr(1)` sets (`FS_IOC_GETFLAGS`), the project
-//! ID (`FS_IOC_FSGETXATTR`) that project quotas count by, and the DOS flags
-//! ZFS keeps for SMB (`ZFS_IOC_GETDOSFLAGS`).
+//! ID (`FS_IOC_FSGETXATTR`) that project quotas count by, the DOS flags
+//! ZFS keeps for SMB (`ZFS_IOC_GETDOSFLAGS`), FAT's attributes
+//! (`FAT_IOCTL_GET_ATTRIBUTES`) and XFS's options (`FS_IOC_FSGETXATTR`).
 
 use std::{
     fs::{File, Metadata, OpenOptions},
@@ -18,7 +19,10 @@ use log::{debug, warn};
 use super::{Unsupported, XattrErrors, path_error, set_flags_best_effort, unsupported};
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType,
-    generic_attributes::{LINUX_INODE_FLAGS, LINUX_PROJECT_ID, LINUX_ZFS_DOS_FLAGS},
+    generic_attributes::{
+        LINUX_FAT_ATTRS, LINUX_INODE_FLAGS, LINUX_PROJECT_ID, LINUX_XFS_OPTIONS,
+        LINUX_ZFS_DOS_FLAGS, XfsOptions,
+    },
 };
 
 pub(super) const FILE_FLAGS: Option<&str> = Some(LINUX_INODE_FLAGS);
@@ -118,6 +122,48 @@ const ZFS_DOS_KEPT: u64 = 0x0000_0001_0000_0000 // ZFS_READONLY
 /// The DOS flag every new file gets, and every write of its contents sets
 /// again.
 const ZFS_ARCHIVE: u64 = 0x0000_0008_0000_0000;
+
+// FAT's attributes, from <linux/msdos_fs.h>: a __u32 on a descriptor of the
+// file. Only issued on FAT (MSDOS_SUPER_MAGIC): 'r' 0x10 may mean something
+// else to another file system.
+const FAT_IOCTL_GET_ATTRIBUTES: libc::Ioctl = libc::_IOR::<u32>(0x72, 0x10); // 'r'
+const FAT_IOCTL_SET_ATTRIBUTES: libc::Ioctl = libc::_IOW::<u32>(0x72, 0x11); // 'r'
+
+/// statfs's `f_type` for vfat and msdos.
+const MSDOS_SUPER_MAGIC: u32 = 0x4d44;
+
+/// FAT's read-only attribute (`ATTR_RO`).
+const FAT_READONLY: u32 = 0x01;
+/// FAT's archive attribute (`ATTR_ARCH`): Linux gives every new file it,
+/// and sets it again on every write.
+const FAT_ARCHIVE: u32 = 0x20;
+/// The FAT attributes kept: those `FAT_IOCTL_SET_ATTRIBUTES` sets,
+/// read-only, hidden (0x02), system (0x04) and archive. Volume label and
+/// directory can't change.
+const FAT_KEPT: u32 = FAT_READONLY | 0x02 | 0x04 | FAT_ARCHIVE;
+
+/// statfs's `f_type` for XFS.
+const XFS_SUPER_MAGIC: u32 = 0x5846_5342;
+
+// fsx_xflags of XFS's options, from <linux/fs.h>.
+const FS_XFLAG_EXTSIZE: u32 = 0x0000_0800; // e
+const FS_XFLAG_EXTSZINHERIT: u32 = 0x0000_1000; // E
+const FS_XFLAG_COWEXTSIZE: u32 = 0x0001_0000; // C
+
+/// The `fsx_xflags` kept on XFS: those of a file's options that
+/// `linux.inode_flags` doesn't carry (it has immutable, append-only, sync,
+/// noatime, nodump and project inheritance) and that a file can be given:
+/// nosymlinks (n), the extent size hint (e), its inheritance (E), nodefrag
+/// (f), filestream (S) and the copy-on-write extent size hint (C). Not
+/// realtime and its inheritance, which need a realtime device, nor DAX;
+/// not preallocated (p), which a restore that preallocates gives every file
+/// it writes dense, and none it writes sparse.
+const XFS_KEPT: u32 = 0x0000_0400 // FS_XFLAG_NOSYMLINKS n
+    | FS_XFLAG_EXTSIZE
+    | FS_XFLAG_EXTSZINHERIT
+    | 0x0000_2000 // FS_XFLAG_NODEFRAG f
+    | 0x0000_4000 // FS_XFLAG_FILESTREAM S
+    | FS_XFLAG_COWEXTSIZE;
 
 /// Opens a regular file or directory for `FS_IOC_GETFLAGS` and
 /// `FS_IOC_SETFLAGS`, as `lsattr(1)` and `chattr(1)` do, so as not to follow
@@ -313,18 +359,224 @@ pub(super) fn file_flags(
 }
 
 /// Records the project ID of a regular file or directory, unless it is 0,
-/// and on ZFS its DOS flags ([`dos_flags_attribute`]).
+/// on ZFS its DOS flags ([`dos_flags_attribute`]), on FAT its attributes
+/// ([`fat_attrs_attribute`]) and on XFS its options ([`xfs_options`]).
 pub(super) fn fill_attributes(path: &Path, node: &mut Node, f: Option<&File>) -> io::Result<()> {
     let Some(f) = f else {
         return Ok(());
     };
     let dos_flags = fill_dos_flags(path, node, f);
+    fill_fat_attrs(path, node, f);
     match get_fsxattr(f) {
-        Ok(attr) => node.meta.generic_attributes.set_number(LINUX_PROJECT_ID, file_projid(f, &attr)),
+        Ok(attr) => {
+            node.meta.generic_attributes.set_number(LINUX_PROJECT_ID, file_projid(f, &attr));
+            if is_on(f, XFS_SUPER_MAGIC).unwrap_or(false)
+                && let Some(opts) = xfs_options(&attr)
+            {
+                node.meta
+                    .generic_attributes
+                    .set(LINUX_XFS_OPTIONS, &opts)
+                    .map_err(io::Error::other)?;
+            }
+        }
         Err(err) if unsupported(&err) => {}
         Err(err) => return Err(path_error("FS_IOC_FSGETXATTR", path, &err)),
     }
     dos_flags
+}
+
+/// Records the FAT attributes of the file `f` at `path`, if it is on FAT and
+/// they are worth an attribute. An error only goes to the debug log.
+fn fill_fat_attrs(path: &Path, node: &mut Node, f: &File) {
+    if !is_on(f, MSDOS_SUPER_MAGIC).unwrap_or(false) {
+        return;
+    }
+    match get_u32(f, FAT_IOCTL_GET_ATTRIBUTES) {
+        Ok(attrs) => {
+            if let Some(kept) = fat_attrs_attribute(attrs, node.is_dir()) {
+                node.meta.generic_attributes.set_u64(LINUX_FAT_ATTRS, kept.into());
+            }
+        }
+        Err(err) => debug!("no FAT attributes for {}: {err}", path.display()),
+    }
+}
+
+/// What `linux.fat_attrs` records for a regular file or (`dir`) directory
+/// with the FAT attributes `attrs`: the [`FAT_KEPT`] ones, 0 included
+/// (archive cleared), unless they are what it would have anyway if it were
+/// restored without them: archive alone for a regular file (read-only or
+/// not: its mode says which), none for a directory, so that a tree of
+/// ordinary files on FAT gets no attribute. As in BackOtter's restic.
+const fn fat_attrs_attribute(attrs: u32, dir: bool) -> Option<u32> {
+    let kept = attrs & FAT_KEPT;
+    let plain = if dir { kept == 0 } else { kept & !FAT_READONLY == FAT_ARCHIVE };
+    if plain { None } else { Some(kept) }
+}
+
+/// The FAT attributes a file that has `current` gets for `attrs`: the
+/// [`FAT_KEPT`] ones of `attrs`, the others (directory) as they are.
+const fn wanted_fat_attrs(current: u32, attrs: u32) -> u32 {
+    (current & !FAT_KEPT) | (attrs & FAT_KEPT)
+}
+
+/// The XFS options of a file whose `FS_IOC_FSGETXATTR` gave `attr`, if it
+/// has any: the [`XFS_KEPT`] flags, with the extent size hint where its
+/// flag or its inheritance is set, and the copy-on-write one where its flag
+/// is. As in BackOtter's restic.
+const fn xfs_options(attr: &FsXattr) -> Option<XfsOptions> {
+    let xflags = attr.xflags & XFS_KEPT;
+    if xflags == 0 {
+        return None;
+    }
+    Some(XfsOptions {
+        xflags,
+        extsize: if xflags & (FS_XFLAG_EXTSIZE | FS_XFLAG_EXTSZINHERIT) == 0 { 0 } else { attr.extsize },
+        cowextsize: if xflags & FS_XFLAG_COWEXTSIZE == 0 { 0 } else { attr.cowextsize },
+    })
+}
+
+/// `cur`, a file's `struct fsxattr`, with the options `opts` in place of its
+/// own: the [`XFS_KEPT`] flags, and the hints' sizes, 0 where their flags
+/// are off (XFS refuses a size without its flag). The rest (other flags,
+/// the project ID) stays as it is.
+const fn wanted_fsxattr(cur: &FsXattr, opts: &XfsOptions) -> FsXattr {
+    let mut want = *cur;
+    want.xflags = (cur.xflags & !XFS_KEPT) | (opts.xflags & XFS_KEPT);
+    want.extsize = if want.xflags & (FS_XFLAG_EXTSIZE | FS_XFLAG_EXTSZINHERIT) == 0 { 0 } else { opts.extsize };
+    want.cowextsize = if want.xflags & FS_XFLAG_COWEXTSIZE == 0 { 0 } else { opts.cowextsize };
+    want
+}
+
+/// Whether `a` and `b` give a file the same XFS options.
+const fn same_xfs_options(a: &FsXattr, b: &FsXattr) -> bool {
+    a.xflags == b.xflags && a.extsize == b.extsize && a.cowextsize == b.cowextsize
+}
+
+fn get_u32(f: &File, req: libc::Ioctl) -> io::Result<u32> {
+    let mut v: u32 = 0;
+    // SAFETY: req (FAT_IOCTL_GET_ATTRIBUTES) writes a __u32 to the pointer.
+    if unsafe { libc::ioctl(f.as_raw_fd(), req, &raw mut v) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(v)
+}
+
+fn set_u32(f: &File, req: libc::Ioctl, v: u32) -> io::Result<()> {
+    // SAFETY: req (FAT_IOCTL_SET_ATTRIBUTES) reads a __u32 from the pointer.
+    if unsafe { libc::ioctl(f.as_raw_fd(), req, &raw const v) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Gives the regular file or directory at `path` the FAT attributes `attrs`
+/// (`linux.fat_attrs`), on FAT, before its inode flags: any write sets
+/// archive again. `FAT_IOCTL_SET_ATTRIBUTES` also sets the mode's write
+/// bits from read-only, as a `chmod(2)` would. Attributes that are right
+/// already get no set at all. The file system's root directory takes none
+/// (`EINVAL`), reported as unsupported.
+pub(super) fn restore_fat_attrs(path: &Path, typ: &NodeType, attrs: u32) -> io::Result<()> {
+    let f = open_for_flags(path, typ, None)?;
+    let unsupported_err = |err: io::Error| Unsupported::error(LINUX_FAT_ATTRS, 0, err);
+    if !is_on(&f, MSDOS_SUPER_MAGIC).map_err(|err| path_error("fstatfs", path, &err))? {
+        return Err(unsupported_err(io::Error::new(io::ErrorKind::Unsupported, "not FAT")));
+    }
+    let current = get_u32(&f, FAT_IOCTL_GET_ATTRIBUTES).map_err(|err| {
+        if unsupported(&err) {
+            unsupported_err(err)
+        } else {
+            path_error("FAT_IOCTL_GET_ATTRIBUTES", path, &err)
+        }
+    })?;
+    restore_fat_attrs_with(path, current, attrs, |a| set_u32(&f, FAT_IOCTL_SET_ATTRIBUTES, a))
+}
+
+/// [`restore_fat_attrs`] for a file that has the FAT attributes `current`,
+/// with `set` (`FAT_IOCTL_SET_ATTRIBUTES`).
+fn restore_fat_attrs_with(
+    path: &Path,
+    current: u32,
+    attrs: u32,
+    set: impl FnOnce(u32) -> io::Result<()>,
+) -> io::Result<()> {
+    let want = wanted_fat_attrs(current, attrs);
+    if want == current {
+        return Ok(());
+    }
+    set(want).map_err(|err| {
+        if unsupported(&err) {
+            Unsupported::error(LINUX_FAT_ATTRS, 0, path_error("FAT_IOCTL_SET_ATTRIBUTES", path, &err))
+        } else {
+            path_error("FAT_IOCTL_SET_ATTRIBUTES", path, &err)
+        }
+    })
+}
+
+/// Gives the file `f` at `path` the XFS options `opts`, unless it has them
+/// already.
+fn set_xfs_options(f: &File, path: &Path, opts: &XfsOptions) -> io::Result<()> {
+    let unsupported_or = |op: &str, err: io::Error| {
+        if unsupported(&err) {
+            Unsupported::error(LINUX_XFS_OPTIONS, 0, path_error(op, path, &err))
+        } else {
+            path_error(op, path, &err)
+        }
+    };
+    let cur = get_fsxattr(f).map_err(|err| unsupported_or("FS_IOC_FSGETXATTR", err))?;
+    let want = wanted_fsxattr(&cur, opts);
+    if same_xfs_options(&cur, &want) {
+        return Ok(());
+    }
+    // XFS refuses (EINVAL) a new extent size hint on a regular file that has
+    // data: one restored over an existing file.
+    set_fsxattr(f, &want).map_err(|err| unsupported_or("FS_IOC_FSSETXATTR", err))
+}
+
+/// Gives the regular file or directory at `path` the XFS options `opts`
+/// (`linux.xfs_options`), on XFS, before its inode flags, leaving its other
+/// flags and project ID as they are.
+pub(super) fn restore_xfs_options(path: &Path, typ: &NodeType, opts: &XfsOptions) -> io::Result<()> {
+    let f = open_for_flags(path, typ, None)?;
+    if !is_on(&f, XFS_SUPER_MAGIC).map_err(|err| path_error("fstatfs", path, &err))? {
+        return Err(Unsupported::error(
+            LINUX_XFS_OPTIONS,
+            0,
+            io::Error::new(io::ErrorKind::Unsupported, "not XFS"),
+        ));
+    }
+    set_xfs_options(&f, path, opts)
+}
+
+/// Gives the regular file at `path`, which the restore is about to write,
+/// the XFS options `opts` while it is empty: XFS only takes an extent size
+/// hint on a regular file without data. Creates the file (empty, mode 0600)
+/// when there is none, as [`prepare_file_for_flags`] does, and leaves one
+/// with data alone. Not XFS, or any error, is left for
+/// [`restore_xfs_options`], in the late pass, to report.
+pub(super) fn prepare_file_for_xfs(path: &Path, opts: &XfsOptions) {
+    let f = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(f) => Ok(f),
+        // An empty file prepare_file_for_flags made.
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            open_for_flags(path, &NodeType::File, None)
+        }
+        Err(err) => Err(err),
+    };
+    let set = f.and_then(|f| {
+        if f.metadata()?.len() != 0 || !is_on(&f, XFS_SUPER_MAGIC)? {
+            return Ok(());
+        }
+        set_xfs_options(&f, path, opts)
+    });
+    if let Err(err) = set {
+        debug!("XFS options of {} not set early: {err}", path.display());
+    }
 }
 
 /// Records the DOS flags of the file `f` at `path`, if it is on ZFS and they
@@ -834,7 +1086,7 @@ pub(super) fn xattr_list(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, ffi::OsStr, os::unix::fs::PermissionsExt};
+    use std::{cell::RefCell, ffi::OsStr, os::unix::fs::PermissionsExt, path::PathBuf};
 
     use super::*;
     use crate::backend::node::Metadata as NodeMetadata;
@@ -995,6 +1247,257 @@ mod tests {
         assert_eq!(attribute(&path, &NodeType::File), None);
         restore_zfs_dos_flags(dir.path(), &NodeType::Dir, ZFS_HIDDEN).unwrap();
         assert_eq!(attribute(dir.path(), &NodeType::Dir), Some(ZFS_HIDDEN));
+    }
+
+    #[test]
+    fn fat_ioctls() {
+        #[cfg(all(target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            assert_eq!(FAT_IOCTL_GET_ATTRIBUTES, 0x8004_7210);
+            assert_eq!(FAT_IOCTL_SET_ATTRIBUTES, 0x4004_7211);
+        }
+    }
+
+    #[test]
+    fn fat_attrs_kept_as_restic_keeps_them() {
+        for (attrs, dir, want) in [
+            (0x20, false, None),       // a new or written file: archive alone
+            (0x21, false, None),       // read-only too, which its mode says
+            (0x10, true, None),        // a new directory: ATTR_DIR alone
+            (0x00, false, Some(0)),    // archive cleared
+            (0x22, false, Some(0x22)), // hidden
+            (0x24, false, Some(0x24)), // system
+            (0x06, false, Some(0x06)), // hidden, system, archive cleared
+            (0x01, false, Some(0x01)), // read-only, archive cleared
+            (0x12, true, Some(0x02)),  // a hidden directory
+            (0x11, true, Some(0x01)),  // a read-only directory
+            (0x30, true, Some(0x20)),  // a directory with archive
+            (0x28, false, None),       // volume label: never kept
+        ] {
+            assert_eq!(fat_attrs_attribute(attrs, dir), want, "{attrs:#x} dir {dir}");
+        }
+        assert_eq!(wanted_fat_attrs(0x30, 0x06), 0x16);
+        assert_eq!(wanted_fat_attrs(0x2f, 0), 0x08);
+
+        let path = Path::new("f");
+        let sets = RefCell::new(Vec::new());
+        restore_fat_attrs_with(path, 0x22, 0x22, |a| {
+            sets.borrow_mut().push(a);
+            Ok(())
+        })
+        .unwrap();
+        assert!(sets.borrow().is_empty(), "right already, but set");
+        restore_fat_attrs_with(path, 0x10, 0x02, |a| {
+            sets.borrow_mut().push(a);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(*sets.borrow(), [0x12]);
+        // The root directory takes none: EINVAL is unsupported.
+        let err = restore_fat_attrs_with(path, 0x10, 0x02, |_| {
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        let err = restore_fat_attrs_with(path, 0x20, 0x02, |_| {
+            Err(io::Error::from_raw_os_error(libc::EPERM))
+        })
+        .unwrap_err();
+        assert_ne!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn xfs_options_kept_as_restic_keeps_them() {
+        let fsx = |xflags, extsize, cowextsize| FsXattr { xflags, extsize, cowextsize, ..FsXattr::default() };
+        // hasattr, prealloc, immutable, projinherit: none of them.
+        assert_eq!(xfs_options(&fsx(0x8000_0002 | 0x8 | 0x200, 0, 0)), None);
+        assert_eq!(
+            xfs_options(&fsx(0x8000_0802, 1 << 20, 0)),
+            Some(XfsOptions { xflags: 0x800, extsize: 1 << 20, cowextsize: 0 })
+        );
+        assert_eq!(
+            xfs_options(&fsx(0x1000 | 0x4000 | 0x1_0000, 2 << 20, 4 << 20)),
+            Some(XfsOptions { xflags: 0x1_5000, extsize: 2 << 20, cowextsize: 4 << 20 })
+        );
+        assert_eq!(
+            xfs_options(&fsx(0x2000, 4096, 0)),
+            Some(XfsOptions { xflags: 0x2000, extsize: 0, cowextsize: 0 })
+        );
+        // The kept flags and sizes replaced; prealloc, immutable and the
+        // project ID left as they are.
+        let mut cur = fsx(0x8000_0002 | 0x8 | 0x2000, 0, 0);
+        cur.projid = 7;
+        let want = wanted_fsxattr(&cur, &XfsOptions { xflags: 0x800, extsize: 1 << 20, cowextsize: 0 });
+        assert_eq!(
+            (want.xflags, want.extsize, want.cowextsize, want.projid),
+            (0x8000_0002 | 0x8 | 0x800, 1 << 20, 0, 7)
+        );
+        assert!(!same_xfs_options(&cur, &want));
+        let want = wanted_fsxattr(&fsx(0x800, 1 << 20, 0), &XfsOptions::default());
+        assert_eq!((want.xflags, want.extsize, want.cowextsize), (0, 0, 0));
+        let cur = fsx(0x2000, 0, 0);
+        assert!(same_xfs_options(&cur, &wanted_fsxattr(&cur, &XfsOptions { xflags: 0x2000, ..XfsOptions::default() })));
+    }
+
+    #[test]
+    fn fat_attrs_and_xfs_options_elsewhere_are_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        let f = File::open(&path).unwrap();
+        if is_on(&f, MSDOS_SUPER_MAGIC).unwrap() || is_on(&f, XFS_SUPER_MAGIC).unwrap() {
+            return; // TMPDIR on FAT or XFS
+        }
+        let err = restore_fat_attrs(&path, &NodeType::File, 0x22).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("linux.fat_attrs not supported by the file system: not FAT"), "{err}");
+        let opts = XfsOptions { xflags: 0x2000, ..XfsOptions::default() };
+        let err = restore_xfs_options(dir.path(), &NodeType::Dir, &opts).unwrap_err();
+        assert!(err.to_string().contains("linux.xfs_options not supported by the file system: not XFS"), "{err}");
+        // Early, nothing happens: the file is left as it is.
+        prepare_file_for_xfs(&path, &XfsOptions { xflags: 0x800, extsize: 1 << 20, cowextsize: 0 });
+        assert_eq!(std::fs::read(&path).unwrap(), b"x");
+    }
+
+    /// A file system made with `mkfs` (and `args`) on an image of `size`
+    /// bytes, mounted on a loop device until it is dropped. `None` without
+    /// root or the tools.
+    struct LoopMount {
+        dir: tempfile::TempDir,
+    }
+
+    impl LoopMount {
+        fn new(size: u64, mkfs: &str, args: &[&str]) -> Option<Self> {
+            // SAFETY: geteuid has no preconditions.
+            if unsafe { libc::geteuid() } != 0 {
+                eprintln!("skipped: needs root, to mount a file system");
+                return None;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let img = dir.path().join("fs.img");
+            File::create(&img).unwrap().set_len(size).unwrap();
+            std::fs::create_dir(dir.path().join("mnt")).unwrap();
+            let ok = |cmd: &mut std::process::Command| cmd.output().is_ok_and(|o| o.status.success());
+            if !ok(std::process::Command::new(mkfs).args(args).arg(&img)) {
+                eprintln!("skipped: no {mkfs}");
+                return None;
+            }
+            if !ok(std::process::Command::new("mount").args(["-o", "loop"]).arg(&img).arg(dir.path().join("mnt"))) {
+                eprintln!("skipped: mount failed");
+                return None;
+            }
+            Some(Self { dir })
+        }
+
+        fn path(&self) -> PathBuf {
+            self.dir.path().join("mnt")
+        }
+    }
+
+    impl Drop for LoopMount {
+        fn drop(&mut self) {
+            _ = std::process::Command::new("umount").arg(self.path()).status();
+        }
+    }
+
+    fn filled(path: &Path, typ: &NodeType) -> Node {
+        let m = std::fs::symlink_metadata(path).unwrap();
+        let mut node = Node::new_node(OsStr::new("x"), typ.clone(), NodeMetadata::default());
+        let f = open_for_attrs(path, typ, &m);
+        fill_attributes(path, &mut node, f.as_ref()).unwrap();
+        node
+    }
+
+    // With root, on a loop vfat: the attributes a backup keeps, and a
+    // restore putting them back.
+    #[test]
+    fn fat_attrs_on_vfat() {
+        let Some(mnt) = LoopMount::new(64 << 20, "mkfs.vfat", &[]) else {
+            return;
+        };
+        let mnt = mnt.path();
+        let get = |p: &Path| get_u32(&File::open(p).unwrap(), FAT_IOCTL_GET_ATTRIBUTES).unwrap();
+        let set = |p: &Path, a| set_u32(&File::open(p).unwrap(), FAT_IOCTL_SET_ATTRIBUTES, a).unwrap();
+        for (name, dir, attrs, kept) in [
+            ("plain", false, 0x20, false),
+            ("hidden", false, 0x22, true),
+            ("cleared", false, 0, true),
+            ("system", false, 0x24, true),
+            ("pdir", true, 0x10, false),
+            ("hdir", true, 0x12, true),
+            ("rodir", true, 0x11, true),
+        ] {
+            let (src, dst) = (mnt.join(name), mnt.join(format!("restored-{name}")));
+            let typ = if dir {
+                std::fs::create_dir(&src).unwrap();
+                std::fs::create_dir(&dst).unwrap();
+                NodeType::Dir
+            } else {
+                std::fs::write(&src, name).unwrap();
+                std::fs::write(&dst, name).unwrap();
+                NodeType::File
+            };
+            set(&src, attrs);
+            let got = filled(&src, &typ).meta.generic_attributes.number(LINUX_FAT_ATTRS);
+            assert_eq!(got.is_some(), kept, "{name}: {got:?}");
+            if let Some(a) = got {
+                restore_fat_attrs(&dst, &typ, a).unwrap();
+                assert_eq!(get(&src), get(&dst), "{name}");
+            }
+        }
+        assert_eq!(filled(&mnt, &NodeType::Dir).meta.generic_attributes.number(LINUX_FAT_ATTRS), None);
+        let err = restore_fat_attrs(&mnt, &NodeType::Dir, 0x02).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
+    }
+
+    // With root, on a loop XFS: the options a backup keeps, set early on an
+    // empty file (an extent size hint) and late on a directory.
+    #[test]
+    fn xfs_options_on_xfs() {
+        let Some(mnt) = LoopMount::new(320 << 20, "mkfs.xfs", &["-q", "-f"]) else {
+            return;
+        };
+        let mnt = mnt.path();
+        let xfs_io = |args: &[&str]| {
+            let st = std::process::Command::new("xfs_io").args(args).status().unwrap();
+            assert!(st.success(), "xfs_io {args:?}");
+        };
+        let (file, dir) = (mnt.join("extsize"), mnt.join("dir"));
+        std::fs::write(&file, b"").unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        xfs_io(&["-c", "extsize 1m", "-c", "chattr +f", file.to_str().unwrap()]);
+        xfs_io(&["-c", "extsize 2m", "-c", "chattr +S", dir.to_str().unwrap()]);
+        std::fs::write(&file, vec![0_u8; 65536]).unwrap();
+        let opts = |p: &Path, typ: NodeType| {
+            filled(p, &typ).meta.generic_attributes.decoded::<XfsOptions>(LINUX_XFS_OPTIONS)
+        };
+        let fopts = opts(&file, NodeType::File).expect("file's XFS options not kept");
+        assert_eq!(fopts, XfsOptions { xflags: 0x2800, extsize: 1 << 20, cowextsize: 0 });
+        let dopts = opts(&dir, NodeType::Dir).expect("directory's XFS options not kept");
+        assert_eq!(dopts, XfsOptions { xflags: 0x5000, extsize: 2 << 20, cowextsize: 0 });
+        let plain = mnt.join("plain");
+        {
+            let mut f = File::create(&plain).unwrap();
+            io::Write::write_all(&mut f, b"x").unwrap();
+            f.sync_all().unwrap(); // its extent allocated, not delayed
+        }
+        assert_eq!(opts(&plain, NodeType::File), None);
+
+        // Early on a new file, then its data, then late: as the restore does.
+        let (rfile, rdir) = (mnt.join("rfile"), mnt.join("rdir"));
+        prepare_file_for_xfs(&rfile, &fopts);
+        std::fs::write(&rfile, vec![0_u8; 65536]).unwrap();
+        restore_xfs_options(&rfile, &NodeType::File, &fopts).unwrap();
+        assert_eq!(opts(&rfile, NodeType::File), Some(fopts));
+        std::fs::create_dir(&rdir).unwrap();
+        restore_xfs_options(&rdir, &NodeType::Dir, &dopts).unwrap();
+        assert_eq!(opts(&rdir, NodeType::Dir), Some(dopts));
+        // Too late for a file with data: unsupported (EINVAL).
+        let err = restore_xfs_options(&plain, &NodeType::File, &fopts).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
+        // Taken off again.
+        restore_xfs_options(&rdir, &NodeType::Dir, &XfsOptions::default()).unwrap();
+        assert_eq!(opts(&rdir, NodeType::Dir), None);
     }
 
     #[test]
