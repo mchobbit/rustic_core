@@ -288,8 +288,10 @@ that either program restores what the other backed up.
   without being allocated (`ftruncate`), and each blob is written by the
   blocks of the destination file system's block size (`f_bsize` of
   `fstatfs(2)`, of `fstatvfs(2)` on NetBSD and illumos, else the file's
-  `st_blksize`; at least 4096 bytes, 4096 where none is known), aligned to
-  the offsets in the file, as BackOtter's restic writes it: of each block
+  `st_blksize`; at least 512 bytes, 4096 where none is known: 512 on
+  bcachefs formatted with `block_size` 512 and on FreeBSD's ZFS, 1024 on
+  ext2/3/4 and XFS with 1 KiB blocks), aligned to the offsets in the
+  file, as BackOtter's restic writes it: of each block
   the blob reaches into, the part inside the blob is left unwritten if it
   is all zeros, else written, and nothing outside the blob is ever
   written (adjacent parts in one write; an all-zero blob, which holes give
@@ -302,7 +304,15 @@ that either program restores what the other backed up.
   replaced writing the partial blocks at a blob's ends whatever they held
   (up to a block more for each blob boundary: 71% more blocks on ext4 and
   XFS, 26 times as many on uncompressed ZFS, for a disk image), and
-  before it, leaving each blob's longest all-zero prefix unwritten. If
+  before it, leaving each blob's longest all-zero prefix unwritten. Until
+  round 23 the block was at least 4096 bytes, and a file whose holes were
+  all smaller (512-byte holes on bcachefs with 512-byte blocks, which
+  `cp --sparse=always` makes) came back dense. A block smaller than the
+  file system can make a hole of (FreeBSD's ZFS reports 512, OpenBSD's
+  FFS its fragment) only cuts blobs into more writes, not the blocks they
+  take: about 60 times as many for a disk image of an ext4 file system
+  (52,000 writes for 3 GiB, against 860 at 4096), 3 times as many for
+  executables. If
   the file turns out not to be empty after all (a race), it is emptied
   first, so that no hole keeps old contents. Stock rustic's
   `--sparse by-content` left old contents where a zero chunk went.
@@ -612,8 +622,15 @@ that either program restores what the other backed up.
   are set, so set at the end with the other metadata the entries would
   lose the compression, replicas, targets or nocow they inherited, and get
   their project ID as their own. Errors there are silent: the directory's
-  metadata at the end sets them all again, and reports them. As
-  BackOtter's restic does.
+  metadata at the end sets again each that isn't right, and reports them.
+  That pass, as every restore of extended attributes, leaves one the file
+  has already with its node's value alone: bcachefs refuses
+  `bcachefs.casefold` on a directory with entries (`ENOTEMPTY`), even the
+  value it has. Where `bcachefs.casefold` still has to change on a
+  directory with entries (an existing one, restored over), that refusal,
+  setting or removing it, is a warning, "casefolding (bcachefs.casefold)
+  not restored on DIR: directory not empty", as for F, not one of the
+  file's errors. As BackOtter's restic does.
 - A restore over an existing tree removes what has a node's name but
   another type, with or without `--delete`, as BackOtter's restic does: a
   symlink where the snapshot has a directory is replaced by the directory

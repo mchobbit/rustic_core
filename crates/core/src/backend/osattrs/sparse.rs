@@ -169,21 +169,37 @@ fn open(path: &Path, m: &Metadata) -> io::Result<File> {
     Ok(f)
 }
 
-/// The smallest block a file restored sparse has its holes in, and the
-/// one used where the file system's block size isn't known.
-const MIN_HOLE_BLOCK: u64 = 4096;
+/// The smallest block a file restored sparse has its holes in: a sector,
+/// the block of bcachefs formatted with `block_size` 512, the smallest any
+/// file system has. A file system's own smaller blocks (XFS, ext2/3/4 with
+/// 1 KiB blocks, bcachefs) get holes as small as its source's.
+const MIN_HOLE_BLOCK: u64 = 512;
+
+/// The block a file restored sparse has its holes in where the file
+/// system's block size isn't known.
+const DEFAULT_HOLE_BLOCK: u64 = 4096;
 
 /// The size of the blocks a file restored sparse has its holes in, `f`
 /// being that file: the block size of its file system (`f_bsize` of
 /// `fstatfs(2)`, of `fstatvfs(2)` on NetBSD and illumos), else its
-/// `st_blksize`, at least 4096 bytes; 4096 if neither is known. As
-/// BackOtter's restic (`fs.HoleBlockSize`).
+/// `st_blksize`, at least 512 bytes; 4096 if neither is known
+/// ([`hole_block`]). As BackOtter's restic (`fs.HoleBlockSize`).
 pub(super) fn hole_block_size(f: &File) -> u64 {
-    fs_block_size(f)
-        .filter(|&size| size > 0)
-        .or_else(|| f.metadata().ok().map(|m| m.blksize()))
-        .unwrap_or(0)
-        .max(MIN_HOLE_BLOCK)
+    hole_block(
+        fs_block_size(f)
+            .filter(|&size| size > 0)
+            .or_else(|| f.metadata().ok().map(|m| m.blksize())),
+    )
+}
+
+/// The block a file restored sparse has its holes in on a file system whose
+/// block size is `size` (`None` or 0: not known): `size`, at least
+/// [`MIN_HOLE_BLOCK`]; [`DEFAULT_HOLE_BLOCK`] where it isn't known.
+fn hole_block(size: Option<u64>) -> u64 {
+    match size {
+        Some(size) if size > 0 => size.max(MIN_HOLE_BLOCK),
+        _ => DEFAULT_HOLE_BLOCK,
+    }
 }
 
 /// `f_bsize` of `fstatfs(2)` of `f`.
@@ -747,15 +763,35 @@ mod tests {
         assert!(!has_holes(&path, &m, Some(&File::open(&path).unwrap())));
     }
 
-    /// Holes are made in blocks of at least 4096 bytes (whatever their size:
+    /// Holes are made in blocks of at least 512 bytes (whatever their size:
     /// some FUSE and network file systems report odd ones).
     #[test]
-    fn hole_block_size_at_least_4096() {
+    fn hole_block_size_at_least_512() {
         let dir = tempfile::tempdir().unwrap();
         let f = File::create(dir.path().join("f")).unwrap();
         let size = hole_block_size(&f);
         eprintln!("block size {size}");
         assert!(size >= MIN_HOLE_BLOCK, "{size}");
+        assert_eq!(MIN_HOLE_BLOCK, 512);
+    }
+
+    /// The file system's block size, at least 512 (bcachefs with
+    /// `block_size` 512 has holes that small); 4096 where it isn't known.
+    #[test]
+    fn hole_block_rule() {
+        for (size, want) in [
+            (None, 4096),
+            (Some(0), 4096),
+            (Some(1), 512),
+            (Some(511), 512),
+            (Some(512), 512),
+            (Some(1024), 1024),
+            (Some(4096), 4096),
+            (Some(65536), 65536),
+            (Some(131_072), 131_072),
+        ] {
+            assert_eq!(hole_block(size), want, "{size:?}");
+        }
     }
 
     /// A file for [`HoleReader`]: its bytes, the holes its file system

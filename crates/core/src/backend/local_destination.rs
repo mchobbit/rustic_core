@@ -605,7 +605,13 @@ impl LocalDestination {
                 None if osattrs::xattr_never_removed(&curr_node_name) => {}
                 None => {
                     if let Err(err) = xattr::remove(&filename, &curr_name) {
-                        errors.push(format!("removing {curr_node_name}"), err);
+                        // BackOtter: bcachefs refusing to clear casefolding
+                        // on a directory with entries is a warning.
+                        if osattrs::casefold_not_empty(&curr_node_name, &err) {
+                            warn_casefold_not_empty(&curr_node_name, &filename);
+                        } else {
+                            errors.push(format!("removing {curr_node_name}"), err);
+                        }
                     }
                 }
             }
@@ -622,7 +628,13 @@ impl LocalDestination {
                 if let Err(err) =
                     xattr::set(&filename, os_name, value.as_ref().unwrap_or(&Vec::new()))
                 {
-                    errors.push(name.as_str(), err);
+                    // BackOtter: bcachefs refusing casefolding on a
+                    // directory with entries is a warning, as for F.
+                    if osattrs::casefold_not_empty(name, &err) {
+                        warn_casefold_not_empty(name, &filename);
+                    } else {
+                        errors.push(name.as_str(), err);
+                    }
                 }
             }
         }
@@ -998,6 +1010,17 @@ impl LocalDestination {
         })?;
         Ok(())
     }
+}
+
+/// BackOtter: the warning for bcachefs refusing to change the casefolding
+/// (`name`, `bcachefs.casefold`) of `path`, a directory with entries
+/// ([`osattrs::casefold_not_empty`]), as BackOtter's restic gives it.
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+fn warn_casefold_not_empty(name: &str, path: &Path) {
+    log::warn!(
+        "casefolding ({name}) not restored on {}: directory not empty",
+        path.display()
+    );
 }
 
 /// BackOtter: the ranges of `data`, written at `offset` of a file restored
