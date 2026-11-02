@@ -726,8 +726,7 @@ pub(super) fn xattrs(path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
     attr_names(&dir)?
         .into_iter()
         .map(|name| {
-            let mut value = Vec::new();
-            _ = open_attr(&dir, &name, libc::O_RDONLY)?.read_to_end(&mut value)?;
+            let value = attr_value(&dir, &name)?;
             Ok(ExtendedAttribute {
                 name,
                 value: Some(value),
@@ -736,9 +735,32 @@ pub(super) fn xattrs(path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
         .collect()
 }
 
+/// The value of the extended attribute `name` in `dir`, an attribute
+/// directory.
+fn attr_value(dir: &File, name: &str) -> io::Result<Vec<u8>> {
+    let mut value = Vec::new();
+    _ = open_attr(dir, name, libc::O_RDONLY)?.read_to_end(&mut value)?;
+    Ok(value)
+}
+
+/// Whether the extended attribute `name` in `dir`, an attribute directory,
+/// has the value `want`: false where it can't be read. Only one of the
+/// same size is read.
+fn attr_has_value(dir: &File, name: &str, want: &[u8]) -> bool {
+    open_attr(dir, name, libc::O_RDONLY).is_ok_and(|mut f| {
+        let mut value = Vec::with_capacity(want.len());
+        f.metadata().is_ok_and(|m| m.len() == want.len() as u64)
+            && f.read_to_end(&mut value).is_ok()
+            && value == want
+    })
+}
+
 /// Gives the file at `path` exactly the extended attributes `attrs`. One
 /// that can't be set or removed doesn't keep the others from being set or
 /// removed, as in BackOtter's restic: each failure is returned, by name.
+/// One the file has already, with its node's value, is left as it is, as on
+/// every other system and in BackOtter's restic; one that can't be read is
+/// written.
 pub(super) fn set_xattrs(path: &Path, attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
     let Some(dir) = attr_dir(path)? else {
         // Each one named, as those that can't be set are.
@@ -755,10 +777,10 @@ pub(super) fn set_xattrs(path: &Path, attrs: &[ExtendedAttribute]) -> Result<(),
         return errors.into_result();
     };
     let mut errors = XattrErrors::default();
-    match attr_names(&dir) {
+    let present = match attr_names(&dir) {
         Ok(names) => {
-            for name in names {
-                if !attrs.iter().any(|a| a.name == name) {
+            for name in &names {
+                if !attrs.iter().any(|a| a.name == *name) {
                     let n = CString::new(name.as_str()).map_err(io::Error::from);
                     // SAFETY: n is a C string.
                     let removed = n.and_then(|n| {
@@ -769,12 +791,20 @@ pub(super) fn set_xattrs(path: &Path, attrs: &[ExtendedAttribute]) -> Result<(),
                     }
                 }
             }
+            names
         }
-        Err(err) => errors.push("listing", err),
-    }
+        Err(err) => {
+            errors.push("listing", err);
+            Vec::new()
+        }
+    };
     for a in attrs {
+        let value = a.value.as_deref().unwrap_or_default();
+        if present.contains(&a.name) && attr_has_value(&dir, &a.name, value) {
+            continue;
+        }
         let set = open_attr(&dir, &a.name, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)
-            .and_then(|mut f| f.write_all(a.value.as_deref().unwrap_or_default()));
+            .and_then(|mut f| f.write_all(value));
         if let Err(err) = set {
             errors.push(a.name.as_str(), err);
         }
@@ -942,4 +972,72 @@ fn restore_one_xattr_meta(
         .map(drop)
         .map_err(|err| path_error("utimensat", &at, &err));
     owner.and(mode).and(acl).and(times)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{thread, time::Duration};
+
+    use super::*;
+
+    fn xattr(name: &str, value: &[u8]) -> ExtendedAttribute {
+        ExtendedAttribute {
+            name: name.to_string(),
+            value: Some(value.to_vec()),
+        }
+    }
+
+    /// BackOtter: an extended attribute the file has already, with its
+    /// node's value, isn't written again; the others are written, and those
+    /// the node hasn't got removed. Nothing to check on a file system
+    /// without them.
+    #[test]
+    fn set_xattrs_leaves_equal_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"").unwrap();
+        let first = [
+            xattr("diff", b"old"),
+            xattr("empty", b""),
+            xattr("gone", b"g"),
+            xattr("same", b"v"),
+        ];
+        if set_xattrs(&file, &first).is_err() {
+            eprintln!("no extended attributes in {}", dir.path().display());
+            return;
+        }
+        let adir = attr_dir(&file).unwrap().unwrap();
+        let mtime = |name: &str| {
+            open_attr(&adir, name, libc::O_RDONLY)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .modified()
+                .unwrap()
+        };
+        let before = [mtime("diff"), mtime("empty"), mtime("same")];
+        thread::sleep(Duration::from_millis(50));
+        let want = [
+            xattr("diff", b"new"),
+            ExtendedAttribute {
+                name: "empty".to_string(),
+                value: None,
+            },
+            xattr("new", b"n"),
+            xattr("same", b"v"),
+        ];
+        set_xattrs(&file, &want).unwrap();
+        assert_ne!(mtime("diff"), before[0]);
+        assert_eq!(mtime("empty"), before[1]);
+        assert_eq!(mtime("same"), before[2]);
+        assert_eq!(
+            xattrs(&file).unwrap(),
+            [
+                xattr("diff", b"new"),
+                xattr("empty", b""),
+                xattr("new", b"n"),
+                xattr("same", b"v"),
+            ]
+        );
+    }
 }
