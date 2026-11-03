@@ -13,11 +13,27 @@ use crate::{
     },
     error::{ErrorKind, RusticError, RusticResult},
     index::{ReadIndex, indexer::Indexer},
+    commands::restore::SnapshotOrigin,
     repofile::{PathList, SnapshotFile, SnapshotSummary},
     repository::{IndexedTree, Repository},
 };
 
-/// Merges the given snapshots into a new snapshot.
+/// BackOtter: `program_version` without what makes it BackOtter's: each
+/// word cut at `+backotter`, so `rustic 0.11.4+backotter.3` becomes
+/// `rustic 0.11.4`, stock rustic's own form ([`SnapshotOrigin::Other`]).
+/// A merge of snapshots not all BackOtter's writes it, since in a stock
+/// snapshot's nodes a missing attribute is unknown, not zero.
+fn without_backotter(program_version: &str) -> String {
+    program_version
+        .split(' ')
+        .map(|word| word.split_once("+backotter").map_or(word, |(stock, _)| stock))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Merges the given snapshots into a new snapshot. BackOtter: `snap`'s
+/// program version loses its `+backotter` unless every snapshot merged is
+/// BackOtter's ([`without_backotter`]).
 ///
 /// # Arguments
 ///
@@ -36,6 +52,12 @@ pub(crate) fn merge_snapshots<S: IndexedTree>(
     mut snap: SnapshotFile,
 ) -> RusticResult<SnapshotFile> {
     let now = Zoned::now();
+
+    // BackOtter: the merged snapshot is BackOtter's (missing attributes
+    // were zero at backup) only if every snapshot merged is.
+    if !snapshots.iter().all(|sn| SnapshotOrigin::of(sn).known_bko()) {
+        snap.program_version = without_backotter(&snap.program_version);
+    }
 
     let paths = snapshots
         .iter()
@@ -143,4 +165,24 @@ pub(crate) fn merge_trees<S: IndexedTree>(
     stats.apply(summary, BlobType::Tree);
 
     Ok(tree_merged)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backotter_cut_from_program_version() {
+        for (version, want) in [
+            ("rustic 0.11.4+backotter.3", "rustic 0.11.4"),
+            ("rustic 0.11.4-dev+backotter.3", "rustic 0.11.4-dev"),
+            ("restic 0.19.1+backotter.3", "restic 0.19.1"),
+            ("rustic 0.11.4", "rustic 0.11.4"),
+            ("", ""),
+        ] {
+            let cut = without_backotter(version);
+            assert_eq!(cut, want, "{version}");
+            assert!(!SnapshotOrigin::from_program_version(&cut).known_bko(), "{version}");
+        }
+    }
 }

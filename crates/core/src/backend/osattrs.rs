@@ -544,16 +544,31 @@ pub(crate) struct FilledHoles {
 /// `SEEK_HOLE` (where there is one) finds a hole, is opened for writing, so
 /// that a file without holes (most, and those a file system compresses)
 /// gets no close-write event, and a running program no `ETXTBSY`. On Linux
-/// `fallocate(2)` fills them; on macOS, whose `F_PREALLOCATE` only adds
-/// space past the end, zeros are written into each hole (`SEEK_HOLE`,
-/// `SEEK_DATA`). Elsewhere nothing is done.
+/// `fallocate(2)` fills them, except on ZFS. Elsewhere nothing is done, as
+/// in BackOtter's restic: macOS's `F_PREALLOCATE` only adds space past the
+/// end of a file, and nothing is written into a file whose contents are
+/// right already.
 pub(crate) fn fill_holes(path: &Path, len: u64) -> FilledHoles {
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     return sparse::fill_holes(path, len);
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         _ = (path, len);
         FilledHoles::default()
+    }
+}
+
+/// Whether [`fill_holes`] would fill holes of the regular file at `path`, of
+/// `len` bytes, looked at as it looks (never opened for writing): for
+/// `restore --dry-run`, which counts such a file as one to modify, as
+/// BackOtter's restic does.
+pub(crate) fn holes_to_fill(path: &Path, len: u64) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    return sparse::holes_to_fill(path, len);
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        _ = (path, len);
+        false
     }
 }
 
