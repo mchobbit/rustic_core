@@ -1806,8 +1806,12 @@ mod tests {
         std::fs::create_dir(&nilfs).unwrap();
         assert!(!fresh(&d), ".nilfs directory");
         std::fs::remove_dir(&nilfs).unwrap();
-        std::os::unix::fs::symlink("/dev/null", &nilfs).unwrap();
-        assert!(!fresh(&d), ".nilfs symlink");
+        // To an empty regular file, so following it would accept it.
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        std::os::unix::fs::symlink(&empty, &nilfs).unwrap();
+        assert!(!fresh(&d), ".nilfs symlink to an empty file");
+        assert!(!restore_target_is_fresh(&d), ".nilfs symlink to an empty file");
         std::fs::remove_file(&nilfs).unwrap();
         std::fs::write(d.join(".nilfs2"), b"").unwrap();
         assert!(!fresh(&d), "another name");
