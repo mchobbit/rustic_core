@@ -161,7 +161,10 @@ pub use crate::{
         prune::{LimitOption, PruneOptions, PrunePlan, PruneStats},
         repair::{index::RepairIndexOptions, snapshots::RepairSnapshotsOptions},
         repoinfo::{BlobInfo, IndexInfos, PackInfo, RepoFileInfo, RepoFileInfos},
-        restore::{FileDirStats, RestoreOptions, RestorePlan, RestoreStats, SparseRestore},
+        restore::{
+            FileDirStats, RestoreOptions, RestorePlan, RestoreStats, SnapshotOrigin, SparseRestore,
+            restore_target_is_fresh,
+        },
         rewrite::RewriteOptions,
     },
     error::{ErrorKind, RusticError, RusticResult, Severity, Status},

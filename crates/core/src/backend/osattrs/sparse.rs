@@ -150,6 +150,7 @@ fn seek_hole(f: &File) -> io::Result<u64> {
 /// files, so as not to follow a symlink, wait on a lock or take a terminal.
 /// An error unless it is still the file `m` (its lstat) describes.
 #[cfg(any(
+    target_os = "linux",
     target_os = "android",
     target_os = "freebsd",
     target_os = "illumos",
@@ -576,6 +577,101 @@ impl<F> Drop for HoleReader<F> {
     }
 }
 
+/// [`super::fill_holes`]: the holes of the regular file at `path`, of `len`
+/// bytes, filled, where it still is such a file and has any.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+pub(super) fn fill_holes(path: &Path, len: u64) -> super::FilledHoles {
+    let mut done = super::FilledHoles::default();
+    if let Err(err) = fill_holes_with(path, len, &mut done) {
+        done.error = Some(err);
+    }
+    done
+}
+
+/// [`fill_holes`], which sets `done.changed` once it has opened the file for
+/// writing, and gives the error that kept it from filling them all.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn fill_holes_with(path: &Path, len: u64, done: &mut super::FilledHoles) -> io::Result<()> {
+    use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
+
+    let m = std::fs::symlink_metadata(path)?;
+    // Most files: all their blocks, nothing more to look at.
+    if !m.is_file() || m.len() != len || !maybe_sparse(len, m.blocks()) {
+        return Ok(());
+    }
+    // Fewer blocks than bytes (holes, or a file system that compresses):
+    // SEEK_HOLE tells, on the file opened for reading only.
+    let probe = open(path, &m)?;
+    #[cfg(target_os = "linux")]
+    let holes = has_holes(path, &m, Some(&probe));
+    #[cfg(not(target_os = "linux"))]
+    let holes = decide(len, m.blocks(), Some(|| seek_hole(&probe)));
+    drop(probe);
+    if !holes {
+        return Ok(());
+    }
+    debug!("filling the holes of {}", path.display());
+    let f = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)?;
+    let before = f.metadata()?;
+    if !before.is_file() || before.dev() != m.dev() || before.ino() != m.ino() {
+        return Err(io::Error::other("replaced since it was looked at"));
+    }
+    let filled = allocate_holes(&f, len);
+    done.changed = f.metadata().is_ok_and(|after| after.blocks() > before.blocks());
+    filled
+}
+
+/// Allocates the first `len` bytes of `f`, holes included: `fallocate(2)`
+/// with mode 0, which leaves data as it is.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn allocate_holes(f: &File, len: u64) -> io::Result<()> {
+    super::os_preallocate(f, len)
+}
+
+/// Allocates the holes of the first `len` bytes of `f` on macOS, whose
+/// `F_PREALLOCATE` adds space only past the end of a file
+/// (`F_PEOFPOSMODE`), and never inside it: zeros written into each.
+#[cfg(target_vendor = "apple")]
+fn allocate_holes(f: &File, len: u64) -> io::Result<()> {
+    write_zeros_into_holes(f, len)
+}
+
+/// Writes zeros into each hole of the first `len` bytes of `f`, which
+/// `SEEK_HOLE` and `SEEK_DATA` find, so that the file system allocates them;
+/// the file's contents stay the same.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+fn write_zeros_into_holes(f: &File, len: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    const CHUNK: u64 = 1 << 20;
+    let zeros = vec![0_u8; 1 << 20];
+    let mut off = 0;
+    while off < len {
+        let hole = lseek(f, off, libc::SEEK_HOLE)?;
+        if hole >= len {
+            break;
+        }
+        let data = match lseek(f, hole, libc::SEEK_DATA) {
+            Ok(data) => data.min(len),
+            // No data after the hole: it runs to the end.
+            Err(err) if err.raw_os_error() == Some(libc::ENXIO) => len,
+            Err(err) => return Err(err),
+        };
+        let mut at = hole;
+        while at < data {
+            let n = (data - at).min(CHUNK);
+            f.write_all_at(&zeros[..usize::try_from(n).map_err(io::Error::other)?], at)?;
+            at += n;
+        }
+        off = data.max(hole + 1);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -584,6 +680,94 @@ mod tests {
     };
 
     use super::*;
+
+    /// A file with holes that SEEK_HOLE finds, here (a file system that
+    /// keeps holes), or `None`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn sparse_file(dir: &Path, name: &str, len: u64) -> Option<std::path::PathBuf> {
+        let path = dir.join(name);
+        let mut f = File::create(&path).unwrap();
+        _ = f.seek(SeekFrom::Start(len - 1)).unwrap();
+        f.write_all(b"x").unwrap();
+        drop(f);
+        let m = std::fs::metadata(&path).unwrap();
+        maybe_sparse(len, m.blocks()).then_some(path)
+    }
+
+    /// BackOtter: a file with holes gets them filled, and says it changed;
+    /// a file without (or filled already) isn't opened for writing at all:
+    /// one that can't be (read-only, not as root) is no error.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn fill_holes_only_where_there_are_holes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let len = 4 << 20;
+        let Some(path) = sparse_file(dir.path(), "holes", len) else {
+            eprintln!("no holes in {}", dir.path().display());
+            return;
+        };
+        let filled = fill_holes(&path, len);
+        if let Some(err) = &filled.error
+            && err.raw_os_error() == Some(libc::EOPNOTSUPP)
+        {
+            eprintln!("no fallocate in {}: {err}", dir.path().display());
+            return;
+        }
+        assert!(filled.error.is_none(), "{:?}", filled.error);
+        assert!(filled.changed);
+        let m = std::fs::metadata(&path).unwrap();
+        assert!(!maybe_sparse(len, m.blocks()), "{} blocks", m.blocks());
+        assert_eq!(std::fs::read(&path).unwrap().iter().filter(|&&b| b != 0).count(), 1);
+
+        // Filled already: nothing to do, read-only or not.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let again = fill_holes(&path, len);
+        assert!(again.error.is_none(), "{:?}", again.error);
+        assert!(!again.changed);
+
+        // A dense file, read-only: not opened for writing.
+        let dense = dir.path().join("dense");
+        std::fs::write(&dense, vec![1_u8; 1 << 16]).unwrap();
+        std::fs::set_permissions(&dense, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let none = fill_holes(&dense, 1 << 16);
+        assert!(none.error.is_none(), "{:?}", none.error);
+        assert!(!none.changed);
+
+        // One with holes that can't be opened for writing (not as root):
+        // the error says so, and nothing changed.
+        if !nix::unistd::geteuid().is_root()
+            && let Some(ro) = sparse_file(dir.path(), "ro", len)
+        {
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o444)).unwrap();
+            let refused = fill_holes(&ro, len);
+            assert!(refused.error.is_some());
+            assert!(!refused.changed);
+        }
+    }
+
+    /// BackOtter: macOS's way of filling holes (zeros written into each),
+    /// tried where it can be: the file is allocated, its contents the same.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn zeros_written_into_holes() {
+        let dir = tempfile::tempdir().unwrap();
+        let len = 3 << 20;
+        let Some(path) = sparse_file(dir.path(), "holes", len) else {
+            eprintln!("no holes in {}", dir.path().display());
+            return;
+        };
+        // Data in the middle too: holes on both sides of it.
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        std::os::unix::fs::FileExt::write_all_at(&f, b"middle", 1 << 20).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        write_zeros_into_holes(&f, len).unwrap();
+        drop(f);
+        let m = std::fs::metadata(&path).unwrap();
+        assert!(!maybe_sparse(len, m.blocks()), "{} blocks", m.blocks());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
 
     #[test]
     fn maybe_sparse_by_blocks() {

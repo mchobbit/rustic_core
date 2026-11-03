@@ -13,8 +13,8 @@ use rustic_core::{
 };
 
 use super::{
-    RepoOpen, TestSource, assert_with_win, atime_as_mtime, insta_node_redaction,
-    insta_snapshotfile_redaction, set_up_repo, tar_gz_testdata,
+    RepoOpen, TestSource, assert_with_win, insta_node_redaction, insta_snapshotfile_redaction,
+    set_up_repo, tar_gz_testdata,
 };
 
 #[rstest]
@@ -33,9 +33,7 @@ fn test_rewrite(
     let paths = &source.path_list();
 
     // we use as_path to not depend on the actual tempdir
-    let backup_opts = BackupOptions::default()
-        .as_path(PathBuf::from_str("test")?)
-        .ignore_save_opts(atime_as_mtime());
+    let backup_opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
 
     // first backup
     let snapshot = repo.backup(&backup_opts, paths, SnapshotFile::default())?;
