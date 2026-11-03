@@ -177,9 +177,14 @@ impl SnapshotOrigin {
 /// (owner, mode, times, extended attributes, ACLs and flags), as in stock
 /// rustic: a freshly booted server's `/tmp`, with nothing in it but empty
 /// `.X11-unix`, `.ICE-unix` and `systemd-private-*/tmp`, keeps its sticky
-/// bit. A symlink at `dest` is not fresh. Where there are no device
-/// numbers (Windows), no directory is a mount point. As in BackOtter's
-/// restic. Call it before the restore starts.
+/// bit. A symlink at `dest` is not fresh. Nor is an existing `dest` that
+/// is sticky or that others may write in (mode bits 01000 or 0002,
+/// [`shared_dir`]), even empty: a shared directory such as an empty
+/// `/tmp` or `/dev/shm` keeps its mode, owner, extended attributes and
+/// ACLs. mkfs, newfs, `zfs create` and `btrfs subvolume create` never
+/// make such a root. Where there are no device numbers (Windows), no
+/// directory is a mount point, and there are no such mode bits. As in
+/// BackOtter's restic. Call it before the restore starts.
 #[must_use]
 pub fn restore_target_is_fresh(dest: impl AsRef<std::path::Path>) -> bool {
     fresh_target_with(dest.as_ref(), &|_, meta| device_of(meta))
@@ -199,6 +204,22 @@ const fn device_of(_meta: &std::fs::Metadata) -> Option<u64> {
     None
 }
 
+/// Whether the directory of `meta` is sticky or others may write in it
+/// (mode bits 01000 or 0002): a directory shared by its users, like
+/// `/tmp`, never a new file system's root.
+#[cfg(unix)]
+fn shared_dir(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o1002 != 0
+}
+
+/// Whether the directory of `meta` is sticky or others may write in it:
+/// never, where there are no such mode bits.
+#[cfg(not(unix))]
+const fn shared_dir(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
 /// The device of a path, given its (`lstat`) metadata.
 type DeviceOf<'a> = dyn Fn(&std::path::Path, &std::fs::Metadata) -> Option<u64> + 'a;
 
@@ -206,7 +227,7 @@ type DeviceOf<'a> = dyn Fn(&std::path::Path, &std::fs::Metadata) -> Option<u64> 
 fn fresh_target_with(dest: &std::path::Path, device: &DeviceOf<'_>) -> bool {
     match std::fs::symlink_metadata(dest) {
         Err(err) => err.kind() == std::io::ErrorKind::NotFound,
-        Ok(meta) if meta.is_dir() => {
+        Ok(meta) if meta.is_dir() && !shared_dir(&meta) => {
             let mut budget = FRESH_TARGET_MAX_DIRS;
             fresh_dir(dest, device(dest, &meta), device, &mut budget).is_some()
         }
@@ -1612,6 +1633,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn target_fresh_only_when_new_or_empty() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().join("d");
         let mounts = std::cell::RefCell::new(Vec::<PathBuf>::new());
@@ -1628,6 +1650,8 @@ mod tests {
         };
         assert!(fresh(&d));
         std::fs::create_dir(&d).unwrap();
+        // As mkfs makes it, whatever the umask.
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(fresh(&d));
         std::fs::create_dir(d.join("lost+found")).unwrap();
         std::fs::write(d.join("lost+found/#123"), b"x").unwrap();
@@ -1713,6 +1737,28 @@ mod tests {
         std::fs::write(&f, b"x").unwrap();
         assert!(!fresh(&f), "file as the destination");
 
+        // A shared directory, sticky or writable by others, is not fresh,
+        // even empty: an empty /tmp or /dev/shm.
+        let shm = dir.path().join("shm");
+        std::fs::create_dir(&shm).unwrap();
+        for (mode, want) in [
+            (0o1777, false),
+            (0o1755, false),
+            (0o777, false),
+            (0o757, false),
+            (0o775, true),
+            (0o755, true),
+            (0o700, true),
+        ] {
+            std::fs::set_permissions(&shm, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(fresh(&shm), want, "empty, mode {mode:o}");
+            assert_eq!(restore_target_is_fresh(&shm), want, "empty, mode {mode:o}");
+        }
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(!fresh(&d), "bare-metal root, mode 1777");
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(fresh(&d));
+
         // The devices restore_target_is_fresh itself sees: none of these
         // directories is a mount point.
         assert!(restore_target_is_fresh(dir.path().join("new")));
@@ -1753,8 +1799,11 @@ mod tests {
             if !mount(&efi) {
                 return None;
             }
+            // An empty tmpfs (mode 1777) as the destination, as /dev/shm,
+            // is not fresh; mounted below a fresh one, it may be.
+            let mut results = vec![("empty tmpfs", false, restore_target_is_fresh(&efi))];
             std::fs::create_dir(efi.join("lost+found")).unwrap();
-            let mut results = vec![("boot and boot/efi mounted", true, restore_target_is_fresh(d))];
+            results.push(("boot and boot/efi mounted", true, restore_target_is_fresh(d)));
             for (what, sub) in [
                 ("empty directory in efi", "efi/EFI"),
                 ("empty directory in boot", "grub"),
