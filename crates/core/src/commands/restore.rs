@@ -115,12 +115,15 @@ pub enum SnapshotOrigin {
 
 impl SnapshotOrigin {
     /// The origin of a snapshot written by the program `program_version`
-    /// (`restic 0.18.1`, `rustic 0.11.4+backotter.3`).
+    /// (`restic 0.18.1`, `rustic 0.11.4+backotter.3`). None (empty) is
+    /// restic's before 0.16, which wrote none: stock rustic always writes
+    /// `rustic VERSION`.
     #[must_use]
     pub fn from_program_version(program_version: &str) -> Self {
         if program_version.contains("+backotter") {
             Self::BackOtter
-        } else if program_version.starts_with("restic ") {
+        } else if program_version.is_empty() || program_version.starts_with("restic ") {
+            // restic before 0.16 wrote no program version; rustic always has.
             Self::Restic
         } else {
             Self::Other
@@ -151,22 +154,70 @@ impl SnapshotOrigin {
 
 /// BackOtter: whether a restore into `dest` gives `dest` the metadata of
 /// the node it restores there (`restore SNAP:subfolder DEST`): only when the
-/// restore creates `dest`, or `dest` is an empty directory, where one that
-/// holds only `lost+found` counts as empty (a new file system's root).
-/// Otherwise `dest` stays as it is (owner, mode, times, extended attributes,
-/// ACLs and flags), as in stock rustic. Call it before the restore starts.
+/// restore creates `dest`, or `dest` is a directory with nothing in it but
+/// directories, at any depth, where entries a file system makes itself
+/// don't count: `lost+found` (a directory), FreeBSD UFS's `.snap` (a
+/// directory) and `.sujournal` (a regular file), none looked into, in at
+/// most 4096 directories ([`FRESH_TARGET_MAX_DIRS`]). That is a
+/// new file system's root with the new file systems of the system restored
+/// mounted below it (`/boot`, `/boot/efi`, `/home`, ZFS datasets, btrfs
+/// subvolumes), and the directories made for their mount points: BackOtter's
+/// bare-metal restore. Anything else (a file, a symlink, a device, a
+/// directory that can't be read) means `dest` stays as it is (owner, mode,
+/// times, extended attributes, ACLs and flags), as in stock rustic. A
+/// symlink at `dest` is not fresh, and symlinks in it aren't followed. As in
+/// BackOtter's restic. Call it before the restore starts.
 #[must_use]
 pub fn restore_target_is_fresh(dest: impl AsRef<std::path::Path>) -> bool {
     let dest = dest.as_ref();
     match std::fs::symlink_metadata(dest) {
         Err(err) => err.kind() == std::io::ErrorKind::NotFound,
-        Ok(m) if m.is_dir() => std::fs::read_dir(dest).is_ok_and(|entries| {
-            entries
-                .into_iter()
-                .all(|entry| entry.is_ok_and(|entry| entry.file_name() == "lost+found"))
-        }),
+        Ok(m) if m.is_dir() => holds_only_directories(dest),
         Ok(_) => false,
     }
+}
+
+/// The most directories [`restore_target_is_fresh`] looks at, `dest`
+/// included: a destination with more isn't fresh. As BackOtter's restic.
+const FRESH_TARGET_MAX_DIRS: usize = 4096;
+
+/// Whether the directory `dir` holds nothing but directories that do too,
+/// and entries a file system makes itself ([`made_by_file_system`]), in at
+/// most [`FRESH_TARGET_MAX_DIRS`] directories.
+fn holds_only_directories(dir: &std::path::Path) -> bool {
+    let mut dirs = vec![dir.to_path_buf()];
+    let mut seen = 0;
+    while let Some(dir) = dirs.pop() {
+        seen += 1;
+        if seen > FRESH_TARGET_MAX_DIRS {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return false;
+        };
+        for entry in entries {
+            // file_type doesn't follow a symlink.
+            let Ok((entry, file_type)) = entry.and_then(|e| e.file_type().map(|t| (e, t))) else {
+                return false;
+            };
+            if made_by_file_system(&entry.file_name(), file_type) {
+                continue;
+            }
+            if !file_type.is_dir() {
+                return false;
+            }
+            dirs.push(entry.path());
+        }
+    }
+    true
+}
+
+/// Whether the entry `name` of type `file_type` is one a new file system
+/// has: `lost+found` (ext2/3/4, UFS), FreeBSD UFS's `.snap` (newfs without
+/// `-n`) and `.sujournal` (newfs `-j`).
+fn made_by_file_system(name: &std::ffi::OsStr, file_type: std::fs::FileType) -> bool {
+    (file_type.is_dir() && (name == "lost+found" || name == ".snap"))
+        || (file_type.is_file() && name == ".sujournal")
 }
 
 /// Which files to restore sparse (BackOtter: new files that had holes are,
@@ -1434,7 +1485,8 @@ mod tests {
         assert_eq!(of("restic 0.18.1"), SnapshotOrigin::Restic);
         assert_eq!(of("rustic v0.11.4"), SnapshotOrigin::Other);
         assert_eq!(of("rustic 0.11.4"), SnapshotOrigin::Other);
-        assert_eq!(of(""), SnapshotOrigin::Other);
+        // restic before 0.16 wrote no program version.
+        assert_eq!(of(""), SnapshotOrigin::Restic);
         assert_eq!(RestoreOptions::default().origin, SnapshotOrigin::Other);
         assert!(SnapshotOrigin::BackOtter.known_bko());
         assert!(!SnapshotOrigin::Restic.known_bko());
@@ -1471,9 +1523,24 @@ mod tests {
         let mut with_mode = unix.clone();
         with_mode.meta.mode = Some(0o644);
         assert!(!mode_zero_if_missing(bko, &with_mode));
-        let mut dir = unix;
+        let mut dir = unix.clone();
         dir.node_type = NodeType::Dir;
         assert!(!mode_zero_if_missing(bko, &dir));
+        // restic before 0.16 wrote no program version, and left mode 0 out
+        // as every restic does; stock rustic always names itself.
+        let old_restic = SnapshotFile {
+            program_version: String::new(),
+            ..SnapshotFile::default()
+        };
+        let opts = |snap: &SnapshotFile| RestoreOptions::default().origin(SnapshotOrigin::of(snap));
+        assert!(mode_zero_if_missing(opts(&old_restic), &unix));
+        assert!(!mode_zero_if_missing(opts(&old_restic), &stdin));
+        let stock_rustic = SnapshotFile {
+            program_version: "rustic 0.13.0".to_string(),
+            ..SnapshotFile::default()
+        };
+        assert!(!mode_zero_if_missing(opts(&stock_rustic), &unix));
+        assert!(!SnapshotOrigin::of(&old_restic).known_bko());
     }
 
     /// Holes of a file left as it is are filled only in BackOtter's
@@ -1494,8 +1561,11 @@ mod tests {
     }
 
     /// The destination of `SNAP:subfolder` gets the subfolder's metadata
-    /// only when the restore creates it or finds it empty (`lost+found`
-    /// alone counts as empty).
+    /// only when the restore creates it or finds nothing in it but
+    /// directories (at any depth) and what a file system makes itself
+    /// (`lost+found`, `.snap`, `.sujournal`): a new root with the new file
+    /// systems mounted below it.
+    #[cfg(unix)]
     #[test]
     fn target_fresh_only_when_new_or_empty() {
         let dir = tempfile::tempdir().unwrap();
@@ -1504,15 +1574,90 @@ mod tests {
         std::fs::create_dir(&d).unwrap();
         assert!(restore_target_is_fresh(&d));
         std::fs::create_dir(d.join("lost+found")).unwrap();
+        std::fs::write(d.join("lost+found/#123"), b"x").unwrap();
         assert!(restore_target_is_fresh(&d));
-        std::fs::write(d.join("file"), b"x").unwrap();
+        // Mount points: /boot, /boot/efi, /home with its lost+found, a
+        // FreeBSD UFS's .snap and .sujournal, a ZFS dataset's parent.
+        for sub in ["boot/efi", "home/lost+found", "var/.snap", "usr/local/lib"] {
+            std::fs::create_dir_all(d.join(sub)).unwrap();
+        }
+        std::fs::write(d.join("var/.sujournal"), b"").unwrap();
+        assert!(restore_target_is_fresh(&d));
+        // Anything else, at any depth, is not.
+        for (what, make, undo) in [
+            ("file", "boot/efi/f", "boot/efi/f"),
+            ("lost+found file", "usr/lost+found", "usr/lost+found"),
+            (".sujournal directory with a file", "usr/.sujournal/", "usr/.sujournal"),
+            (".snap file", "home/.snap", "home/.snap"),
+        ] {
+            if let Some(dirname) = make.strip_suffix('/') {
+                std::fs::create_dir(d.join(dirname)).unwrap();
+                std::fs::write(d.join(dirname).join("f"), b"x").unwrap();
+            } else {
+                std::fs::write(d.join(make), b"x").unwrap();
+            }
+            assert!(!restore_target_is_fresh(&d), "{what}");
+            let undo = d.join(undo);
+            if undo.is_dir() {
+                std::fs::remove_dir_all(&undo).unwrap();
+            } else {
+                std::fs::remove_file(&undo).unwrap();
+            }
+            assert!(restore_target_is_fresh(&d), "{what} removed");
+        }
+        // At most 4096 directories, d and boot/efi among them.
+        let many = d.join("many");
+        std::fs::create_dir(&many).unwrap();
+        // d, boot, efi, home, var, usr, local, lib and many (not lost+found or .snap).
+        let have = 9;
+        for i in 0..FRESH_TARGET_MAX_DIRS - have {
+            std::fs::create_dir(many.join(i.to_string())).unwrap();
+        }
+        assert!(restore_target_is_fresh(&d));
+        std::fs::create_dir(many.join("one more")).unwrap();
         assert!(!restore_target_is_fresh(&d));
-        std::fs::remove_file(d.join("file")).unwrap();
-        std::fs::create_dir(d.join("sub")).unwrap();
+        std::fs::remove_dir_all(&many).unwrap();
+        // A symlink, even to a directory, is not followed.
+        std::os::unix::fs::symlink("/", d.join("boot/link")).unwrap();
         assert!(!restore_target_is_fresh(&d));
+        std::fs::remove_file(d.join("boot/link")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&d, &link).unwrap();
+        assert!(!restore_target_is_fresh(&link));
         let f = dir.path().join("f");
         std::fs::write(&f, b"x").unwrap();
         assert!(!restore_target_is_fresh(&f));
+    }
+
+    /// As root on Linux: a file system mounted in the destination (tmpfs
+    /// here, /boot or /home in a bare-metal restore) counts by what it
+    /// holds, as any directory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_fresh_with_a_mount_in_it() {
+        if !nix::unistd::geteuid().is_root() {
+            eprintln!("not root: no mount");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let boot = d.join("boot");
+        std::fs::create_dir(&boot).unwrap();
+        let mounted = std::process::Command::new("mount")
+            .args(["-t", "tmpfs", "bkotest", boot.to_str().unwrap()])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !mounted {
+            eprintln!("tmpfs not mounted");
+            return;
+        }
+        std::fs::create_dir_all(boot.join("efi/lost+found")).unwrap();
+        let empty = restore_target_is_fresh(d);
+        std::fs::write(boot.join("efi/vmlinuz"), b"x").unwrap();
+        let with_file = restore_target_is_fresh(d);
+        let _ = std::process::Command::new("umount").arg(&boot).status();
+        assert!(empty);
+        assert!(!with_file);
     }
 
     #[cfg(feature = "clap")]

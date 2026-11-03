@@ -344,11 +344,17 @@ that either program restores what the other backed up.
   close-write event (sync clients, indexers) and a running program no
   `ETXTBSY`. Linux fills them with `fallocate(2)`; macOS, whose
   `F_PREALLOCATE` only adds space past the end, gets zeros written into
-  each hole (`SEEK_HOLE`, `SEEK_DATA`). A file whose holes were filled
-  counts as modified, not unchanged; one whose holes couldn't be filled
-  (`ENOSPC`, a file system without `fallocate`) is a warning ("holes not
-  filled"), and the restore goes on, exiting 0 as for other metadata. Not
-  under `--dry-run`.
+  each hole (`SEEK_HOLE`, `SEEK_DATA`). Never on ZFS (`fstatfs(2)` of the
+  file opened read-only: `f_type` 0x2fc12fc1 on Linux, `zfs` on macOS),
+  where `fallocate(2)` allocates nothing and compression keeps written
+  zeros as holes, so that such a file would be opened for writing at every
+  restore for nothing; a file system that can't allocate (`fallocate(2)`
+  failing with `EOPNOTSUPP` or `ENOSYS`: ext4 on an ext3-format file's
+  indirect blocks, older ZFS) is nothing to do, as in BackOtter's restic. A
+  file whose holes were filled counts as modified, not unchanged; one whose
+  holes couldn't be filled otherwise (`ENOSPC`, `EIO`, can't be opened for
+  writing) is a warning ("holes not filled"), and the restore goes on,
+  exiting 0 as for other metadata. Not under `--dry-run`.
 - On FreeBSD and NetBSD, extended attributes are named as restic names them:
   the user namespace only, under bare names (stock rustic keeps both
   namespaces, as `user.NAME` and `system.NAME`, and restores the system
@@ -557,6 +563,9 @@ that either program restores what the other backed up.
   (`+backotter`), which record everything they can, a missing attribute
   was zero or absent at backup (no flags, no project ID, no holes); in any
   other it is unknown, and the restore leaves the destination as it is.
+  A snapshot without a program version is restic's before 0.16, which wrote
+  none (stock rustic always writes `rustic VERSION`): a stock restic
+  snapshot, whose regular files without a mode had mode 0.
 - A hard link replaces whatever has its name already, as in BackOtter's
   restic: the same link, where a restore is run again over its own result,
   or another file. Stock rustic tried to link over it, failed (`EEXIST`)

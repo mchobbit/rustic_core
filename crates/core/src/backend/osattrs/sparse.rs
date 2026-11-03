@@ -120,17 +120,64 @@ fn generic_seek_hole_type(f_type: u32) -> bool {
 /// holes ([`GENERIC_SEEK_HOLE`]), by `fstatfs(2)`; not if that fails.
 #[cfg(target_os = "linux")]
 fn generic_seek_hole(f: &File) -> bool {
+    fs_type(f).is_some_and(generic_seek_hole_type)
+}
+
+/// statfs(2)'s `f_type` of the file system of `f`, by `fstatfs(2)`; `None`
+/// if that fails.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn fs_type(f: &File) -> Option<u32> {
     use std::os::fd::AsRawFd;
 
     let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: f is an open file, and st is written by fstatfs.
     if unsafe { libc::fstatfs(f.as_raw_fd(), st.as_mut_ptr()) } != 0 {
         debug!("fstatfs: {}", io::Error::last_os_error());
-        return false;
+        return None;
     }
     // SAFETY: fstatfs succeeded.
     let st = unsafe { st.assume_init() };
-    u32::try_from(st.f_type).is_ok_and(generic_seek_hole_type)
+    u32::try_from(st.f_type).ok()
+}
+
+/// statfs(2)'s `f_type` of ZFS (`ZFS_SUPER_MAGIC`).
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+const ZFS_SUPER_MAGIC: u32 = 0x2fc1_2fc1;
+
+/// Whether holes can be filled on the file system whose statfs(2) `f_type`
+/// is `f_type`: not on ZFS, where `fallocate(2)` succeeds and allocates
+/// nothing, and whose compression keeps written zeros as holes, which would
+/// have the file opened for writing at every restore for nothing. As
+/// BackOtter's restic (`fileHoles`).
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn fills_holes_type(f_type: u32) -> bool {
+    f_type != ZFS_SUPER_MAGIC
+}
+
+/// Whether holes of the file `f` can be filled ([`fills_holes_type`]);
+/// where the file system can't be told, they are tried.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn fills_holes_on(f: &File) -> bool {
+    fs_type(f).is_none_or(fills_holes_type)
+}
+
+/// Whether holes of the file `f` can be filled on macOS: not on OpenZFS on
+/// macOS (`zfs`), whose compression keeps the zeros written into a hole as
+/// a hole.
+#[cfg(target_vendor = "apple")]
+fn fills_holes_on(f: &File) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: f is an open file, and st is written by fstatfs.
+    if unsafe { libc::fstatfs(f.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        return true;
+    }
+    // SAFETY: fstatfs succeeded.
+    let st = unsafe { st.assume_init() };
+    // SAFETY: f_fstypename is a NUL-terminated C string.
+    let name = unsafe { std::ffi::CStr::from_ptr(st.f_fstypename.as_ptr()) };
+    name.to_bytes() != b"zfs"
 }
 
 /// The offset of the first hole in the regular file `f`, which is its size
@@ -602,6 +649,10 @@ fn fill_holes_with(path: &Path, len: u64, done: &mut super::FilledHoles) -> io::
     // Fewer blocks than bytes (holes, or a file system that compresses):
     // SEEK_HOLE tells, on the file opened for reading only.
     let probe = open(path, &m)?;
+    // Never on ZFS, where nothing is allocated (fills_holes_type).
+    if !fills_holes_on(&probe) {
+        return Ok(());
+    }
     #[cfg(target_os = "linux")]
     let holes = has_holes(path, &m, Some(&probe));
     #[cfg(not(target_os = "linux"))]
@@ -625,10 +676,25 @@ fn fill_holes_with(path: &Path, len: u64, done: &mut super::FilledHoles) -> io::
 }
 
 /// Allocates the first `len` bytes of `f`, holes included: `fallocate(2)`
-/// with mode 0, which leaves data as it is.
+/// with mode 0, which leaves data as it is. A file system that can't
+/// (`EOPNOTSUPP`, `ENOSYS`: ext4 on indirect-block files, older ZFS) is
+/// nothing to do, as in BackOtter's restic ([`cannot_allocate`]).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn allocate_holes(f: &File, len: u64) -> io::Result<()> {
-    super::os_preallocate(f, len)
+    match super::os_preallocate(f, len) {
+        Err(err) if cannot_allocate(&err) => {
+            debug!("holes not filled: {err}");
+            Ok(())
+        }
+        done => done,
+    }
+}
+
+/// Whether `err`, from `fallocate(2)`, says the file system can't allocate
+/// (`EOPNOTSUPP`, `ENOSYS`), which leaves nothing to do.
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn cannot_allocate(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP | libc::ENOSYS))
 }
 
 /// Allocates the holes of the first `len` bytes of `f` on macOS, whose
@@ -708,14 +774,16 @@ mod tests {
             eprintln!("no holes in {}", dir.path().display());
             return;
         };
-        let filled = fill_holes(&path, len);
-        if let Some(err) = &filled.error
-            && err.raw_os_error() == Some(libc::EOPNOTSUPP)
-        {
-            eprintln!("no fallocate in {}: {err}", dir.path().display());
+        if !fills_holes_on(&File::open(&path).unwrap()) {
+            eprintln!("ZFS: no holes filled in {}", dir.path().display());
             return;
         }
+        let filled = fill_holes(&path, len);
         assert!(filled.error.is_none(), "{:?}", filled.error);
+        if !filled.changed && maybe_sparse(len, std::fs::metadata(&path).unwrap().blocks()) {
+            eprintln!("no fallocate in {}", dir.path().display());
+            return;
+        }
         assert!(filled.changed);
         let m = std::fs::metadata(&path).unwrap();
         assert!(!maybe_sparse(len, m.blocks()), "{} blocks", m.blocks());
@@ -897,6 +965,56 @@ mod tests {
             return;
         }
         assert!(!has_holes(&path, &m, Some(&File::open(&path).unwrap())));
+    }
+
+    /// Holes are never filled on ZFS, where `fallocate(2)` allocates
+    /// nothing; and a file system that can't allocate is nothing to do.
+    #[test]
+    fn fills_holes_types() {
+        for (name, f_type, want) in [
+            ("ZFS", 0x2fc1_2fc1, false),
+            ("ext4", 0xef53, true),
+            ("tmpfs", 0x0102_1994, true),
+            ("XFS", 0x5846_5342, true),
+            ("btrfs", 0x9123_683e, true),
+        ] {
+            assert_eq!(fills_holes_type(f_type), want, "{name}");
+        }
+        for (errno, want) in [
+            (libc::EOPNOTSUPP, true),
+            (libc::ENOSYS, true),
+            (libc::ENOSPC, false),
+            (libc::EIO, false),
+        ] {
+            assert_eq!(cannot_allocate(&io::Error::from_raw_os_error(errno)), want, "{errno}");
+        }
+    }
+
+    /// `BKO_TEST_ZFS_DIR` names a directory on ZFS with compression: a file
+    /// whose zero records ZFS keeps as holes is left alone, not opened for
+    /// writing (it is read-only, which fails as anyone but root), and not
+    /// changed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zfs_holes_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(dir) = std::env::var_os("BKO_TEST_ZFS_DIR") else {
+            eprintln!("BKO_TEST_ZFS_DIR not set");
+            return;
+        };
+        let dir = tempfile::tempdir_in(dir).unwrap();
+        let path = dir.path().join("zeros");
+        let len = 8 << 20;
+        std::fs::write(&path, vec![0_u8; 8 << 20]).unwrap();
+        File::open(&path).unwrap().sync_all().unwrap();
+        assert_eq!(fs_type(&File::open(&path).unwrap()), Some(ZFS_SUPER_MAGIC), "not ZFS");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let m = std::fs::metadata(&path).unwrap();
+        assert!(maybe_sparse(len, m.blocks()), "no compression: {} blocks", m.blocks());
+        let filled = fill_holes(&path, len);
+        assert!(filled.error.is_none(), "{:?}", filled.error);
+        assert!(!filled.changed);
     }
 
     // On JFS and nilfs2, SEEK_HOLE finds no hole before the size, so the
