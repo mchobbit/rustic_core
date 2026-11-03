@@ -15,8 +15,8 @@ use rustic_core::{
 };
 
 use super::{
-    RepoOpen, TestSource, assert_with_win, atime_as_mtime, insta_node_redaction,
-    insta_snapshotfile_redaction, set_up_repo, tar_gz_testdata,
+    RepoOpen, TestSource, assert_with_win, insta_node_redaction, insta_snapshotfile_redaction,
+    set_up_repo, tar_gz_testdata,
 };
 
 #[rstest]
@@ -35,9 +35,7 @@ fn test_backup_with_tar_gz_passes(
     let paths = &source.path_list();
 
     // we use as_path to not depend on the actual tempdir
-    let opts = BackupOptions::default()
-        .as_path(PathBuf::from_str("test")?)
-        .ignore_save_opts(atime_as_mtime());
+    let opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
 
     // first backup
     let first_snapshot = repo.backup(&opts, paths, SnapshotFile::default())?;
@@ -165,7 +163,6 @@ fn test_backup_dry_run_with_tar_gz_passes(
     // we use as_path to not depend on the actual tempdir
     let opts = BackupOptions::default()
         .as_path(PathBuf::from_str("test")?)
-        .ignore_save_opts(atime_as_mtime())
         .dry_run(true);
 
     // dry-run backup
@@ -313,13 +310,15 @@ fn test_backup_excludes_xattr_entries(set_up_repo: Result<RepoOpen>) -> Result<(
     Ok(())
 }
 
-/// BackOtter: a backup keeps each file's and directory's access time, and
-/// leaves them as they were in the source (on Linux, where it can read
-/// them without updating them).
+/// BackOtter: a backup with `--set-atime yes` (as BackOtter runs it) keeps
+/// each file's and directory's access time, and leaves them as they were in
+/// the source (on Linux, where it can read them without updating them). By
+/// default, as in stock rustic, the atime stored is the mtime.
 #[rstest]
 #[cfg(not(windows))]
 fn test_backup_keeps_access_times(set_up_repo: Result<RepoOpen>) -> Result<()> {
     use filetime::{FileTime, set_file_atime};
+    use rustic_core::{LocalSourceSaveOptions, TimeOption};
 
     let source = tempfile::tempdir()?;
     let dir = source.path().join("dir");
@@ -330,17 +329,29 @@ fn test_backup_keeps_access_times(set_up_repo: Result<RepoOpen>) -> Result<()> {
     set_file_atime(&dir, old)?;
 
     let repo = set_up_repo?.to_indexed_ids()?;
-    let opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
+    let opts = BackupOptions::default()
+        .as_path(PathBuf::from_str("test")?)
+        .ignore_save_opts(LocalSourceSaveOptions::default().set_atime(TimeOption::Yes));
     let paths = PathList::from_iter(Some(source.path().to_path_buf()));
     let first = repo.backup(&opts, &paths, SnapshotFile::default())?;
+    let mtime_opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
+    let by_default = repo.backup(&mtime_opts, &paths, SnapshotFile::default())?;
 
     let repo = repo.to_indexed()?;
-    let atime = |path: &str| -> Result<Option<i64>> {
-        let node = repo.node_from_snapshot_path(&format!("latest:{path}"), |_| true)?;
-        Ok(node.meta.atime.map(jiff::Timestamp::as_second))
+    let times = |snap: &SnapshotFile, path: &str| -> Result<(Option<i64>, Option<i64>)> {
+        let node = repo.node_from_snapshot_path(&format!("{}:{path}", snap.id), |_| true)?;
+        Ok((
+            node.meta.atime.map(jiff::Timestamp::as_second),
+            node.meta.mtime.map(jiff::Timestamp::as_second),
+        ))
     };
-    assert_eq!(atime("test/dir")?, Some(old.unix_seconds()));
-    assert_eq!(atime("test/dir/file")?, Some(old.unix_seconds()));
+    assert_eq!(times(&first, "test/dir")?.0, Some(old.unix_seconds()));
+    assert_eq!(times(&first, "test/dir/file")?.0, Some(old.unix_seconds()));
+    for path in ["test/dir", "test/dir/file"] {
+        let (atime, mtime) = times(&by_default, path)?;
+        assert_eq!(atime, mtime, "{path}");
+        assert_ne!(atime, Some(old.unix_seconds()), "{path}");
+    }
 
     // The backup read them; on Linux it leaves their access times as they
     // were, even on a file system that updates them (relatime).

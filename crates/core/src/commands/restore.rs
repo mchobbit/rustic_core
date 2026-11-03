@@ -27,7 +27,7 @@ use crate::{
     },
     blob::{BlobLocation, BlobLocations},
     error::{ErrorKind, RusticError, RusticResult},
-    repofile::packfile::PackId,
+    repofile::{SnapshotFile, packfile::PackId},
     repository::{IndexedFull, IndexedTree, Open, Repository},
 };
 
@@ -54,15 +54,13 @@ pub struct RestoreOptions {
     #[cfg_attr(feature = "clap", clap(long))]
     pub delete: bool,
 
-    // BackOtter: numeric ids are the default, as in restic: a rescue
-    // system's own users are the wrong ones to look names up in. The flag
-    // stays, for scripts that pass it.
-    /// Restore the saved uid/gid, not those of user/group (the default)
+    /// Use numeric ids instead of user/group when restoring uid/gui
     #[cfg_attr(feature = "clap", clap(long))]
     pub numeric_id: bool,
 
-    // BackOtter: --ownership-by-name too, restic's name for it.
-    /// Look the owners up by user/group name, not the saved uid/gid
+    // BackOtter: names are the default, as in stock rustic; --by-name (and
+    // --ownership-by-name, restic's name for it) says so explicitly.
+    /// Look the owners up by user/group name, falling back to the saved uid/gid (the default)
     #[cfg_attr(
         feature = "clap",
         clap(long, visible_alias = "ownership-by-name", conflicts_with = "numeric_id")
@@ -85,6 +83,90 @@ pub struct RestoreOptions {
     /// Restore sparse files: by-content makes holes for zero runs in every new file [default: only in new files that had holes]
     #[cfg_attr(feature = "clap", clap(long))]
     pub sparse: Option<SparseRestore>,
+
+    // BackOtter: not an option, but what the snapshot says: the caller sets
+    // it from the snapshot it restores ([`SnapshotOrigin::of`]).
+    /// What wrote the snapshot restored, which says what a node's missing attributes mean
+    #[cfg_attr(feature = "clap", clap(skip))]
+    pub origin: SnapshotOrigin,
+}
+
+/// BackOtter: what wrote the snapshot a restore restores, by its
+/// `program_version`, which says what a node's missing attributes mean.
+///
+/// BackOtter's restic and rustic (`+backotter` in the version) record
+/// everything they can, so a missing attribute means zero or none at backup
+/// time: no file flags, no project ID, no holes worth keeping. In any other
+/// snapshot a missing attribute means unknown, and the restore leaves the
+/// destination as it is, as stock rustic does. Stock restic leaves a mode
+/// of 0 out (Go's `omitempty`), so a regular file of a Unix file system
+/// without a mode had mode 0 there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SnapshotOrigin {
+    /// Stock rustic, or not known: missing attributes are unknown
+    #[default]
+    Other,
+    /// Stock restic: a missing mode is 0, other missing attributes unknown
+    Restic,
+    /// BackOtter's restic or rustic: missing attributes are zero or none
+    BackOtter,
+}
+
+impl SnapshotOrigin {
+    /// The origin of a snapshot written by the program `program_version`
+    /// (`restic 0.18.1`, `rustic 0.11.4+backotter.3`).
+    #[must_use]
+    pub fn from_program_version(program_version: &str) -> Self {
+        if program_version.contains("+backotter") {
+            Self::BackOtter
+        } else if program_version.starts_with("restic ") {
+            Self::Restic
+        } else {
+            Self::Other
+        }
+    }
+
+    /// The origin of the snapshot `snap`.
+    #[must_use]
+    pub fn of(snap: &SnapshotFile) -> Self {
+        Self::from_program_version(&snap.program_version)
+    }
+
+    /// Whether a missing attribute means zero or none at backup time:
+    /// a snapshot of BackOtter's restic or rustic.
+    #[must_use]
+    pub const fn known_bko(self) -> bool {
+        matches!(self, Self::BackOtter)
+    }
+
+    /// Whether a regular file read from a Unix file system without a mode
+    /// had mode 0: restic (any) leaves a mode of 0 out, and so did
+    /// BackOtter's rustic before it wrote `"mode":0`.
+    #[must_use]
+    pub const fn omits_zero_mode(self) -> bool {
+        matches!(self, Self::Restic | Self::BackOtter)
+    }
+}
+
+/// BackOtter: whether a restore into `dest` gives `dest` the metadata of
+/// the node it restores there (`restore SNAP:subfolder DEST`): only when the
+/// restore creates `dest`, or `dest` is an empty directory, where one that
+/// holds only `lost+found` counts as empty (a new file system's root).
+/// Otherwise `dest` stays as it is (owner, mode, times, extended attributes,
+/// ACLs and flags), as in stock rustic. Call it before the restore starts.
+#[must_use]
+pub fn restore_target_is_fresh(dest: impl AsRef<std::path::Path>) -> bool {
+    let dest = dest.as_ref();
+    match std::fs::symlink_metadata(dest) {
+        Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+        Ok(m) if m.is_dir() => std::fs::read_dir(dest).is_ok_and(|entries| {
+            entries
+                .into_iter()
+                .all(|entry| entry.is_ok_and(|entry| entry.file_name() == "lost+found"))
+        }),
+        Ok(_) => false,
+    }
 }
 
 /// Which files to restore sparse (BackOtter: new files that had holes are,
@@ -216,6 +298,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
     dry_run: bool,
 ) -> RusticResult<RestorePlan> {
     let mut node_streamer = without_sockets(node_streamer);
+    let known_bko = opts.origin.known_bko();
     let p = repo.progress_spinner("collecting file information...");
     let dest_path = dest.path("");
 
@@ -260,15 +343,15 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         entry.path().display()
                     );
                 }
+                // BackOtter: flags that refuse removal (immutable, ...) stay
+                // as they are, as in stock rustic: such a file isn't
+                // removed, and the error says why.
                 (true, false, true) => {
-                    // BackOtter: flags that refuse removal come off first.
-                    osattrs::clear_restricting_flags_tree(entry.path());
                     if let Err(err) = dest.remove_dir(entry.path()) {
                         error!("error removing {}: {err}", entry.path().display());
                     }
                 }
                 (true, false, false) => {
-                    osattrs::clear_restricting_flags(entry.path());
                     if let Err(err) = dest.remove_file(entry.path()) {
                         error!("error removing {}: {err}", entry.path().display());
                     }
@@ -301,9 +384,8 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                 info!("would have replaced {}", entry.path().display());
                 true
             } else {
-                if is_dir {
-                    osattrs::clear_restricting_flags_tree(entry.path());
-                }
+                // BackOtter: nothing below a directory loses its flags:
+                // what refuses removal stays, as with --delete.
                 match (is_dir, opts.delete) {
                     (false, _) => dest.remove_file(entry.path()).map_err(|err| err.to_string()),
                     (true, true) => dest.remove_dir(entry.path()).map_err(|err| err.to_string()),
@@ -333,7 +415,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                     if !dry_run
                         && std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir())
                         && std::fs::read_dir(&target).is_ok_and(|mut dir| dir.next().is_none())
-                        && let Err(err) = osattrs::prepare_dir(&target, node)
+                        && let Err(err) = osattrs::prepare_dir(&target, node, known_bko)
                     {
                         warn!("restore {}: {err}", path.display());
                     }
@@ -352,8 +434,12 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                             })?;
                         // BackOtter: flags a file system only takes on an
                         // empty directory (casefolding) go on before its
-                        // entries, or come off if it inherited them.
-                        if let Err(err) = osattrs::prepare_dir(&dest.path(path), node) {
+                        // entries, or come off if it inherited them where
+                        // the node says it had none (a snapshot of
+                        // BackOtter's); without a word on them, it keeps
+                        // what it inherited.
+                        if let Err(err) = osattrs::prepare_dir(&dest.path(path), node, known_bko)
+                        {
                             warn!("restore {}: {err}", path.display());
                         }
                     }
@@ -402,16 +488,21 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         Err(err) if err.kind() == std::io::ErrorKind::NotFound)
                 };
                 let sparse = write_sparse(opts.sparse, node, fresh);
-                // BackOtter: a file left as it is, which isn't restored
-                // sparse, gets its holes allocated (a swap file left with
-                // holes by an interrupted restore).
+                // BackOtter: a file left as it is, which had no holes at
+                // backup, gets its holes allocated (a swap file left with
+                // holes by an interrupted restore): only where the snapshot
+                // says so (fills_holes). Whether it did, which makes it a
+                // file modified.
                 let fill_holes = || {
-                    if !(dry_run
-                        || opts.sparse == Some(SparseRestore::ByContent)
-                        || osattrs::is_sparse(node))
-                    {
-                        osattrs::fill_holes(&dest.path(path), node.meta.size);
+                    if dry_run || !fills_holes(opts, node) {
+                        return false;
                     }
+                    let target = dest.path(path);
+                    let filled = osattrs::fill_holes(&target, node.meta.size);
+                    if let Some(err) = &filled.error {
+                        warn!("restore {}: holes not filled: {err}", path.display());
+                    }
+                    filled.changed
                 };
                 // collect blobs needed for restoring
                 match (
@@ -428,14 +519,20 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                     // Note that exists = false and Existing or Verified can happen if the file is changed between scanning the dir
                     // and calling add_file. So we don't care about exists but trust add_file here.
                     (_, AddFileResult::Existing) => {
-                        stats.files.unchanged += 1;
                         trace!("identical file: {}", path.display());
-                        fill_holes();
+                        if fill_holes() {
+                            stats.files.modify += 1;
+                        } else {
+                            stats.files.unchanged += 1;
+                        }
                     }
                     (_, AddFileResult::Verified) => {
-                        stats.files.verified += 1;
                         trace!("verified identical file: {}", path.display());
-                        fill_holes();
+                        if fill_holes() {
+                            stats.files.modify += 1;
+                        } else {
+                            stats.files.verified += 1;
+                        }
                     }
                     // TODO: The differentiation between files to modify and files to create could be done only by add_file
                     // Currently, add_file never returns Modify, but always New, so we differentiate based on exists
@@ -488,8 +585,11 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         // the flags that would refuse its being rewritten,
                         // replaced or given its metadata (immutable,
                         // append-only, undeletable), as in BackOtter's
-                        // restic; the late flags pass sets the node's.
-                        if !dry_run {
+                        // restic, where its node says which flags it had:
+                        // the late flags pass sets those. Elsewhere they
+                        // stay, as in stock rustic, and what they refuse
+                        // fails with its error.
+                        if !dry_run && osattrs::node_sets_flags(node, known_bko) {
                             osattrs::clear_restricting_flags(destination.path());
                         }
                         // process existing node
@@ -694,25 +794,52 @@ fn write_sparse(sparse: Option<SparseRestore>, node: &Node, fresh: bool) -> bool
     fresh && (sparse == Some(SparseRestore::ByContent) || osattrs::is_sparse(node))
 }
 
+/// BackOtter: whether a regular file `node` that the restore leaves as it is
+/// (its contents match) gets its holes filled: only in a snapshot of
+/// BackOtter's, where a file without `unix.sparse` had no holes at backup,
+/// and not with `--sparse by-content`. In any other snapshot no file is
+/// marked, and a file with holes there may have had them at backup too: it
+/// stays as it is, as in stock rustic.
+fn fills_holes(opts: RestoreOptions, node: &Node) -> bool {
+    opts.origin.known_bko()
+        && opts.sparse != Some(SparseRestore::ByContent)
+        && !osattrs::is_sparse(node)
+}
+
 /// BackOtter: how a restore sets owners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ownership {
     /// Not at all (`--no-ownership`).
     None,
-    /// The saved uid and gid, as restic does (the default).
+    /// The saved uid and gid (`--numeric-id`), as restic does.
     Numeric,
-    /// By user and group name (`--by-name`), falling back to the saved ids.
+    /// By user and group name, falling back to the saved ids (the default,
+    /// as in stock rustic; `--by-name`).
     ByName,
 }
 
-/// BackOtter: how `opts` say to set owners: numeric ids unless names are
-/// asked for.
+/// BackOtter: how `opts` say to set owners: by name unless numeric ids are
+/// asked for (`--numeric-id`), as in stock rustic.
 const fn ownership(opts: RestoreOptions) -> Ownership {
-    match (opts.no_ownership, opts.by_name) {
+    match (opts.no_ownership, opts.numeric_id) {
         (true, _) => Ownership::None,
-        (false, false) => Ownership::Numeric,
-        (false, true) => Ownership::ByName,
+        (false, true) => Ownership::Numeric,
+        (false, false) => Ownership::ByName,
     }
+}
+
+/// BackOtter: whether the regular file `node`, which has no mode, had mode
+/// 0 (permissions `0000`, as /etc/shadow has): when it was read from a Unix
+/// file system (it has an inode number; a file read from stdin or made on
+/// Windows has none) and the snapshot leaves a mode of 0 out (restic's, or
+/// BackOtter's rustic's before it wrote `"mode":0`). Otherwise its mode is
+/// unknown, and the file keeps the one it was created with, as in stock
+/// rustic.
+const fn mode_zero_if_missing(opts: RestoreOptions, node: &Node) -> bool {
+    matches!(node.node_type, NodeType::File)
+        && node.meta.mode.is_none()
+        && node.meta.inode != 0
+        && opts.origin.omits_zero_mode()
 }
 
 fn hardlink_key(node: &Node) -> Option<HardlinkKey> {
@@ -759,9 +886,9 @@ pub(crate) fn set_metadata(
         );
         return false;
     }
-    // BackOtter: numeric ids, unless names are asked for (--by-name); then
-    // on illumos the ids an owner and group that are SIDs have here, before
-    // the mode, which a change of owner can clear the setuid bit of.
+    // BackOtter: by name, unless numeric ids are asked for (--numeric-id);
+    // then on illumos the ids an owner and group that are SIDs have here,
+    // before the mode, which a change of owner can clear the setuid bit of.
     // A change of owner refused to a restore not running as root is no
     // warning, as in restic.
     let target = dest.path(path);
@@ -791,15 +918,18 @@ pub(crate) fn set_metadata(
     }
     // BackOtter: the attributes osattrs keeps; ACLs after the mode. One
     // warning naming each attribute not set, and its error.
+    let known_bko = opts.origin.known_bko();
     let set_attributes = || {
-        dest.set_extended_attributes(path, &node.meta.extended_attributes)
+        // BackOtter: stock rustic's names on FreeBSD and NetBSD
+        // (`user.NAME`) in any snapshot not BackOtter's.
+        dest.set_extended_attributes(path, &node.meta.extended_attributes, !known_bko)
             .unwrap_or_else(|err| {
                 warn!(
                     "restore {}: setting extended attributes failed: {err}",
                     path.display()
                 );
             });
-        osattrs::restore_attributes(&target, node)
+        osattrs::restore_attributes(&target, node, known_bko)
             .unwrap_or_else(|err| osattrs::warn_restore(path, &err));
     };
     // On Haiku before the mode: BFS wants write access to the file for
@@ -808,7 +938,7 @@ pub(crate) fn set_metadata(
     if cfg!(target_os = "haiku") {
         set_attributes();
     }
-    dest.set_permission(path, node)
+    dest.set_permission(path, node, mode_zero_if_missing(opts, node))
         .unwrap_or_else(|_| warn!("restore {}: chmod failed.", path.display()));
     if node.is_symlink() {
         osattrs::restore_symlink_mode(&target, node)
@@ -1287,12 +1417,102 @@ mod tests {
     }
 
     #[test]
-    fn numeric_ids_by_default() {
+    fn names_by_default() {
+        // As in stock rustic: by name, unless --numeric-id.
         let opts = RestoreOptions::default();
-        assert_eq!(ownership(opts), Ownership::Numeric);
+        assert_eq!(ownership(opts), Ownership::ByName);
         assert_eq!(ownership(opts.numeric_id(true)), Ownership::Numeric);
         assert_eq!(ownership(opts.by_name(true)), Ownership::ByName);
         assert_eq!(ownership(opts.no_ownership(true)), Ownership::None);
+    }
+
+    #[test]
+    fn snapshot_origins() {
+        let of = SnapshotOrigin::from_program_version;
+        assert_eq!(of("rustic 0.11.4+backotter.3"), SnapshotOrigin::BackOtter);
+        assert_eq!(of("restic 0.19.1+backotter.3"), SnapshotOrigin::BackOtter);
+        assert_eq!(of("restic 0.18.1"), SnapshotOrigin::Restic);
+        assert_eq!(of("rustic v0.11.4"), SnapshotOrigin::Other);
+        assert_eq!(of("rustic 0.11.4"), SnapshotOrigin::Other);
+        assert_eq!(of(""), SnapshotOrigin::Other);
+        assert_eq!(RestoreOptions::default().origin, SnapshotOrigin::Other);
+        assert!(SnapshotOrigin::BackOtter.known_bko());
+        assert!(!SnapshotOrigin::Restic.known_bko());
+        assert!(!SnapshotOrigin::Other.known_bko());
+        assert!(SnapshotOrigin::Restic.omits_zero_mode());
+        assert!(SnapshotOrigin::BackOtter.omits_zero_mode());
+        assert!(!SnapshotOrigin::Other.omits_zero_mode());
+        let snap = SnapshotFile {
+            program_version: "restic 0.17.3".to_string(),
+            ..SnapshotFile::default()
+        };
+        assert_eq!(SnapshotOrigin::of(&snap), SnapshotOrigin::Restic);
+    }
+
+    /// A regular file without a mode is restored with mode 0 only where
+    /// that is what it had: from a Unix file system (an inode number), in a
+    /// snapshot that leaves a mode of 0 out (restic's, BackOtter's). A file
+    /// read from stdin or made on Windows (no inode number), or any in a
+    /// stock rustic snapshot, keeps the mode it was created with.
+    #[test]
+    fn mode_zero_only_where_known() {
+        let meta = crate::backend::node::Metadata::default;
+        let mut unix = Node::new_node("shadow".as_ref(), NodeType::File, meta());
+        unix.meta.inode = 1234;
+        let stdin = Node::new_node("stdin".as_ref(), NodeType::File, meta());
+        let restic = RestoreOptions::default().origin(SnapshotOrigin::Restic);
+        let bko = RestoreOptions::default().origin(SnapshotOrigin::BackOtter);
+        let stock = RestoreOptions::default();
+        assert!(mode_zero_if_missing(restic, &unix));
+        assert!(mode_zero_if_missing(bko, &unix));
+        assert!(!mode_zero_if_missing(stock, &unix));
+        assert!(!mode_zero_if_missing(restic, &stdin));
+        assert!(!mode_zero_if_missing(bko, &stdin));
+        let mut with_mode = unix.clone();
+        with_mode.meta.mode = Some(0o644);
+        assert!(!mode_zero_if_missing(bko, &with_mode));
+        let mut dir = unix;
+        dir.node_type = NodeType::Dir;
+        assert!(!mode_zero_if_missing(bko, &dir));
+    }
+
+    /// Holes of a file left as it is are filled only in BackOtter's
+    /// snapshots, for a file without `unix.sparse`, and not with
+    /// `--sparse by-content`.
+    #[test]
+    fn holes_filled_only_where_known() {
+        let plain = Node::default();
+        let mut marked = Node::default();
+        marked.meta.generic_attributes.set_true(UNIX_SPARSE);
+        let bko = RestoreOptions::default().origin(SnapshotOrigin::BackOtter);
+        assert!(fills_holes(bko, &plain));
+        assert!(!fills_holes(bko, &marked));
+        assert!(!fills_holes(bko.sparse(SparseRestore::ByContent), &plain));
+        assert!(fills_holes(bko.sparse(SparseRestore::No), &plain));
+        assert!(!fills_holes(RestoreOptions::default(), &plain));
+        assert!(!fills_holes(RestoreOptions::default().origin(SnapshotOrigin::Restic), &plain));
+    }
+
+    /// The destination of `SNAP:subfolder` gets the subfolder's metadata
+    /// only when the restore creates it or finds it empty (`lost+found`
+    /// alone counts as empty).
+    #[test]
+    fn target_fresh_only_when_new_or_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("d");
+        assert!(restore_target_is_fresh(&d));
+        std::fs::create_dir(&d).unwrap();
+        assert!(restore_target_is_fresh(&d));
+        std::fs::create_dir(d.join("lost+found")).unwrap();
+        assert!(restore_target_is_fresh(&d));
+        std::fs::write(d.join("file"), b"x").unwrap();
+        assert!(!restore_target_is_fresh(&d));
+        std::fs::remove_file(d.join("file")).unwrap();
+        std::fs::create_dir(d.join("sub")).unwrap();
+        assert!(!restore_target_is_fresh(&d));
+        let f = dir.path().join("f");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(!restore_target_is_fresh(&f));
     }
 
     #[cfg(feature = "clap")]
@@ -1303,7 +1523,7 @@ mod tests {
         let parse = |args: &[&str]| {
             RestoreOptions::try_parse_from(std::iter::once("restore").chain(args.iter().copied()))
         };
-        assert_eq!(ownership(parse(&[]).unwrap()), Ownership::Numeric);
+        assert_eq!(ownership(parse(&[]).unwrap()), Ownership::ByName);
         assert_eq!(ownership(parse(&["--numeric-id"]).unwrap()), Ownership::Numeric);
         assert_eq!(ownership(parse(&["--by-name"]).unwrap()), Ownership::ByName);
         // restic's name for it.

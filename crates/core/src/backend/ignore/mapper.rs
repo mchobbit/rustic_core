@@ -42,9 +42,9 @@ pub enum BlockdevOption {
 #[non_exhaustive]
 /// [`LocalSourceSaveOptions`] describes how entries from a local source will be saved in the repository.
 pub struct LocalSourceSaveOptions {
-    // BackOtter: the real access time by default, as BackOtter's restic
-    // keeps it (stock rustic stores the mtime).
-    /// Set access time [default: yes]
+    // BackOtter: the mtime by default, as in stock rustic (and stock restic
+    // without --with-atime); BackOtter asks for the real one (yes).
+    /// Set access time [default: mtime]
     #[cfg_attr(feature = "clap", clap(long))]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
     pub set_atime: Option<TimeOption>,
@@ -115,7 +115,7 @@ impl LocalSourceSaveOptions {
         let atime = || m.accessed().ok().and_then(|t| Timestamp::try_from(t).ok());
         let atime = self
             .set_atime
-            .unwrap_or(TimeOption::Yes)
+            .unwrap_or(TimeOption::Mtime)
             .map_or_else(atime, mtime);
         let ctime = || Self::ctime(m);
         let ctime = self
@@ -365,6 +365,24 @@ impl LocalSourceSaveOptions {
 #[cfg(all(test, not(any(windows, target_os = "openbsd", target_os = "illumos"))))]
 mod tests {
     use super::*;
+
+    /// BackOtter: as stock rustic, a backup stores the mtime as the atime
+    /// by default; `--set-atime yes` (BackOtter's) the real one.
+    #[test]
+    fn atime_is_mtime_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, b"hello").unwrap();
+        let old = filetime::FileTime::from_unix_time(1_577_836_800, 0);
+        filetime::set_file_atime(&path, old).unwrap();
+        let m = std::fs::symlink_metadata(&path).unwrap();
+        let name = OsStr::new("file");
+        let node = LocalSourceSaveOptions::default().map_path(&path, name, &m).unwrap();
+        assert_eq!(node.meta.atime, node.meta.mtime);
+        let real = LocalSourceSaveOptions::default().set_atime(TimeOption::Yes);
+        let node = real.map_path(&path, name, &m).unwrap();
+        assert_eq!(node.meta.atime.map(Timestamp::as_second), Some(old.unix_seconds()));
+    }
 
     /// BackOtter: extended attributes are stored in the byte order of their
     /// names, whatever order the file system lists them in, as BackOtter's

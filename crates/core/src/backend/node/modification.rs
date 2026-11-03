@@ -105,9 +105,7 @@ impl XattrOption {
 #[allow(clippy::struct_field_names)]
 /// [`NodeModification`] describes how nodes will be modified
 pub struct NodeModification {
-    // BackOtter: the access time stays as saved by default, as `restic
-    // rewrite` keeps it, now that a backup saves it.
-    /// Set access time [default: yes]
+    /// Set access time [default: mtime]
     #[cfg_attr(feature = "clap", clap(long))]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
     pub set_atime: Option<TimeOption>,
@@ -146,7 +144,7 @@ impl NodeModification {
         let mtime = meta.mtime;
         meta.atime = self
             .set_atime
-            .unwrap_or(TimeOption::Yes)
+            .unwrap_or(TimeOption::Mtime)
             .map_or_else(|| meta.atime, mtime);
         meta.ctime = self
             .set_ctime
@@ -165,26 +163,5 @@ impl NodeModification {
         let changed = node.meta != meta;
         node.meta = meta;
         changed
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use jiff::Timestamp;
-
-    use super::*;
-
-    #[test]
-    fn default_keeps_the_access_time() {
-        let mut node = Node::default();
-        node.meta.mtime = Some(Timestamp::from_second(1_700_000_000).unwrap());
-        node.meta.atime = Some(Timestamp::from_second(1_600_000_000).unwrap());
-        let atime = node.meta.atime;
-        assert!(!NodeModification::default().modify_node(&mut node));
-        assert_eq!(node.meta.atime, atime);
-
-        let mtime = NodeModification::default().set_atime(TimeOption::Mtime);
-        assert!(mtime.modify_node(&mut node));
-        assert_eq!(node.meta.atime, node.meta.mtime);
     }
 }

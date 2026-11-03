@@ -14,7 +14,8 @@ use rstest::rstest;
 use tempfile::tempdir;
 
 use rustic_core::{
-    BackupOptions, LocalDestination, LsOptions, RestoreOptions, repofile::SnapshotFile,
+    BackupOptions, LocalDestination, LsOptions, RestoreOptions, SnapshotOrigin,
+    repofile::SnapshotFile,
 };
 
 use super::{RepoOpen, TestSource, set_up_repo, tar_gz_testdata};
@@ -82,12 +83,26 @@ fn test_restore_preserves_hardlinks(
 }
 
 /// BackOtter: restores what the repository's latest snapshot holds into
-/// `dir`, with `opts`.
+/// `dir`, with `opts` and the snapshot's origin, as rustic's restore does.
 #[cfg(not(windows))]
 fn restore_to(
     repo: &rustic_core::Repository<impl rustic_core::IndexedFull>,
     dir: &Path,
     opts: RestoreOptions,
+) -> Result<()> {
+    let snap = repo.get_snapshot_from_str("latest", |_| true)?;
+    restore_with(repo, dir, opts.origin(SnapshotOrigin::of(&snap)), |node| node)
+}
+
+/// BackOtter: restores what the repository's latest snapshot holds into
+/// `dir`, with `opts` as they are, each node changed by `change` first (to
+/// make it as another program would have written it).
+#[cfg(not(windows))]
+fn restore_with(
+    repo: &rustic_core::Repository<impl rustic_core::IndexedFull>,
+    dir: &Path,
+    opts: RestoreOptions,
+    change: impl Fn(rustic_core::repofile::Node) -> rustic_core::repofile::Node + Copy,
 ) -> Result<()> {
     let node = repo.node_from_snapshot_path("latest", |_| true)?;
     let ls_opts = LsOptions::default();
@@ -96,7 +111,7 @@ fn restore_to(
         true,
         !node.is_dir(),
     )?;
-    let ls = repo.ls(&node, &ls_opts)?;
+    let ls = repo.ls(&node, &ls_opts)?.map(move |item| item.map(|(p, n)| (p, change(n))));
     let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false)?;
     repo.restore(plan, &opts, ls, &dest)?;
     Ok(())
@@ -250,6 +265,17 @@ fn test_restore_sparse(set_up_repo: Result<RepoOpen>) -> Result<()> {
         &["sparse", "full", "zeros", "trailing"],
     )?;
 
+    // The same file of holes, left as it is, from a snapshot not
+    // BackOtter's (stock rustic's, which marks no file): it keeps its holes,
+    // as in stock rustic, which can't tell it had none.
+    let restore_dir = tempdir()?;
+    let test = restore_dir.path().join("test");
+    fs::create_dir(&test)?;
+    File::create(test.join("zeros"))?.set_len(u64::try_from(zeros.len())?)?;
+    restore_with(&repo, restore_dir.path(), RestoreOptions::default(), |node| node)?;
+    assert!(fs::read(test.join("zeros"))? == zeros, "zeros: contents differ");
+    assert!(!allocated(&test.join("zeros"))?, "zeros: allocated");
+
     // Over a symlink where the snapshot has a directory: the symlink is
     // replaced by the directory, as BackOtter's restic does, and nothing is
     // written where it points. The files in it are new, so those marked get
@@ -270,5 +296,63 @@ fn test_restore_sparse(set_up_repo: Result<RepoOpen>) -> Result<()> {
         &["full", "zeros", "trailing"],
     )?;
 
+    Ok(())
+}
+
+/// BackOtter: a regular file without a mode keeps the mode it is created
+/// with (as in stock rustic) where the snapshot doesn't say it had 0: one
+/// read from stdin (no inode number), or any in a stock rustic snapshot. A
+/// file a restic snapshot has without a mode (restic leaves 0 out) is
+/// restored with permissions 0000.
+#[rstest]
+#[cfg(not(windows))]
+fn test_restore_missing_mode(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    use rustic_core::{CommandInput, PathList};
+
+    let mode = |path: &Path| -> Result<u32> { Ok(fs::metadata(path)?.permissions().mode() & 0o7777) };
+
+    // stdin, in a snapshot of BackOtter's.
+    let repo = set_up_repo?.to_indexed_ids()?;
+    let cmd: CommandInput = "echo test".parse()?;
+    let opts = BackupOptions::default().stdin_filename("dump.sql").stdin_command(cmd);
+    let snap = repo.backup(&opts, &PathList::from_string("-")?, SnapshotFile::default())?;
+    assert_eq!(SnapshotOrigin::of(&snap), SnapshotOrigin::BackOtter);
+    let repo = repo.to_indexed()?;
+    let restore_dir = tempdir()?;
+    restore_to(&repo, restore_dir.path(), RestoreOptions::default())?;
+    let dump = restore_dir.path().join("dump.sql");
+    assert_eq!(fs::read(&dump)?, b"test\n");
+    assert_ne!(mode(&dump)? & 0o600, 0, "stdin dump restored as {:o}", mode(&dump)?);
+
+    // A file of a Unix file system, its mode left out as restic leaves 0
+    // out: 0000 from restic's snapshot, the creation mode from stock
+    // rustic's.
+    let source = tempdir()?;
+    fs::write(source.path().join("shadow"), b"secret")?;
+    let repo = repo.to_indexed_ids()?;
+    let opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
+    let paths = PathList::from_iter(Some(source.path().to_path_buf()));
+    let _snapshot = repo.backup(&opts, &paths, SnapshotFile::default())?;
+    let repo = repo.to_indexed()?;
+    let no_mode = |mut node: rustic_core::repofile::Node| {
+        if node.is_file() {
+            node.meta.mode = None;
+        }
+        node
+    };
+    let restic = RestoreOptions::default().origin(SnapshotOrigin::Restic);
+    let restore_dir = tempdir()?;
+    restore_with(&repo, restore_dir.path(), restic, no_mode)?;
+    let shadow = restore_dir.path().join("test/shadow");
+    assert_eq!(mode(&shadow)?, 0);
+    fs::set_permissions(&shadow, fs::Permissions::from_mode(0o600))?;
+    assert_eq!(fs::read(&shadow)?, b"secret");
+
+    let restore_dir = tempdir()?;
+    restore_with(&repo, restore_dir.path(), RestoreOptions::default(), no_mode)?;
+    let shadow = restore_dir.path().join("test/shadow");
+    assert_ne!(mode(&shadow)? & 0o600, 0, "restored as {:o}", mode(&shadow)?);
     Ok(())
 }

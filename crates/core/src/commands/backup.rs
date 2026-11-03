@@ -1,7 +1,7 @@
 //! `backup` subcommand
 use derive_setters::Setters;
 use itertools::Itertools;
-use log::info;
+use log::{debug, info};
 
 use std::path::PathBuf;
 
@@ -16,6 +16,8 @@ use crate::{
         childstdout::ChildStdoutSource,
         dry_run::DryRunBackend,
         ignore::{LocalSource, LocalSourceFilterOptions, LocalSourceSaveOptions},
+        node::modification::TimeOption,
+        osattrs,
         stdin::StdinSource,
     },
     error::{ErrorKind, RusticError, RusticResult},
@@ -287,12 +289,24 @@ where
     let archiver = Archiver::new(be, index, repo.config(), parent, snap)?;
     let p = repo.progress_bytes("backing up...");
 
+    // BackOtter: no scan for the backup's size where listing a directory
+    // moves its access time (no O_NOATIME) and the backup keeps real
+    // access times (`--set-atime yes`): the scan would list directories
+    // before the backup takes their metadata, as in BackOtter's restic.
+    // With the default (atimes as mtimes) it scans, as stock rustic.
+    let real_atimes = opts.ignore_save_opts.set_atime == Some(TimeOption::Yes);
+    let scan_moves_atimes =
+        osattrs::scan_moves_saved_atimes(real_atimes, osattrs::LISTING_KEEPS_ATIMES);
+    if scan_moves_atimes && !opts.no_scan {
+        debug!("no scan for the backup's size: it would move directories' access times");
+    }
+    let no_scan = opts.no_scan || scan_moves_atimes;
     archiver.archive(
         src,
         &backup_paths[0],
         as_path.as_ref(),
         opts.parent_opts.skip_if_unchanged,
-        opts.no_scan,
+        no_scan,
         &p,
     )
 }

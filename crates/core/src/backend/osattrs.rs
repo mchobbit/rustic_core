@@ -300,6 +300,11 @@ pub(crate) fn prepare_file(path: &Path, node: &Node) -> io::Result<()> {
 /// casefolding from its parent when it had none. Flags the file system
 /// doesn't support are left for [`restore_file_flags`] to report.
 ///
+/// A node without flags had none only in a snapshot of BackOtter's
+/// (`known_bko`), which records every directory's; in any other the
+/// directory keeps what it has or inherited (casefolding from its parent),
+/// as in stock rustic.
+///
 /// # Errors
 ///
 /// * If the flags couldn't be set.
@@ -307,27 +312,55 @@ pub(crate) fn prepare_file(path: &Path, node: &Node) -> io::Result<()> {
 /// BackOtter: on bcachefs (Linux) it then gives the directory its options
 /// and project ID too, which bcachefs passes only to entries created after
 /// them, as BackOtter's restic does (`linux::prepare_dir_for_options`).
-pub(crate) fn prepare_dir(path: &Path, node: &Node) -> io::Result<()> {
+pub(crate) fn prepare_dir(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
     if os::FLAGS_BEFORE_ENTRIES == 0 {
         return Ok(());
     }
-    let flags =
-        os::prepare_dir_for_flags(path, file_flags(node).unwrap_or(0) & os::FLAGS_BEFORE_ENTRIES);
+    let flags = match node_flags(node, known_bko) {
+        Some(flags) => os::prepare_dir_for_flags(path, flags & os::FLAGS_BEFORE_ENTRIES),
+        None => Ok(()),
+    };
     #[cfg(target_os = "linux")]
-    os::prepare_dir_for_options(path, node);
+    os::prepare_dir_for_options(path, node, known_bko);
     flags
+}
+
+/// The file flags `node` says its file had: those it holds, or none (0)
+/// where it holds none in a snapshot of BackOtter's (`known_bko`), which
+/// records them wherever there are any. `None`: not known (a snapshot of
+/// stock restic or rustic, which record none).
+pub(crate) fn node_flags(node: &Node, known_bko: bool) -> Option<u32> {
+    file_flags(node).or_else(|| known_bko.then_some(0))
+}
+
+/// Whether the restore clears the restricting flags of what it finds at the
+/// path of `node` ([`clear_restricting_flags`]): only where the node says
+/// which flags its file had ([`node_flags`]), so that the late flags pass
+/// puts those back. Otherwise what the restore finds keeps its flags, as in
+/// stock rustic, and where they refuse the restore its error says so.
+pub(crate) fn node_sets_flags(node: &Node, known_bko: bool) -> bool {
+    node_flags(node, known_bko).is_some()
 }
 
 /// Whether listing a directory can leave its access time as it was: on Linux
 /// and Android, with `O_NOATIME` (where the user may ask for it). Elsewhere
 /// on Unix every listing moves it, unless the file system doesn't keep
-/// access times (read-only, `noatime`, ZFS's `atime=off`), so a backup
-/// doesn't scan the source for its size first (`--no-scan`), as BackOtter's
-/// restic doesn't: the scan would list each directory before the backup
-/// takes its metadata, and the snapshot would have the scan's time as its
-/// access time. Not a Unix (Windows): as stock rustic.
+/// access times (read-only, `noatime`, ZFS's `atime=off`). Not a Unix
+/// (Windows): as stock rustic.
 pub(crate) const LISTING_KEEPS_ATIMES: bool =
     cfg!(any(target_os = "linux", target_os = "android")) || !cfg!(unix);
+
+/// Whether a backup skips scanning the source for its size first (as
+/// `--no-scan`), as BackOtter's restic does, when it stores real access
+/// times (`--set-atime yes`, `real_atimes`) where listing a directory moves
+/// its access time (`listing_keeps_atimes` false: Unix but Linux): the scan
+/// would list each directory before the backup takes its metadata, and the
+/// snapshot would have the scan's time as its access time. With atimes
+/// stored as the mtime (the default) or not at all, the scan runs, as in
+/// stock rustic, on every system.
+pub(crate) const fn scan_moves_saved_atimes(real_atimes: bool, listing_keeps_atimes: bool) -> bool {
+    real_atimes && !listing_keeps_atimes
+}
 
 /// Clears the flags of the file at `path` (not following a symlink) that
 /// would keep the restore from rewriting, replacing or changing it, before
@@ -345,22 +378,6 @@ pub(crate) fn clear_restricting_flags(path: &Path) {
             debug!("restricting flags of {} not cleared: {err}", path.display());
         }
         _ => {}
-    }
-}
-
-/// [`clear_restricting_flags`] for `path` and, if it is a directory, all
-/// below it (not following symlinks), outermost first: before the restore
-/// removes it (`--delete`, or a node of another type in its place).
-pub(crate) fn clear_restricting_flags_tree(path: &Path) {
-    clear_restricting_flags(path);
-    if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
-        return;
-    }
-    for entry in walkdir::WalkDir::new(path).min_depth(1).follow_links(false) {
-        match entry {
-            Ok(entry) => clear_restricting_flags(entry.path()),
-            Err(err) => debug!("restricting flags below {}: {err}", path.display()),
-        }
     }
 }
 
@@ -509,41 +526,34 @@ fn os_preallocate(_f: &File, _len: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// What [`fill_holes`] did: whether the file changed (it has more blocks
+/// than before, which a failed `fallocate(2)` can leave too), and the error
+/// that kept it from filling them all.
+#[derive(Debug, Default)]
+pub(crate) struct FilledHoles {
+    /// Whether the file has more blocks allocated than before.
+    pub(crate) changed: bool,
+    /// Why its holes weren't all filled, where they weren't.
+    pub(crate) error: Option<io::Error>,
+}
+
 /// Allocates the holes of the regular file at `path`, of `len` bytes, which
 /// the restore leaves as it is and doesn't restore sparse: a swap file left
-/// with holes by an interrupted restore. Only where the system can fill
-/// them (Linux, macOS); errors only go to the debug log.
-pub(crate) fn fill_holes(path: &Path, len: u64) {
+/// with holes by an interrupted restore. It looks first, without opening the
+/// file for writing: only a file with fewer blocks than its size, where
+/// `SEEK_HOLE` (where there is one) finds a hole, is opened for writing, so
+/// that a file without holes (most, and those a file system compresses)
+/// gets no close-write event, and a running program no `ETXTBSY`. On Linux
+/// `fallocate(2)` fills them; on macOS, whose `F_PREALLOCATE` only adds
+/// space past the end, zeros are written into each hole (`SEEK_HOLE`,
+/// `SEEK_DATA`). Elsewhere nothing is done.
+pub(crate) fn fill_holes(path: &Path, len: u64) -> FilledHoles {
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-    {
-        use std::{
-            fs::OpenOptions,
-            os::unix::fs::{MetadataExt, OpenOptionsExt},
-        };
-
-        let f = match OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
-            .open(path)
-        {
-            Ok(f) => f,
-            Err(err) => {
-                debug!("holes of {} not filled: {err}", path.display());
-                return;
-            }
-        };
-        match f.metadata() {
-            Ok(m) if m.is_file() && m.blocks().saturating_mul(512) < len => {
-                debug!("filling the holes of {}", path.display());
-                preallocate(&f, len);
-            }
-            Ok(_) => {}
-            Err(err) => debug!("holes of {} not filled: {err}", path.display()),
-        }
-    }
+    return sparse::fill_holes(path, len);
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     {
         _ = (path, len);
+        FilledHoles::default()
     }
 }
 
@@ -812,9 +822,19 @@ pub(crate) fn restore_owner(path: &Path, node: &Node) -> io::Result<()> {
 /// # Errors
 ///
 /// * If an attribute couldn't be set.
-pub(crate) fn restore_attributes(path: &Path, node: &Node) -> io::Result<()> {
+///
+/// On Linux a node without a project ID had 0 in a snapshot of BackOtter's
+/// (`known_bko`), which bcachefs then gets where the file inherited another;
+/// in any other snapshot the file keeps the one it has or inherited.
+pub(crate) fn restore_attributes(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
     warn_unknown(node);
-    os::restore_attributes(path, node)
+    #[cfg(target_os = "linux")]
+    return os::restore_attributes(path, node, known_bko);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = known_bko;
+        os::restore_attributes(path, node)
+    }
 }
 
 /// Restores the ACLs. This goes after the mode: `chmod(2)` rewrites an
@@ -1326,6 +1346,35 @@ fn unsupported(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BackOtter: a node without file flags says its file had none only in
+    /// a snapshot of BackOtter's; then, or where it has some, the restore
+    /// clears what would refuse it and sets the node's.
+    #[test]
+    fn flags_known_from_node_or_bko() {
+        let node = Node::default();
+        assert_eq!(node_flags(&node, false), None);
+        assert!(!node_sets_flags(&node, false));
+        assert_eq!(node_flags(&node, true), Some(0));
+        assert!(node_sets_flags(&node, true));
+        if let Some(name) = os::FILE_FLAGS {
+            let mut flagged = Node::default();
+            flagged.meta.generic_attributes.set_u64(name, 0x10);
+            assert_eq!(node_flags(&flagged, false), Some(0x10));
+            assert!(node_sets_flags(&flagged, false));
+            assert_eq!(node_flags(&flagged, true), Some(0x10));
+        }
+    }
+
+    /// BackOtter: the size scan is skipped only for real atimes where
+    /// listing moves them.
+    #[test]
+    fn scan_skipped_only_for_real_atimes() {
+        assert!(scan_moves_saved_atimes(true, false));
+        assert!(!scan_moves_saved_atimes(true, true));
+        assert!(!scan_moves_saved_atimes(false, false));
+        assert!(!scan_moves_saved_atimes(false, true));
+    }
 
     #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
     #[test]

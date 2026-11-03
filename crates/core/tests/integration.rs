@@ -60,8 +60,8 @@ use tempfile::{TempDir, tempdir};
 
 use rustic_core::{
     CommandInput, ConfigOptions, CredentialOptions, Credentials, IndexedFull, IndexedFullStatus,
-    KeyOptions, LocalSourceSaveOptions, OpenStatus, PathList, Repository, RepositoryBackends,
-    RepositoryOptions, TimeOption, repofile::MasterKey,
+    KeyOptions, OpenStatus, PathList, Repository, RepositoryBackends, RepositoryOptions,
+    repofile::MasterKey,
 };
 use rustic_testing::backend::in_memory_backend::InMemoryBackend;
 
@@ -191,20 +191,6 @@ fn tar_gz_testdata() -> Result<TestSource> {
     archive.set_preserve_mtime(true);
     archive.unpack(&dir)?;
     Ok(TestSource::new(dir))
-}
-
-/// BackOtter: save options for the stock tests that back up the tar fixture
-/// more than once and expect the same trees: they store each atime as the
-/// mtime (`--set-atime mtime`), as stock rustic does. A backup keeps real
-/// access times by default, and reads files and lists directories without
-/// changing them (on Linux), but reading a symlink (`readlink(2)`) updates
-/// its own, which nothing can avoid: where the file system updates atimes on
-/// every access (`strictatime`, as Debian mounts its tmpfs `/tmp`), each
-/// backup then sees new atimes on the fixture's symlinks and saves new trees.
-/// (Giving them recent atimes first only helps under `relatime`.)
-/// `test_backup_keeps_access_times` checks the real ones.
-fn atime_as_mtime() -> LocalSourceSaveOptions {
-    LocalSourceSaveOptions::default().set_atime(TimeOption::Mtime)
 }
 
 // helper function to do windows-specific snapshots (needed e.g. if paths are contained in the snapshot)

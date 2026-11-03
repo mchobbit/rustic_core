@@ -905,9 +905,12 @@ pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
 /// ID of 0 is the default, and left as it is; but on bcachefs a file without
 /// one gets 0, where it inherited another from its directory (whose project
 /// ID the restore gives it before its entries, [`prepare_dir_for_options`]),
-/// as in BackOtter's restic.
-pub(super) fn restore_attributes(path: &Path, node: &Node) -> io::Result<()> {
+/// as in BackOtter's restic: where its node has 0, or none in a snapshot of
+/// BackOtter's (`known_bko`). A node without one in another snapshot says
+/// nothing about it: the file keeps what it has or inherited.
+pub(super) fn restore_attributes(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
     let projid = match node.meta.generic_attributes.number(LINUX_PROJECT_ID) {
+        None if !known_bko => return Ok(()),
         None | Some(0) => {
             if matches!(node.node_type, NodeType::File | NodeType::Dir)
                 && is_bcachefs_path(path)
@@ -967,12 +970,13 @@ fn is_bcachefs_option(name: &str) -> bool {
 /// Gives the directory at `path`, which the restore has just created or
 /// found empty, the options its node has that bcachefs passes to the
 /// entries a directory gets after they are set: its own `bcachefs.*`
-/// options and its project ID, 0 where it has none. Its entries then
-/// inherit them as in the original, so their data is stored as it was
-/// (compressed, replicated, on the same targets) and their project ID comes
-/// back inherited. Only on bcachefs; errors are left for the directory's
-/// metadata, which sets them all again, to report.
-pub(super) fn prepare_dir_for_options(path: &Path, node: &Node) {
+/// options and its project ID, 0 where it has none in a snapshot of
+/// BackOtter's (`known_bko`; in another, the one it inherited stays). Its
+/// entries then inherit them as in the original, so their data is stored as
+/// it was (compressed, replicated, on the same targets) and their project
+/// ID comes back inherited. Only on bcachefs; errors are left for the
+/// directory's metadata, which sets them all again, to report.
+pub(super) fn prepare_dir_for_options(path: &Path, node: &Node, known_bko: bool) {
     if !matches!(node.node_type, NodeType::Dir) || !is_bcachefs_path(path) {
         return;
     }
@@ -991,7 +995,14 @@ pub(super) fn prepare_dir_for_options(path: &Path, node: &Node) {
             debug!("{name} of {} not set early: {err}", path.display());
         }
     }
-    let projid = node.meta.generic_attributes.number(LINUX_PROJECT_ID).unwrap_or(0);
+    let Some(projid) = node
+        .meta
+        .generic_attributes
+        .number(LINUX_PROJECT_ID)
+        .or_else(|| known_bko.then_some(0))
+    else {
+        return;
+    };
     if let Err(err) = set_projid(path, &f, projid) {
         debug!("project ID of {} not set early: {err}", path.display());
     }
@@ -1642,12 +1653,22 @@ mod tests {
         assert_eq!(node.meta.generic_attributes.number(LINUX_PROJECT_ID), None);
     }
 
+    /// BackOtter: in a snapshot not BackOtter's, a node without a project
+    /// ID says nothing: the file isn't even looked at (a path that doesn't
+    /// exist is no error), on bcachefs either.
+    #[test]
+    fn project_id_unknown_is_left_alone() {
+        let node = Node::default();
+        restore_attributes(Path::new("/nonexistent/bko"), &node, false).unwrap();
+        prepare_dir_for_options(Path::new("/nonexistent/bko"), &node, false);
+    }
+
     #[test]
     fn project_id_0_is_left_alone() {
         // Not even opened: a path that doesn't exist is no error.
         let mut node = Node::default();
         node.meta.generic_attributes.set(LINUX_PROJECT_ID, &0).unwrap();
-        restore_attributes(Path::new("/nonexistent/bko"), &node).unwrap();
+        restore_attributes(Path::new("/nonexistent/bko"), &node, true).unwrap();
     }
 
     #[test]
@@ -1776,13 +1797,13 @@ mod tests {
         let mut node = Node::new_node(OsStr::new("d"), NodeType::Dir, NodeMetadata::default());
         node.meta.extended_attributes =
             vec![ExtendedAttribute { name: "user.backotter".into(), value: Some(b"x".to_vec()) }];
-        prepare_dir_for_options(dir.path(), &node);
+        prepare_dir_for_options(dir.path(), &node, true);
         assert!(xattr::get(dir.path(), "user.backotter").unwrap().is_none());
         let path = dir.path().join("f");
         std::fs::write(&path, b"").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         let file = Node::new_node(OsStr::new("f"), NodeType::File, NodeMetadata::default());
-        restore_attributes(&path, &file).unwrap();
+        restore_attributes(&path, &file, true).unwrap();
     }
 
     /// The effective project ID of the file at `path`, on bcachefs.
@@ -1811,25 +1832,30 @@ mod tests {
             ExtendedAttribute { name: "bcachefs.project".into(), value: Some(b"43".to_vec()) },
         ];
         dir.meta.generic_attributes.set_number(LINUX_PROJECT_ID, 43);
-        prepare_dir_for_options(&d, &dir);
+        prepare_dir_for_options(&d, &dir, true);
         assert_eq!(effective_projid(&d), 43);
 
         let kid = d.join("kid");
         std::fs::write(&kid, b"data").unwrap();
         let zero = d.join("zero");
         std::fs::write(&zero, b"data").unwrap();
+        let stock = d.join("stock");
+        std::fs::write(&stock, b"data").unwrap();
         let compression = xattr::get(&kid, "bcachefs_effective.compression").unwrap().unwrap();
         assert!(compression.starts_with(b"zstd"), "{compression:?}");
 
         let mut kid_node = Node::new_node(OsStr::new("kid"), NodeType::File, NodeMetadata::default());
         kid_node.meta.generic_attributes.set_number(LINUX_PROJECT_ID, 43);
-        restore_attributes(&kid, &kid_node).unwrap();
+        restore_attributes(&kid, &kid_node, true).unwrap();
         let zero_node = Node::new_node(OsStr::new("zero"), NodeType::File, NodeMetadata::default());
-        restore_attributes(&zero, &zero_node).unwrap();
-        restore_attributes(&d, &dir).unwrap();
+        restore_attributes(&zero, &zero_node, true).unwrap();
+        // A node without one in a snapshot not BackOtter's: it stays inherited.
+        restore_attributes(&stock, &zero_node, false).unwrap();
+        restore_attributes(&d, &dir, true).unwrap();
 
         assert_eq!(effective_projid(&kid), 43);
         assert_eq!(effective_projid(&zero), 0);
+        assert_eq!(effective_projid(&stock), 43);
         let names: Vec<_> = xattr::list(&kid).unwrap().collect();
         assert!(!names.iter().any(|n| n == "bcachefs.project"), "{names:?}");
         assert!(!names.iter().any(|n| n == "bcachefs.compression"), "{names:?}");

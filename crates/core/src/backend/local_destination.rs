@@ -448,6 +448,7 @@ impl LocalDestination {
         &self,
         _item: impl AsRef<Path>,
         _node: &Node,
+        _zero_if_missing: bool,
     ) -> LocalDestinationResult<()> {
         Ok(())
     }
@@ -459,6 +460,8 @@ impl LocalDestination {
     ///
     /// * `item` - The item to set the permissions for
     /// * `node` - The node to get the permissions from
+    /// * `zero_if_missing` - BackOtter: whether a node without a mode had
+    ///   mode 0
     ///
     /// # Errors
     ///
@@ -468,6 +471,7 @@ impl LocalDestination {
         &self,
         item: impl AsRef<Path>,
         node: &Node,
+        zero_if_missing: bool,
     ) -> LocalDestinationResult<()> {
         if node.is_symlink() {
             return Ok(());
@@ -477,9 +481,11 @@ impl LocalDestination {
 
         // BackOtter: restic leaves a mode of 0 out ("omitempty"), and a
         // regular file's Go mode is its permissions alone: a file without a
-        // mode has 0000 (/etc/shadow, say), rather than keep the 0644 it was
-        // created with.
-        if let Some(mode) = node.meta.mode.or_else(|| node.is_file().then_some(0)) {
+        // mode, where the restore knows that means 0 (the restore's
+        // `mode_zero_if_missing`), gets 0000 (/etc/shadow, say), rather than
+        // keep the 0644 it was created with. Without a mode otherwise
+        // (stdin, Windows, stock rustic) it keeps that, as in stock rustic.
+        if let Some(mode) = node.meta.mode.or_else(|| zero_if_missing.then_some(0)) {
             let mode = map_mode_from_go(mode);
             fs::set_permissions(filename, fs::Permissions::from_mode(mode))
                 .map_err(LocalDestinationErrorKind::SettingFilePermissionsFailed)?;
@@ -505,6 +511,7 @@ impl LocalDestination {
         &self,
         _item: impl AsRef<Path>,
         _extended_attributes: &[ExtendedAttribute],
+        _stock_names: bool,
     ) -> LocalDestinationResult<()> {
         Ok(())
     }
@@ -521,6 +528,7 @@ impl LocalDestination {
         &self,
         item: impl AsRef<Path>,
         extended_attributes: &[ExtendedAttribute],
+        _stock_names: bool,
     ) -> LocalDestinationResult<()> {
         osattrs::set_native_xattrs(&self.path(item), extended_attributes)
             .map_err(LocalDestinationErrorKind::XattrsNotSet)
@@ -533,6 +541,9 @@ impl LocalDestination {
     ///
     /// * `item` - The item to set the extended attributes for
     /// * `extended_attributes` - The extended attributes to set
+    /// * `stock_names` - BackOtter: whether names may be stock rustic's,
+    ///   with their namespace (`user.NAME`) on FreeBSD and NetBSD: in a
+    ///   snapshot not BackOtter's ([`xattr_restore_names`])
     ///
     /// # Errors
     ///
@@ -548,6 +559,7 @@ impl LocalDestination {
         &self,
         item: impl AsRef<Path>,
         extended_attributes: &[ExtendedAttribute],
+        stock_names: bool,
     ) -> LocalDestinationResult<()> {
         let filename = self.path(item);
         // BackOtter: nothing to do where the xattr crate has no support,
@@ -555,7 +567,8 @@ impl LocalDestination {
         if !xattr::SUPPORTED_PLATFORM {
             return Ok(());
         }
-        set_xattrs_with(&SystemXattrs, &filename, extended_attributes)
+        let bsd_stock = stock_names && cfg!(any(target_os = "freebsd", target_os = "netbsd"));
+        set_xattrs_with(&SystemXattrs, &filename, extended_attributes, bsd_stock)
             .map_err(LocalDestinationErrorKind::XattrsNotSet)
     }
 
@@ -967,8 +980,34 @@ impl XattrCalls for SystemXattrs {
     }
 }
 
+/// BackOtter: for the extended attribute a node names `name`, the name the
+/// sync of a file's attributes matches it by (a node's name for one the
+/// system lists, [`osattrs::xattr_node_name`]), or `None` for one the system
+/// doesn't list, and the name the xattr crate sets it by.
+///
+/// With `bsd_stock` (FreeBSD or NetBSD, a snapshot not BackOtter's), a name
+/// that begins with `user.` or `system.` is stock rustic's, which kept the
+/// namespace (BackOtter's, as restic's, is the bare name of one in the user
+/// namespace): it is set by that name, under its namespace, and a `user.`
+/// one matches the bare name the system lists; `system.` ones are not
+/// listed (nor removed). Otherwise the node's name, set as
+/// [`osattrs::xattr_os_name`] says.
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+fn xattr_restore_names(name: &str, bsd_stock: bool) -> (Option<String>, String) {
+    if bsd_stock {
+        if let Some(bare) = name.strip_prefix("user.") {
+            return (Some(bare.to_string()), name.to_string());
+        }
+        if name.starts_with("system.") {
+            return (None, name.to_string());
+        }
+    }
+    (Some(name.to_string()), osattrs::xattr_os_name(name))
+}
+
 /// BackOtter: gives `filename` exactly the extended attributes
-/// `extended_attributes`, with `calls` ([`LocalDestination::set_extended_attributes`]).
+/// `extended_attributes`, with `calls` ([`LocalDestination::set_extended_attributes`]);
+/// `bsd_stock` as [`xattr_restore_names`] takes it.
 ///
 /// # Errors
 ///
@@ -979,7 +1018,12 @@ fn set_xattrs_with(
     calls: &impl XattrCalls,
     filename: &Path,
     extended_attributes: &[ExtendedAttribute],
+    bsd_stock: bool,
 ) -> Result<(), osattrs::XattrErrors> {
+    let names: Vec<_> = extended_attributes
+        .iter()
+        .map(|ExtendedAttribute { name, .. }| xattr_restore_names(name, bsd_stock))
+        .collect();
     let mut done = vec![false; extended_attributes.len()];
     let mut errors = osattrs::XattrErrors::default();
 
@@ -1014,14 +1058,14 @@ fn set_xattrs_with(
         let Some(curr_node_name) = osattrs::xattr_node_name(&curr_name) else {
             continue;
         };
-        match extended_attributes
+        match names
             .iter()
-            .enumerate()
-            .find(|(_, ExtendedAttribute { name, .. })| name == &curr_node_name)
+            .position(|(matched, _)| matched.as_ref() == Some(&curr_node_name))
         {
             // BackOtter: one with the right value already is left; one
             // that can't be read is set below, as are the others.
-            Some((index, ExtendedAttribute { value, .. })) => {
+            Some(index) => {
+                let value = &extended_attributes[index].value;
                 if calls.get(filename, &curr_name).is_ok_and(|curr| value == &curr) {
                     done[index] = true;
                 }
@@ -1044,13 +1088,14 @@ fn set_xattrs_with(
 
     for (index, ExtendedAttribute { name, value }) in extended_attributes.iter().enumerate() {
         if !done[index] {
-            let os_name = osattrs::xattr_os_name(name);
+            let (matched, os_name) = &names[index];
             // BackOtter: not one that isn't kept (bcachefs_effective.*,
-            // which stock restic keeps), whose setting does nothing.
-            if osattrs::xattr_node_name(os_name.as_ref()).is_none() {
+            // which stock restic keeps), whose setting does nothing; a
+            // stock name of the system namespace is set.
+            if matched.is_some() && osattrs::xattr_node_name(os_name.as_ref()).is_none() {
                 continue;
             }
-            if let Err(err) = calls.set(filename, &os_name, value.as_deref().unwrap_or_default()) {
+            if let Err(err) = calls.set(filename, os_name, value.as_deref().unwrap_or_default()) {
                 // BackOtter: bcachefs refusing casefolding on a
                 // directory with entries is a warning, as for F.
                 if osattrs::casefold_not_empty(name, &err) {
@@ -1280,7 +1325,7 @@ mod tests {
             attrs.insert(0, xattr("trusted.t", b"0"));
         }
         attrs.push(xattr("bogus.c", b"3"));
-        let err = dest.set_extended_attributes("f", &attrs).unwrap_err().to_string();
+        let err = dest.set_extended_attributes("f", &attrs, false).unwrap_err().to_string();
         assert_eq!(xattr::get(&file, "user.b").unwrap(), Some(b"2".to_vec()));
         assert_eq!(xattr::get(&file, "user.old").unwrap(), None);
         assert!(err.contains("bogus.a: "), "{err}");
@@ -1291,12 +1336,12 @@ mod tests {
         }
 
         // Again, over its own result: only the attributes that can't be set.
-        let err = dest.set_extended_attributes("f", &attrs).unwrap_err().to_string();
+        let err = dest.set_extended_attributes("f", &attrs, false).unwrap_err().to_string();
         assert!(!err.contains("user."), "{err}");
         assert_eq!(xattr::get(&file, "user.b").unwrap(), Some(b"2".to_vec()));
 
         // A node without any removes them all.
-        dest.set_extended_attributes("f", &[]).unwrap();
+        dest.set_extended_attributes("f", &[], false).unwrap();
         assert_eq!(xattr::list(&file).unwrap().count(), 0);
     }
 
@@ -1380,13 +1425,13 @@ mod tests {
             xattr("user.new", b"n"),
             xattr("user.same", b"s"),
         ];
-        set_xattrs_with(&calls, dir, &attrs).unwrap();
+        set_xattrs_with(&calls, dir, &attrs, false).unwrap();
         assert_eq!(calls.names(), ["user.new", "user.same"]);
         assert_eq!(*calls.warned.borrow(), ["bcachefs.casefold /r/d"]);
 
         let calls = FakeXattrs::with(&[], &["user.notempty"]);
         let attrs = [xattr("user.notempty", b"1"), xattr("user.b", b"2")];
-        let err = set_xattrs_with(&calls, dir, &attrs).unwrap_err().to_string();
+        let err = set_xattrs_with(&calls, dir, &attrs, false).unwrap_err().to_string();
         assert!(err.starts_with("user.notempty: "), "{err}");
         assert_eq!(calls.names(), ["user.b"]);
         assert!(calls.warned.borrow().is_empty());
@@ -1401,7 +1446,7 @@ mod tests {
             &[("bcachefs.casefold", b"1"), ("user.old", b"x")],
             &["bcachefs.casefold"],
         );
-        set_xattrs_with(&calls, dir, &[xattr("user.new", b"n")]).unwrap();
+        set_xattrs_with(&calls, dir, &[xattr("user.new", b"n")], false).unwrap();
         assert_eq!(calls.names(), ["bcachefs.casefold", "user.new"]);
         assert_eq!(*calls.warned.borrow(), ["bcachefs.casefold /r/d"]);
 
@@ -1409,12 +1454,47 @@ mod tests {
             &[("user.notempty", b"1"), ("user.old", b"x")],
             &["user.notempty"],
         );
-        let err = set_xattrs_with(&calls, dir, &[xattr("user.new", b"n")])
+        let err = set_xattrs_with(&calls, dir, &[xattr("user.new", b"n")], false)
             .unwrap_err()
             .to_string();
         assert!(err.starts_with("removing user.notempty: "), "{err}");
         assert_eq!(calls.names(), ["user.new", "user.notempty"]);
         assert!(calls.warned.borrow().is_empty());
+    }
+
+    /// BackOtter: stock rustic's names on FreeBSD and NetBSD (`user.NAME`,
+    /// `system.NAME`) are restored under their namespace in a snapshot not
+    /// BackOtter's, and a `user.` one matches the bare name listed; in
+    /// BackOtter's snapshots (and elsewhere) a node's name is the name.
+    #[test]
+    fn xattr_stock_bsd_names() {
+        let own = |name: &str| (Some(name.to_string()), osattrs::xattr_os_name(name));
+        assert_eq!(
+            xattr_restore_names("user.comment", true),
+            (Some("comment".to_string()), "user.comment".to_string())
+        );
+        assert_eq!(
+            xattr_restore_names("system.mac", true),
+            (None, "system.mac".to_string())
+        );
+        assert_eq!(xattr_restore_names("comment", true), own("comment"));
+        assert_eq!(xattr_restore_names("user.comment", false), own("user.comment"));
+        assert_eq!(xattr_restore_names("system.mac", false), own("system.mac"));
+    }
+
+    /// BackOtter: a stock name of the user namespace that the file has with
+    /// the right value is left, one of the system namespace is set (never
+    /// listed, nor removed), with `bsd_stock`.
+    #[test]
+    fn xattr_stock_bsd_names_synced() {
+        let dir = Path::new("/r/f");
+        // On FreeBSD and NetBSD the system lists user.comment as "comment";
+        // here the fake lists its keys, so they are the node's names.
+        let calls = FakeXattrs::with(&[("comment", b"c")], &[]);
+        let attrs = [xattr("user.comment", b"c"), xattr("system.mac", b"m")];
+        // The fake's set takes the name as given: one already right isn't set.
+        set_xattrs_with(&calls, dir, &attrs, true).unwrap();
+        assert_eq!(calls.names(), ["comment", "system.mac"]);
     }
 
     /// BackOtter: a node without an SELinux label leaves the file's alone,
@@ -1437,7 +1517,7 @@ mod tests {
             return;
         }
         let dest = LocalDestination::new(dir.path().to_str().unwrap(), false, false).unwrap();
-        dest.set_extended_attributes("f", &[]).unwrap();
+        dest.set_extended_attributes("f", &[], false).unwrap();
         let names: Vec<_> = xattr::list(&file).unwrap().collect();
         assert_eq!(names, ["security.selinux"]);
     }

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::thread::scope;
 
 use jiff::Zoned;
-use log::{debug, warn};
+use log::warn;
 use pariter::IteratorExt;
 
 use crate::{
@@ -16,7 +16,7 @@ use crate::{
         file_archiver::FileArchiver, parent::Parent, tree::TreeIterator,
         tree_archiver::TreeArchiver,
     },
-    backend::{ReadSource, ReadSourceEntry, decrypt::DecryptFullBackend, node::Node, osattrs},
+    backend::{ReadSource, ReadSourceEntry, decrypt::DecryptFullBackend, node::Node},
     blob::BlobType,
     error::RusticResult,
     index::{
@@ -141,13 +141,9 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
         scope(|s| -> RusticResult<_> {
             // determine backup size in parallel to running backup
             let src_size_handle = s.spawn(|| {
-                // BackOtter: not where listing a directory moves its access
-                // time (no O_NOATIME), which the backup keeps: the scan
-                // would list directories before the backup takes their
-                // metadata, as in BackOtter's restic.
-                if !no_scan && !osattrs::LISTING_KEEPS_ATIMES {
-                    debug!("no scan for the backup's size: it would move directories' access times");
-                } else if !no_scan && !p.is_hidden() {
+                // BackOtter: `no_scan` too where the scan would move the
+                // access times the backup keeps (backup.rs).
+                if !no_scan && !p.is_hidden() {
                     match src.size() {
                         Ok(Some(size)) => p.set_length(size),
                         Ok(None) => {}
