@@ -265,6 +265,32 @@ fn test_restore_sparse(set_up_repo: Result<RepoOpen>) -> Result<()> {
         &["sparse", "full", "zeros", "trailing"],
     )?;
 
+    // --dry-run over the same file of holes: BackOtter's snapshot would
+    // fill them, so it counts as a file to modify (as in BackOtter's
+    // restic); a stock rustic snapshot leaves it as it is. Nothing is
+    // filled.
+    let restore_dir = tempdir()?;
+    let test = restore_dir.path().join("test");
+    fs::create_dir(&test)?;
+    File::create(test.join("zeros"))?.set_len(u64::try_from(zeros.len())?)?;
+    let dry_run_modify = |opts: RestoreOptions| -> Result<u64> {
+        let node = repo.node_from_snapshot_path("latest", |_| true)?;
+        let dest = LocalDestination::new(
+            restore_dir.path().to_str().expect("restore path is valid utf-8"),
+            true,
+            false,
+        )?;
+        let ls = repo.ls(&node, &LsOptions::default())?;
+        Ok(repo.prepare_restore(&opts, ls, &dest, true)?.stats.files.modify)
+    };
+    let snap = repo.get_snapshot_from_str("latest", |_| true)?;
+    let bko = RestoreOptions::default().origin(SnapshotOrigin::of(&snap));
+    // Holes are filled on Linux only.
+    let fills = u64::from(cfg!(any(target_os = "linux", target_os = "android")));
+    assert_eq!(dry_run_modify(bko)?, fills, "BackOtter's snapshot");
+    assert_eq!(dry_run_modify(RestoreOptions::default())?, 0, "stock snapshot");
+    assert!(!allocated(&test.join("zeros"))?, "zeros: allocated by --dry-run");
+
     // The same file of holes, left as it is, from a snapshot not
     // BackOtter's (stock rustic's, which marks no file): it keeps its holes,
     // as in stock rustic, which can't tell it had none.

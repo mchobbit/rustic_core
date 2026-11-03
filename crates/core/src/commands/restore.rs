@@ -153,26 +153,63 @@ impl SnapshotOrigin {
 }
 
 /// BackOtter: whether a restore into `dest` gives `dest` the metadata of
-/// the node it restores there (`restore SNAP:subfolder DEST`): only when the
-/// restore creates `dest`, or `dest` is a directory with nothing in it but
-/// directories, at any depth, where entries a file system makes itself
-/// don't count: `lost+found` (a directory), FreeBSD UFS's `.snap` (a
-/// directory) and `.sujournal` (a regular file), none looked into, in at
-/// most 4096 directories ([`FRESH_TARGET_MAX_DIRS`]). That is a
-/// new file system's root with the new file systems of the system restored
+/// the node it restores there (`restore SNAP:subfolder DEST`).
+///
+/// Only when `dest` is fresh: it doesn't exist (the restore creates it), or
+/// every entry found walking it (no symlink followed) is one of
+///
+/// - (a) an entry a file system makes itself ([`made_by_file_system`]:
+///   `lost+found`, a directory; FreeBSD UFS's `.snap`, a directory, and
+///   `.sujournal`, a regular file), whatever it holds;
+/// - (b) a directory that is a mount point: its device (`st_dev`) differs
+///   from its parent's. That is also a ZFS dataset's and a btrfs
+///   subvolume's root, which have devices of their own. What it holds
+///   must again be (a), (b) or (c), relative to it;
+/// - (c) a directory on the path to one: it holds only (a), (b) and (c),
+///   and at least one (b) at some depth;
+///
+/// in at most 4096 directories ([`FRESH_TARGET_MAX_DIRS`]). That is a new
+/// file system's root with the new file systems of the system restored
 /// mounted below it (`/boot`, `/boot/efi`, `/home`, ZFS datasets, btrfs
-/// subvolumes), and the directories made for their mount points: BackOtter's
-/// bare-metal restore. Anything else (a file, a symlink, a device, a
-/// directory that can't be read) means `dest` stays as it is (owner, mode,
-/// times, extended attributes, ACLs and flags), as in stock rustic. A
-/// symlink at `dest` is not fresh, and symlinks in it aren't followed. As in
-/// BackOtter's restic. Call it before the restore starts.
+/// subvolumes): BackOtter's bare-metal restore. Anything else (a file, a
+/// symlink, a device, a plain directory, even empty, on `dest`'s own file
+/// system, a directory that can't be read) means `dest` stays as it is
+/// (owner, mode, times, extended attributes, ACLs and flags), as in stock
+/// rustic: a freshly booted server's `/tmp`, with nothing in it but empty
+/// `.X11-unix`, `.ICE-unix` and `systemd-private-*/tmp`, keeps its sticky
+/// bit. A symlink at `dest` is not fresh. Where there are no device
+/// numbers (Windows), no directory is a mount point. As in BackOtter's
+/// restic. Call it before the restore starts.
 #[must_use]
 pub fn restore_target_is_fresh(dest: impl AsRef<std::path::Path>) -> bool {
-    let dest = dest.as_ref();
+    fresh_target_with(dest.as_ref(), &|_, meta| device_of(meta))
+}
+
+/// The device of the file of `meta`, where there is one.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)] // None on other systems
+fn device_of(meta: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.dev())
+}
+
+/// The device of the file of `meta`, where there is one.
+#[cfg(not(unix))]
+const fn device_of(_meta: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
+/// The device of a path, given its (`lstat`) metadata.
+type DeviceOf<'a> = dyn Fn(&std::path::Path, &std::fs::Metadata) -> Option<u64> + 'a;
+
+/// [`restore_target_is_fresh`], with the devices from `device`.
+fn fresh_target_with(dest: &std::path::Path, device: &DeviceOf<'_>) -> bool {
     match std::fs::symlink_metadata(dest) {
         Err(err) => err.kind() == std::io::ErrorKind::NotFound,
-        Ok(m) if m.is_dir() => holds_only_directories(dest),
+        Ok(meta) if meta.is_dir() => {
+            let mut budget = FRESH_TARGET_MAX_DIRS;
+            fresh_dir(dest, device(dest, &meta), device, &mut budget).is_some()
+        }
         Ok(_) => false,
     }
 }
@@ -181,35 +218,38 @@ pub fn restore_target_is_fresh(dest: impl AsRef<std::path::Path>) -> bool {
 /// included: a destination with more isn't fresh. As BackOtter's restic.
 const FRESH_TARGET_MAX_DIRS: usize = 4096;
 
-/// Whether the directory `dir` holds nothing but directories that do too,
-/// and entries a file system makes itself ([`made_by_file_system`]), in at
-/// most [`FRESH_TARGET_MAX_DIRS`] directories.
-fn holds_only_directories(dir: &std::path::Path) -> bool {
-    let mut dirs = vec![dir.to_path_buf()];
-    let mut seen = 0;
-    while let Some(dir) = dirs.pop() {
-        seen += 1;
-        if seen > FRESH_TARGET_MAX_DIRS {
-            return false;
+/// Whether the directory `dir`, on the device `dev`, holds only entries of
+/// a fresh target (see [`restore_target_is_fresh`]): None if not, else
+/// whether it holds a mount point at some depth. Looks at no more than
+/// `budget` directories, `dir` included, and takes those off it.
+fn fresh_dir(
+    dir: &std::path::Path,
+    dev: Option<u64>,
+    device: &DeviceOf<'_>,
+    budget: &mut usize,
+) -> Option<bool> {
+    *budget = budget.checked_sub(1)?;
+    let mut holds_mount = false;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let path = entry.ok()?.path();
+        // Doesn't follow a symlink; does see what is mounted on `path`.
+        let meta = std::fs::symlink_metadata(&path).ok()?;
+        if made_by_file_system(path.file_name()?, meta.file_type()) {
+            continue;
         }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return false;
-        };
-        for entry in entries {
-            // file_type doesn't follow a symlink.
-            let Ok((entry, file_type)) = entry.and_then(|e| e.file_type().map(|t| (e, t))) else {
-                return false;
-            };
-            if made_by_file_system(&entry.file_name(), file_type) {
-                continue;
-            }
-            if !file_type.is_dir() {
-                return false;
-            }
-            dirs.push(entry.path());
+        if !meta.is_dir() {
+            return None;
         }
+        let sub_dev = device(&path, &meta);
+        let mount_point = sub_dev.is_some() && dev.is_some() && sub_dev != dev;
+        let holds = fresh_dir(&path, sub_dev, device, budget)?;
+        if !(mount_point || holds) {
+            // A plain directory on `dir`'s file system.
+            return None;
+        }
+        holds_mount = true;
     }
-    true
+    Some(holds_mount)
 }
 
 /// Whether the entry `name` of type `file_type` is one a new file system
@@ -542,13 +582,17 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                 // BackOtter: a file left as it is, which had no holes at
                 // backup, gets its holes allocated (a swap file left with
                 // holes by an interrupted restore): only where the snapshot
-                // says so (fills_holes). Whether it did, which makes it a
-                // file modified.
+                // says so (fills_holes). Whether it did (with --dry-run:
+                // would), which makes it a file modified, as in BackOtter's
+                // restic.
                 let fill_holes = || {
-                    if dry_run || !fills_holes(opts, node) {
+                    if !fills_holes(opts, node) {
                         return false;
                     }
                     let target = dest.path(path);
+                    if dry_run {
+                        return osattrs::holes_to_fill(&target, node.meta.size);
+                    }
                     let filled = osattrs::fill_holes(&target, node.meta.size);
                     if let Some(err) = &filled.error {
                         warn!("restore {}: holes not filled: {err}", path.display());
@@ -1560,78 +1604,128 @@ mod tests {
         assert!(!fills_holes(RestoreOptions::default().origin(SnapshotOrigin::Restic), &plain));
     }
 
-    /// The destination of `SNAP:subfolder` gets the subfolder's metadata
-    /// only when the restore creates it or finds nothing in it but
-    /// directories (at any depth) and what a file system makes itself
-    /// (`lost+found`, `.snap`, `.sujournal`): a new root with the new file
-    /// systems mounted below it.
+    /// A destination is fresh when it doesn't exist, or holds only what a
+    /// file system makes itself (`lost+found`, `.snap`, `.sujournal`),
+    /// mount points, and directories on the path to them, at any depth. The
+    /// mount points are made up here: a directory in `mounts` and what is
+    /// below it are on a device of their own.
     #[cfg(unix)]
     #[test]
     fn target_fresh_only_when_new_or_empty() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().join("d");
-        assert!(restore_target_is_fresh(&d));
+        let mounts = std::cell::RefCell::new(Vec::<PathBuf>::new());
+        let device = |path: &std::path::Path, _: &std::fs::Metadata| {
+            let mounts = mounts.borrow();
+            let i = mounts.iter().position(|m| path.starts_with(m));
+            Some(i.map_or(0, |i| i as u64 + 1))
+        };
+        let fresh = |d: &std::path::Path| fresh_target_with(d, &device);
+        let mount = |sub: &str| {
+            std::fs::create_dir_all(d.join(sub)).unwrap();
+            // The deepest first, so that it is found first.
+            mounts.borrow_mut().insert(0, d.join(sub));
+        };
+        assert!(fresh(&d));
         std::fs::create_dir(&d).unwrap();
-        assert!(restore_target_is_fresh(&d));
+        assert!(fresh(&d));
         std::fs::create_dir(d.join("lost+found")).unwrap();
         std::fs::write(d.join("lost+found/#123"), b"x").unwrap();
-        assert!(restore_target_is_fresh(&d));
-        // Mount points: /boot, /boot/efi, /home with its lost+found, a
-        // FreeBSD UFS's .snap and .sujournal, a ZFS dataset's parent.
-        for sub in ["boot/efi", "home/lost+found", "var/.snap", "usr/local/lib"] {
-            std::fs::create_dir_all(d.join(sub)).unwrap();
+        assert!(fresh(&d), "lost+found only");
+        std::fs::write(d.join(".sujournal"), b"").unwrap();
+        std::fs::create_dir(d.join(".snap")).unwrap();
+        assert!(fresh(&d), "UFS's own entries");
+
+        // A freshly booted server's /tmp: empty directories on its own
+        // file system.
+        let tmp = dir.path().join("tmp");
+        for sub in [".X11-unix", ".ICE-unix", ".font-unix", "systemd-private-1-x/tmp"] {
+            std::fs::create_dir_all(tmp.join(sub)).unwrap();
         }
+        assert!(!fresh(&tmp), "/tmp");
+        std::fs::create_dir(d.join("srv")).unwrap();
+        assert!(!fresh(&d), "an empty directory");
+        std::fs::remove_dir(d.join("srv")).unwrap();
+
+        // Mount points: /boot and /boot/efi, /home with its lost+found,
+        // /var with UFS's own, /usr/local below a plain /usr (a ZFS
+        // dataset's parent).
+        for sub in ["boot", "boot/efi", "home", "var", "usr/local"] {
+            mount(sub);
+        }
+        std::fs::create_dir(d.join("home/lost+found")).unwrap();
+        std::fs::create_dir(d.join("var/.snap")).unwrap();
         std::fs::write(d.join("var/.sujournal"), b"").unwrap();
-        assert!(restore_target_is_fresh(&d));
+        assert!(fresh(&d), "bare-metal root");
+
         // Anything else, at any depth, is not.
-        for (what, make, undo) in [
-            ("file", "boot/efi/f", "boot/efi/f"),
-            ("lost+found file", "usr/lost+found", "usr/lost+found"),
-            (".sujournal directory with a file", "usr/.sujournal/", "usr/.sujournal"),
-            (".snap file", "home/.snap", "home/.snap"),
+        for (what, make) in [
+            ("file", "f"),
+            ("file in a mount point", "boot/efi/f"),
+            ("file on the path to a mount point", "usr/f"),
+            ("empty directory in a mount point", "boot/grub/"),
+            ("empty directory beside a mount point", "usr/share/"),
+            ("lost+found file", "usr/lost+found"),
+            (".sujournal directory", "home/.sujournal/"),
+            (".snap file", "home/.snap"),
         ] {
-            if let Some(dirname) = make.strip_suffix('/') {
-                std::fs::create_dir(d.join(dirname)).unwrap();
-                std::fs::write(d.join(dirname).join("f"), b"x").unwrap();
+            let path = d.join(make.trim_end_matches('/'));
+            if make.ends_with('/') {
+                std::fs::create_dir(&path).unwrap();
             } else {
-                std::fs::write(d.join(make), b"x").unwrap();
+                std::fs::write(&path, b"x").unwrap();
             }
-            assert!(!restore_target_is_fresh(&d), "{what}");
-            let undo = d.join(undo);
-            if undo.is_dir() {
-                std::fs::remove_dir_all(&undo).unwrap();
+            assert!(!fresh(&d), "{what}");
+            if path.is_dir() {
+                std::fs::remove_dir(&path).unwrap();
             } else {
-                std::fs::remove_file(&undo).unwrap();
+                std::fs::remove_file(&path).unwrap();
             }
-            assert!(restore_target_is_fresh(&d), "{what} removed");
+            assert!(fresh(&d), "{what} removed");
         }
-        // At most 4096 directories, d and boot/efi among them.
-        let many = d.join("many");
-        std::fs::create_dir(&many).unwrap();
-        // d, boot, efi, home, var, usr, local, lib and many (not lost+found or .snap).
-        let have = 9;
+        // A directory on the path to a mount point holding only
+        // lost+found is a plain directory.
+        std::fs::create_dir_all(d.join("opt/lost+found")).unwrap();
+        assert!(!fresh(&d), "a plain directory with lost+found");
+        std::fs::remove_dir_all(d.join("opt")).unwrap();
+
+        // At most 4096 directories: d, boot, efi, home, var, usr, local,
+        // many and those in it (not lost+found or .snap).
+        let have = 8;
+        mount("many");
         for i in 0..FRESH_TARGET_MAX_DIRS - have {
-            std::fs::create_dir(many.join(i.to_string())).unwrap();
+            mount(&format!("many/{i}"));
         }
-        assert!(restore_target_is_fresh(&d));
-        std::fs::create_dir(many.join("one more")).unwrap();
-        assert!(!restore_target_is_fresh(&d));
-        std::fs::remove_dir_all(&many).unwrap();
+        assert!(fresh(&d), "4096 directories");
+        mount("many/one more");
+        assert!(!fresh(&d), "4097 directories");
+        std::fs::remove_dir_all(d.join("many")).unwrap();
+        assert!(fresh(&d));
+
         // A symlink, even to a directory, is not followed.
         std::os::unix::fs::symlink("/", d.join("boot/link")).unwrap();
-        assert!(!restore_target_is_fresh(&d));
+        assert!(!fresh(&d), "symlink");
         std::fs::remove_file(d.join("boot/link")).unwrap();
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&d, &link).unwrap();
-        assert!(!restore_target_is_fresh(&link));
+        assert!(!fresh(&link), "symlink as the destination");
         let f = dir.path().join("f");
         std::fs::write(&f, b"x").unwrap();
-        assert!(!restore_target_is_fresh(&f));
+        assert!(!fresh(&f), "file as the destination");
+
+        // The devices restore_target_is_fresh itself sees: none of these
+        // directories is a mount point.
+        assert!(restore_target_is_fresh(dir.path().join("new")));
+        let lf = dir.path().join("lf");
+        std::fs::create_dir_all(lf.join("lost+found/x")).unwrap();
+        assert!(restore_target_is_fresh(&lf));
+        assert!(!restore_target_is_fresh(&d));
+        assert!(!restore_target_is_fresh(&tmp));
     }
 
-    /// As root on Linux: a file system mounted in the destination (tmpfs
-    /// here, /boot or /home in a bare-metal restore) counts by what it
-    /// holds, as any directory.
+    /// As root on Linux, with tmpfs mounts: a new root with /boot and
+    /// /boot/efi mounted below it is fresh; an empty directory or a file
+    /// on any of them is not.
     #[cfg(target_os = "linux")]
     #[test]
     fn target_fresh_with_a_mount_in_it() {
@@ -1642,22 +1736,48 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         let boot = d.join("boot");
-        std::fs::create_dir(&boot).unwrap();
-        let mounted = std::process::Command::new("mount")
-            .args(["-t", "tmpfs", "bkotest", boot.to_str().unwrap()])
-            .status()
-            .is_ok_and(|s| s.success());
-        if !mounted {
+        let efi = boot.join("efi");
+        let mount = |at: &std::path::Path| {
+            std::fs::create_dir_all(at).unwrap();
+            std::process::Command::new("mount")
+                .args(["-t", "tmpfs", "bkotest"])
+                .arg(at)
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        if !mount(&boot) {
             eprintln!("tmpfs not mounted");
             return;
         }
-        std::fs::create_dir_all(boot.join("efi/lost+found")).unwrap();
-        let empty = restore_target_is_fresh(d);
-        std::fs::write(boot.join("efi/vmlinuz"), b"x").unwrap();
-        let with_file = restore_target_is_fresh(d);
+        let results = (|| {
+            if !mount(&efi) {
+                return None;
+            }
+            std::fs::create_dir(efi.join("lost+found")).unwrap();
+            let mut results = vec![("boot and boot/efi mounted", true, restore_target_is_fresh(d))];
+            for (what, sub) in [
+                ("empty directory in efi", "efi/EFI"),
+                ("empty directory in boot", "grub"),
+            ] {
+                std::fs::create_dir(boot.join(sub)).unwrap();
+                results.push((what, false, restore_target_is_fresh(d)));
+                std::fs::remove_dir(boot.join(sub)).unwrap();
+            }
+            std::fs::write(efi.join("vmlinuz"), b"x").unwrap();
+            results.push(("file in efi", false, restore_target_is_fresh(d)));
+            std::fs::remove_file(efi.join("vmlinuz")).unwrap();
+            std::fs::create_dir(d.join("tmp")).unwrap();
+            results.push(("empty directory beside boot", false, restore_target_is_fresh(d)));
+            std::fs::remove_dir(d.join("tmp")).unwrap();
+            results.push(("all removed", true, restore_target_is_fresh(d)));
+            Some(results)
+        })();
+        let _ = std::process::Command::new("umount").arg(&efi).status();
         let _ = std::process::Command::new("umount").arg(&boot).status();
-        assert!(empty);
-        assert!(!with_file);
+        let results = results.expect("tmpfs mounted on boot/efi");
+        for (what, want, got) in results {
+            assert_eq!(got, want, "{what}");
+        }
     }
 
     #[cfg(feature = "clap")]

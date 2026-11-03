@@ -331,7 +331,7 @@ that either program restores what the other backed up.
   when it is sized (`fallocate(2)` on Linux, `F_PREALLOCATE` on macOS, as
   restic does; nothing elsewhere), and gets every byte, zeros included. An
   existing file left as it is, of the right contents, has its holes
-  allocated on Linux and macOS (a swap file left with holes by an
+  allocated on Linux (a swap file left with holes by an
   interrupted restore), only where the snapshot says it had none: a
   snapshot of BackOtter's (its program version has `+backotter`, which
   marks every file with holes `unix.sparse`), for a node without the mark,
@@ -342,19 +342,25 @@ that either program restores what the other backed up.
   bytes, then `SEEK_HOLE` on it opened read-only) and opened for writing
   only to fill holes it has, so that a file without holes gets no
   close-write event (sync clients, indexers) and a running program no
-  `ETXTBSY`. Linux fills them with `fallocate(2)`; macOS, whose
-  `F_PREALLOCATE` only adds space past the end, gets zeros written into
-  each hole (`SEEK_HOLE`, `SEEK_DATA`). Never on ZFS (`fstatfs(2)` of the
-  file opened read-only: `f_type` 0x2fc12fc1 on Linux, `zfs` on macOS),
+  `ETXTBSY`. Linux fills them with `fallocate(2)`. Other systems fill
+  none, as BackOtter's restic: macOS's `F_PREALLOCATE` only adds space past
+  the end of a file, and the only other way, writing zeros into each hole,
+  writes into a file whose contents are right already. Never on ZFS
+  (`fstatfs(2)` of the file opened read-only: `f_type` 0x2fc12fc1),
   where `fallocate(2)` allocates nothing and compression keeps written
   zeros as holes, so that such a file would be opened for writing at every
   restore for nothing; a file system that can't allocate (`fallocate(2)`
   failing with `EOPNOTSUPP` or `ENOSYS`: ext4 on an ext3-format file's
   indirect blocks, older ZFS) is nothing to do, as in BackOtter's restic. A
-  file whose holes were filled counts as modified, not unchanged; one whose
-  holes couldn't be filled otherwise (`ENOSPC`, `EIO`, can't be opened for
-  writing) is a warning ("holes not filled"), and the restore goes on,
-  exiting 0 as for other metadata. Not under `--dry-run`.
+  file whose holes were filled counts as modified, not unchanged, and so
+  does one that got blocks from a fill that then failed (`ENOSPC` once the
+  file system has allocated part of it: its blocks are looked at again
+  after any failure); one whose holes couldn't be filled otherwise
+  (`ENOSPC`, `EIO`, can't be opened for writing) is a warning ("holes not
+  filled"), and the restore goes on, exiting 0 as for other metadata.
+  `--dry-run` looks at the file the same way (never opening it for
+  writing) and counts one whose holes would be filled as modified, as
+  BackOtter's restic reports it as updated.
 - On FreeBSD and NetBSD, extended attributes are named as restic names them:
   the user namespace only, under bare names (stock rustic keeps both
   namespaces, as `user.NAME` and `system.NAME`, and restores the system
@@ -566,6 +572,14 @@ that either program restores what the other backed up.
   A snapshot without a program version is restic's before 0.16, which wrote
   none (stock rustic always writes `rustic VERSION`): a stock restic
   snapshot, whose regular files without a mode had mode 0.
+- `merge` makes a snapshot of other snapshots' nodes: it is BackOtter's
+  only if every snapshot merged is. Otherwise the program version it is
+  given loses its `+backotter`, each word cut there (`rustic
+  0.11.4+backotter.3` becomes `rustic 0.11.4`, stock rustic's own form),
+  so that a stock snapshot's missing attributes stay unknown in it. Stock
+  rustic stamps a merge with its own version whatever was merged.
+  `rewrite`, `copy` and `repair snapshots` keep each snapshot's own
+  program version, as in stock rustic.
 - A hard link replaces whatever has its name already, as in BackOtter's
   restic: the same link, where a restore is run again over its own result,
   or another file. Stock rustic tried to link over it, failed (`EEXIST`)
