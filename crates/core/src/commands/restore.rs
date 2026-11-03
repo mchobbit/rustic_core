@@ -160,7 +160,8 @@ impl SnapshotOrigin {
 ///
 /// - (a) an entry a file system makes itself ([`made_by_file_system`]:
 ///   `lost+found`, a directory; FreeBSD UFS's `.snap`, a directory, and
-///   `.sujournal`, a regular file), whatever it holds;
+///   `.sujournal`, a regular file; nilfs2's `.nilfs`, an empty regular
+///   file), whatever it holds;
 /// - (b) a directory that is a mount point: its device (`st_dev`) differs
 ///   from its parent's. That is also a ZFS dataset's and a btrfs
 ///   subvolume's root, which have devices of their own. What it holds
@@ -255,7 +256,7 @@ fn fresh_dir(
         let path = entry.ok()?.path();
         // Doesn't follow a symlink; does see what is mounted on `path`.
         let meta = std::fs::symlink_metadata(&path).ok()?;
-        if made_by_file_system(path.file_name()?, meta.file_type()) {
+        if made_by_file_system(path.file_name()?, &meta) {
             continue;
         }
         if !meta.is_dir() {
@@ -273,12 +274,17 @@ fn fresh_dir(
     Some(holds_mount)
 }
 
-/// Whether the entry `name` of type `file_type` is one a new file system
-/// has: `lost+found` (ext2/3/4, UFS), FreeBSD UFS's `.snap` (newfs without
-/// `-n`) and `.sujournal` (newfs `-j`).
-fn made_by_file_system(name: &std::ffi::OsStr, file_type: std::fs::FileType) -> bool {
+/// Whether the entry `name`, with the (`lstat`) metadata `meta`, is one a
+/// new file system has: `lost+found`, a directory (ext2/3/4, bcachefs,
+/// illumos UFS); FreeBSD UFS's `.snap`, a directory (newfs without `-n`),
+/// and `.sujournal`, a regular file (newfs `-j`); nilfs2's `.nilfs`, an
+/// empty regular file (mkfs.nilfs2 2.0.0 to 2.2.9, as in Ubuntu 24.04).
+/// As BackOtter's restic.
+fn made_by_file_system(name: &std::ffi::OsStr, meta: &std::fs::Metadata) -> bool {
+    let file_type = meta.file_type();
     (file_type.is_dir() && (name == "lost+found" || name == ".snap"))
         || (file_type.is_file() && name == ".sujournal")
+        || (file_type.is_file() && name == ".nilfs" && meta.len() == 0)
 }
 
 /// Which files to restore sparse (BackOtter: new files that had holes are,
@@ -1626,7 +1632,8 @@ mod tests {
     }
 
     /// A destination is fresh when it doesn't exist, or holds only what a
-    /// file system makes itself (`lost+found`, `.snap`, `.sujournal`),
+    /// file system makes itself (`lost+found`, `.snap`, `.sujournal`,
+    /// an empty `.nilfs`),
     /// mount points, and directories on the path to them, at any depth. The
     /// mount points are made up here: a directory in `mounts` and what is
     /// below it are on a device of their own.
@@ -1769,6 +1776,62 @@ mod tests {
         assert!(!restore_target_is_fresh(&tmp));
     }
 
+    /// A new nilfs2 file system's root may hold `.nilfs`, an empty regular
+    /// file (mkfs.nilfs2 2.0.0 to 2.2.9): it is fresh, as are its mount
+    /// points' roots with one. A `.nilfs` with something in it, or of
+    /// another type, is not what mkfs made. The mount points are made up
+    /// here, as above.
+    #[cfg(unix)]
+    #[test]
+    fn target_fresh_with_nilfs_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("d");
+        let mounts = std::cell::RefCell::new(Vec::<PathBuf>::new());
+        let device = |path: &std::path::Path, _: &std::fs::Metadata| {
+            let mounts = mounts.borrow();
+            let i = mounts.iter().position(|m| path.starts_with(m));
+            Some(i.map_or(0, |i| i as u64 + 1))
+        };
+        let fresh = |d: &std::path::Path| fresh_target_with(d, &device);
+        let nilfs = d.join(".nilfs");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(&nilfs, b"").unwrap();
+        assert!(fresh(&d), "an empty .nilfs only");
+        assert!(restore_target_is_fresh(&d), "an empty .nilfs only");
+
+        std::fs::write(&nilfs, b"x").unwrap();
+        assert!(!fresh(&d), ".nilfs with data");
+        assert!(!restore_target_is_fresh(&d), ".nilfs with data");
+        std::fs::remove_file(&nilfs).unwrap();
+        std::fs::create_dir(&nilfs).unwrap();
+        assert!(!fresh(&d), ".nilfs directory");
+        std::fs::remove_dir(&nilfs).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &nilfs).unwrap();
+        assert!(!fresh(&d), ".nilfs symlink");
+        std::fs::remove_file(&nilfs).unwrap();
+        std::fs::write(d.join(".nilfs2"), b"").unwrap();
+        assert!(!fresh(&d), "another name");
+        std::fs::remove_file(d.join(".nilfs2")).unwrap();
+
+        std::fs::write(&nilfs, b"").unwrap();
+        std::fs::create_dir(d.join("lost+found")).unwrap();
+        assert!(fresh(&d), ".nilfs and lost+found");
+        std::fs::remove_dir(d.join("lost+found")).unwrap();
+
+        // A mount point below, itself a new nilfs2 root.
+        let boot = d.join("boot");
+        std::fs::create_dir(&boot).unwrap();
+        mounts.borrow_mut().push(boot.clone());
+        assert!(fresh(&d), ".nilfs and a mount point");
+        std::fs::write(boot.join(".nilfs"), b"").unwrap();
+        assert!(fresh(&d), ".nilfs in the root and in a mount point");
+        std::fs::write(boot.join(".nilfs"), b"x").unwrap();
+        assert!(!fresh(&d), ".nilfs with data in a mount point");
+        std::fs::write(boot.join(".nilfs"), b"").unwrap();
+        std::fs::write(boot.join("f"), b"").unwrap();
+        assert!(!fresh(&d), "an empty file beside .nilfs");
+    }
+
     /// As root on Linux, with tmpfs mounts: a new root with /boot and
     /// /boot/efi mounted below it is fresh; an empty directory or a file
     /// on any of them is not.
@@ -1818,6 +1881,21 @@ mod tests {
             std::fs::create_dir(d.join("tmp")).unwrap();
             results.push(("empty directory beside boot", false, restore_target_is_fresh(d)));
             std::fs::remove_dir(d.join("tmp")).unwrap();
+            std::fs::write(d.join(".nilfs"), b"").unwrap();
+            std::fs::write(boot.join(".nilfs"), b"").unwrap();
+            results.push((
+                "empty .nilfs in the root and in boot",
+                true,
+                restore_target_is_fresh(d),
+            ));
+            std::fs::write(boot.join(".nilfs"), b"x").unwrap();
+            results.push((
+                "a .nilfs with data in boot",
+                false,
+                restore_target_is_fresh(d),
+            ));
+            std::fs::remove_file(boot.join(".nilfs")).unwrap();
+            std::fs::remove_file(d.join(".nilfs")).unwrap();
             results.push(("all removed", true, restore_target_is_fresh(d)));
             Some(results)
         })();

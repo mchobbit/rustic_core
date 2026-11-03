@@ -550,7 +550,12 @@ that either program restores what the other backed up.
 - A backup keeps the metadata of the directory it backs up (stock rustic
   stores it as a bare directory, mode 0755 and nothing else), so that
   restoring `SNAP:path` can give the destination that directory's metadata,
-  as BackOtter's rustic does. It goes by the name it's saved as
+  as BackOtter's rustic does, where the destination is fresh
+  (`restore_target_is_fresh`: it doesn't exist, or holds only mount
+  points, the directories on the path to them, and what mkfs or newfs
+  makes itself: a `lost+found` or `.snap` directory, a `.sujournal`
+  regular file, nilfs2's empty regular file `.nilfs`; rustic's
+  BACKOTTER.md has the whole rule). It goes by the name it's saved as
   (`--as-path`), and `/` still has no node, as in restic.
 - A regular file without a mode is restored with permissions 0000 where
   that is what it had: restic leaves a mode of 0 out of its JSON (and so
