@@ -986,12 +986,16 @@ Fixes from rustic_core's `main` after the 0.13.0 release, cherry-picked
 Dependencies (Cargo.lock only, semver-compatible, each to its first
 release that RustSec lists as patched): zstd 0.13.4, zstd-safe 7.4.0,
 zstd-sys 2.1.2 (still zstd 1.5.7: the same compressed bytes), rustls
-0.23.46, rustls-webpki 0.103.16, ctutils 0.4.4. Left: suppaftp 8 (FTP
-command injection, RUSTSEC-2026-0271), fixed only in suppaftp 10, which
-needs opendal 0.59 (upstream's #629), and rustic takes opendal through
-crates.io's rustic_backend 0.7.0; rsa 0.9 (RUSTSEC-2023-0071), which has
-no fix; quinn-proto, webpki-root-certs and h2, which rustic-bko doesn't
-build.
+0.23.46, rustls-webpki 0.103.16, ctutils 0.4.4. Also chacha20 0.10.2,
+as 0.10.1 is yanked: its SSE2 backend, the one picked when AVX2 is
+missing, runs SSE4.1's `_mm_extract_epi32` in the RNG that `rand::rng()`
+gives (each nonce, `Id::random`, key salts), so a CPU with neither (AMD
+K8/K10, Core 2 Merom/Conroe) can get SIGILL (RustCrypto/stream-ciphers
+#579, fixed by #580). Left: suppaftp 8 (FTP command injection,
+RUSTSEC-2026-0271), fixed only in suppaftp 10, which needs opendal 0.59
+(upstream's #629), and rustic takes opendal through crates.io's
+rustic_backend 0.7.0; rsa 0.9 (RUSTSEC-2023-0071), which has no fix;
+quinn-proto, webpki-root-certs and h2, which rustic-bko doesn't build.
 
 Not ported:
 
