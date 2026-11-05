@@ -587,10 +587,11 @@ that either program restores what the other backed up.
   rustic stamps a merge with its own version whatever was merged.
   `rewrite`, `copy` and `repair snapshots` keep each snapshot's own
   program version, as in stock rustic.
-- A hard link replaces whatever has its name already, as in BackOtter's
-  restic: the same link, where a restore is run again over its own result,
-  or another file. Stock rustic tried to link over it, failed (`EEXIST`)
-  and stopped there, leaving the rest of the metadata, the late flags pass
+- A hard link over an entry already at its name (upstream's #634, below):
+  the right link, where a restore is run again over its own result, is
+  left as it is; another file or a symlink is replaced; a directory is an
+  error. Stock rustic 0.13.0 tried to link over it, failed (`EEXIST`) and
+  stopped there, leaving the rest of the metadata, the late flags pass
   included, unset.
 - On restore, the project ID is set along with the extended attributes,
   ACLs after the mode, which rewrites NFSv4 ACLs, and file flags after
@@ -995,7 +996,9 @@ K8/K10, Core 2 Merom/Conroe) can get SIGILL (RustCrypto/stream-ciphers
 RUSTSEC-2026-0271), fixed only in suppaftp 10, which needs opendal 0.59
 (upstream's #629), and rustic takes opendal through crates.io's
 rustic_backend 0.7.0; rsa 0.9 (RUSTSEC-2023-0071), which has no fix;
-quinn-proto, webpki-root-certs and h2, which rustic-bko doesn't build.
+quinn-proto, webpki-root-certs and h2, which rustic-bko doesn't build;
+quick-xml 0.38 (RUSTSEC-2026-0194, -0195), which only rustic's
+self-update takes (its `release` feature, not built).
 
 Not ported:
 
