@@ -940,6 +940,79 @@ Not handled, as no BackOtter build needs it: on Windows, which isn't a
 BackOtter platform, a marked file is restored without holes: NTFS needs
 `FSCTL_SET_SPARSE`, which rustic doesn't set.
 
+## Upstream fixes after 0.13.0
+
+Fixes from rustic_core's `main` after the 0.13.0 release, cherry-picked
+(`git cherry-pick -x`, upstream's author kept) in version
+0.13.0+backotter.4; a rebase onto a release that has them drops them:
+
+- 52a1839 (#544) the cache backend is guarded by locks (a file read and
+  written by two threads at once).
+- c4059e3 (#548), d56cc4a (#630) a path that can't be canonicalized is
+  named in the error.
+- 35aef00 (#547) the local backend's delete hook runs when a file is
+  replaced. In `crates/backend`, which rustic-bko doesn't build: rustic
+  takes rustic_backend 0.7.0 from crates.io.
+- 9d9e478 (#546) tree workers stop once the receiver is gone.
+- d7e097c (#585) no underflow in `BlobLocation::data_length`.
+- 4589ea7 (#586) `repair snapshots` handles a file node without contents.
+- be62e24 (#588) a directory node without a subtree doesn't panic in
+  `ls`, the node streamer or `merge_nodes`.
+- 459bb53 (#589) no overflow in `BlobLocations::can_coalesce`.
+- f5b8fd6 (#591) `BlobCopier` checks a blob's offset and length.
+- 82b81d2 (#592) a key file with invalid or excessive scrypt parameters is
+  refused.
+- 0db92b6 (#607) tree loader threads are joined before the index goes.
+- b77ecc8 (#590) a restore refuses a node path that leaves the destination
+  (a `..`, root or prefix component). With conflicts: every path the
+  fork's restore code touches by itself (`write_sparse_at`, illumos' and
+  Haiku's extended attributes, `prepare_dir`, `prepare_file`, a
+  quarantined file's removal, hole filling, `set_metadata`'s osattrs calls
+  and the late flags) is checked the same way, through
+  `LocalDestination::path`. Other names, non-UTF-8 ones included, are
+  taken as they are.
+- fba52fa (#587) `prune` handles a directory node without a subtree.
+- 4c3d6fa (#633) `forget --keep-minutely` counts minutes within one hour.
+- 00bd025 (#632) a backup compares inode numbers with the parent's unless
+  `--ignore-inode` is given (stock compared them only with it), as restic
+  does: a file whose inode changed is read again.
+- 506a1da (#634) a restore's hard link over an entry already at its name:
+  the right link is left as it is, anything else but a directory
+  replaced. With conflicts: it takes the place of the fork's own fix
+  (remove whatever is there, then link, as BackOtter's restic does), and
+  also keeps the file when a symlinked directory makes both names one.
+- b583e92 (#602) `init_with_config` takes `is_hot` from the repository.
+
+Dependencies (Cargo.lock only, semver-compatible, each to its first
+release that RustSec lists as patched): zstd 0.13.4, zstd-safe 7.4.0,
+zstd-sys 2.1.2 (still zstd 1.5.7: the same compressed bytes), rustls
+0.23.46, rustls-webpki 0.103.16, ctutils 0.4.4. Left: suppaftp 8 (FTP
+command injection, RUSTSEC-2026-0271), fixed only in suppaftp 10, which
+needs opendal 0.59 (upstream's #629), and rustic takes opendal through
+crates.io's rustic_backend 0.7.0; rsa 0.9 (RUSTSEC-2023-0071), which has
+no fix; quinn-proto, webpki-root-certs and h2, which rustic-bko doesn't
+build.
+
+Not ported:
+
+- e01b17f (#553) iOS build: no BackOtter platform.
+- ca81cfe (#549), e574765 (#552) documentation only.
+- b7ab1ee (#556) more reqwest options for the rest and OpenDAL backends:
+  a feature, and breaking.
+- 6fa7b56 (#559) Serialize, Deserialize and Merge for `ConfigOptions`: a
+  feature.
+- e97a7dc (#562) OpenDAL retries logged on one line: a feature.
+- b78f648 (#561) unreadable source files counted in the summary: a
+  feature, which changes the snapshot summary.
+- 647d00f (#563) backup paths no longer merged into their parents: a
+  breaking change of behaviour.
+- 4871132 (#629) clippy fixes and dependency updates: breaking (removes
+  `Node`'s and `IndexEntry`'s constructors); its advisory fixes are
+  covered above.
+- e2b61aa (#558) HTTP transport options renamed with `http-`: breaking.
+- 9565d4f (#580) type parameters tidied in `commands/backup`: no fix.
+- eb72c72 (#598) a read timeout for HTTP backends: a feature.
+
 ## Moving to a new rustic_core release
 
     git fetch upstream --tags
