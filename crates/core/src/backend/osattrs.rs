@@ -483,31 +483,10 @@ pub(crate) fn preallocate(f: &File, len: u64) {
 fn os_preallocate(f: &File, len: u64) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
-    // On btrfs and bcachefs only a no-copy-on-write file (a swap file):
-    // they never compress what fallocate(2) allocated, so a restore onto a
-    // compressing mount (compress=zstd) would need every file's full size,
-    // and may not fit where the source did. A NOCOW file isn't compressed
-    // anyway, and is allocated here as everywhere (a swap file must have no
-    // holes).
-    const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
-    const BCACHEFS_SUPER_MAGIC: u64 = 0xca45_1a4e;
-    const FS_IOC_GETFLAGS: u64 = 0x8008_6601;
-    const FS_NOCOW_FL: libc::c_int = 0x0080_0000;
-    // SAFETY: a statfs is plain data, for fstatfs(2) to fill in.
-    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: f is an open file and st a statfs to fill.
-    if unsafe { libc::fstatfs(f.as_raw_fd(), &raw mut st) } == 0 {
-        #[allow(clippy::unnecessary_cast, trivial_numeric_casts)]
-        let magic = (st.f_type as u64) & 0xffff_ffff;
-        if magic == BTRFS_SUPER_MAGIC || magic == BCACHEFS_SUPER_MAGIC {
-            let mut flags: libc::c_int = 0;
-            // SAFETY: FS_IOC_GETFLAGS writes an int.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, trivial_numeric_casts)]
-            let got = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_GETFLAGS as _, &raw mut flags) };
-            if got != 0 || flags & FS_NOCOW_FL == 0 {
-                return Ok(());
-            }
-        }
+    // Not on btrfs but for a NOCOW file, nor on bcachefs: they never
+    // compress what fallocate(2) allocated (sparse::allocates_type).
+    if !sparse::allocates_on(f) {
+        return Ok(());
     }
     let len = libc::off_t::try_from(len).map_err(io::Error::other)?;
     loop {
@@ -570,7 +549,8 @@ pub(crate) struct FilledHoles {
 /// `SEEK_HOLE` (where there is one) finds a hole, is opened for writing, so
 /// that a file without holes (most, and those a file system compresses)
 /// gets no close-write event, and a running program no `ETXTBSY`. On Linux
-/// `fallocate(2)` fills them, except on ZFS. Elsewhere nothing is done, as
+/// `fallocate(2)` fills them, except on ZFS, on btrfs but for a NOCOW file,
+/// and on bcachefs (`sparse::allocates_type`). Elsewhere nothing is done, as
 /// in BackOtter's restic: macOS's `F_PREALLOCATE` only adds space past the
 /// end of a file, and nothing is written into a file whose contents are
 /// right already.
