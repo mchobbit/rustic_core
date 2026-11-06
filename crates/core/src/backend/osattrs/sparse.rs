@@ -137,7 +137,15 @@ fn fs_type(f: &File) -> Option<u32> {
     }
     // SAFETY: fstatfs succeeded.
     let st = unsafe { st.assume_init() };
-    u32::try_from(st.f_type).ok()
+    // Its low 32 bits: f_type is a signed 32-bit word on 32-bit glibc, where
+    // btrfs's and bcachefs's magic numbers (bit 31 set) come out negative.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::unnecessary_cast,
+        trivial_numeric_casts
+    )]
+    Some(st.f_type as u32)
 }
 
 /// statfs(2)'s `f_type` of ZFS (`ZFS_SUPER_MAGIC`).
