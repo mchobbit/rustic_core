@@ -995,6 +995,11 @@ Fixes from rustic_core's `main` after the 0.13.0 release, cherry-picked
   (remove whatever is there, then link, as BackOtter's restic does), and
   also keeps the file when a symlinked directory makes both names one.
 - b583e92 (#602) `init_with_config` takes `is_hot` from the repository.
+- 01fe284 (#640) the OpenDAL backend passes on an error from checking for
+  the config file instead of taking it as "no repository". Taken after
+  0.13.0+backotter.5 with no new version: it is in `crates/backend`, which
+  rustic-bko doesn't build (rustic takes rustic_backend 0.7.0 from
+  crates.io), so rustic-bko is unchanged by it.
 
 Dependencies (Cargo.lock only, semver-compatible, each to its first
 release that RustSec lists as patched): zstd 0.13.4, zstd-safe 7.4.0,
@@ -1031,6 +1036,7 @@ Not ported:
 - e2b61aa (#558) HTTP transport options renamed with `http-`: breaking.
 - 9565d4f (#580) type parameters tidied in `commands/backup`: no fix.
 - eb72c72 (#598) a read timeout for HTTP backends: a feature.
+- 18fa55c (#642) a connect timeout for HTTP backends: a feature.
 
 ## Moving to a new rustic_core release
 
