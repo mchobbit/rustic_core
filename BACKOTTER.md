@@ -329,7 +329,13 @@ that either program restores what the other backed up.
 - Every other file is allocated in full: a new file, or an existing one the
   restore writes into (cut to length first, if longer), is preallocated
   when it is sized (`fallocate(2)` on Linux, `F_PREALLOCATE` on macOS, as
-  restic does; nothing elsewhere), and gets every byte, zeros included. An
+  restic does; nothing elsewhere), and gets every byte, zeros included.
+  On btrfs and bcachefs only a no-copy-on-write file (`C`, a swap file) is
+  preallocated (`fstatfs(2)`, then `FS_IOC_GETFLAGS`): they never compress
+  what `fallocate(2)` allocated, so a restore onto a compressing mount
+  (`compress=zstd`) would need every file's full size and may not fit where
+  the source did. A NOCOW file isn't compressed anyway, and gets its
+  flags when it is created, before it is sized. An
   existing file left as it is, of the right contents, has its holes
   allocated on Linux (a swap file left with holes by an
   interrupted restore), only where the snapshot says it had none: a
@@ -351,7 +357,8 @@ that either program restores what the other backed up.
   zeros as holes, so that such a file would be opened for writing at every
   restore for nothing; a file system that can't allocate (`fallocate(2)`
   failing with `EOPNOTSUPP` or `ENOSYS`: ext4 on an ext3-format file's
-  indirect blocks, older ZFS) is nothing to do, as in BackOtter's restic. A
+  indirect blocks, older ZFS) is nothing to do, as in BackOtter's restic.
+  On btrfs and bcachefs only a NOCOW file's holes are filled, as above. A
   file whose holes were filled counts as modified, not unchanged, and so
   does one that got blocks from a fill that then failed (`ENOSPC` once the
   file system has allocated part of it: its blocks are looked at again
