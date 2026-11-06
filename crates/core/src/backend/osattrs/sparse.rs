@@ -154,11 +154,62 @@ fn fills_holes_type(f_type: u32) -> bool {
     f_type != ZFS_SUPER_MAGIC
 }
 
-/// Whether holes of the file `f` can be filled ([`fills_holes_type`]);
-/// where the file system can't be told, they are tried.
+/// statfs(2)'s `f_type` of btrfs (`BTRFS_SUPER_MAGIC`).
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+const BTRFS_SUPER_MAGIC: u32 = 0x9123_683e;
+
+/// statfs(2)'s `f_type` of bcachefs (`BCACHEFS_SUPER_MAGIC`).
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+const BCACHEFS_SUPER_MAGIC: u32 = 0xca45_1a4e;
+
+/// btrfs's no-copy-on-write file flag (`FS_NOCOW_FL`, `C`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const FS_NOCOW_FL: u32 = 0x0080_0000;
+
+/// Whether `fallocate(2)` is to allocate a file (preallocate it, or fill its
+/// holes) on the file system whose statfs(2) `f_type` is `f_type`, `nocow`
+/// telling whether the file has btrfs's no-copy-on-write flag: not on btrfs
+/// but for a NOCOW file (a swap file), and never on bcachefs. Neither
+/// compresses what `fallocate(2)` allocated, so a restore onto a compressing
+/// mount (`compress=zstd`) would need every file's full size, and might not
+/// fit where the source did. A NOCOW file isn't compressed anyway, and a
+/// swap file must have no holes. bcachefs's no-copy-on-write is an inode
+/// option, not a file flag, and it has no swap files.
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn allocates_type(f_type: u32, nocow: impl FnOnce() -> bool) -> bool {
+    match f_type {
+        BTRFS_SUPER_MAGIC => nocow(),
+        BCACHEFS_SUPER_MAGIC => false,
+        _ => true,
+    }
+}
+
+/// Whether `fallocate(2)` is to allocate the file `f` ([`allocates_type`]);
+/// where the file system can't be told, it is.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(super) fn allocates_on(f: &File) -> bool {
+    fs_type(f).is_none_or(|t| allocates_type(t, || is_nocow(f)))
+}
+
+/// Whether the file `f` has btrfs's no-copy-on-write flag; not if
+/// `FS_IOC_GETFLAGS` fails.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn is_nocow(f: &File) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let mut flags: libc::c_int = 0;
+    // SAFETY: FS_IOC_GETFLAGS writes an int to the pointer.
+    let got = unsafe { libc::ioctl(f.as_raw_fd(), libc::FS_IOC_GETFLAGS, &raw mut flags) };
+    got == 0 && u32::from_ne_bytes(flags.to_ne_bytes()) & FS_NOCOW_FL != 0
+}
+
+/// Whether holes of the file `f` can be filled: [`fills_holes_type`], and
+/// [`allocates_type`], so that a file whose holes wouldn't be filled isn't
+/// opened for writing, nor counted as modified by `--dry-run`; where the
+/// file system can't be told, they are tried.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn fills_holes_on(f: &File) -> bool {
-    fs_type(f).is_none_or(fills_holes_type)
+    fs_type(f).is_none_or(|t| fills_holes_type(t) && allocates_type(t, || is_nocow(f)))
 }
 
 /// The offset of the first hole in the regular file `f`, which is its size
@@ -634,7 +685,8 @@ pub(super) fn holes_to_fill(path: &Path, len: u64) -> bool {
 /// [`fill_holes`] fills, with its lstat if so: it has fewer blocks than
 /// bytes, and then, opened for reading only, `SEEK_HOLE` finds a hole (a
 /// file on a file system that compresses has few blocks and no holes).
-/// Never on ZFS ([`fills_holes_type`]). A file with all its blocks (most)
+/// Never on ZFS, nor on btrfs but for a NOCOW file, nor on bcachefs
+/// ([`fills_holes_on`]). A file with all its blocks (most)
 /// is only lstat'ed.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn file_holes(path: &Path, len: u64) -> io::Result<Option<Metadata>> {
@@ -646,7 +698,8 @@ fn file_holes(path: &Path, len: u64) -> io::Result<Option<Metadata>> {
     // Fewer blocks than bytes (holes, or a file system that compresses):
     // SEEK_HOLE tells, on the file opened for reading only.
     let probe = open(path, &m)?;
-    // Never on ZFS, where nothing is allocated (fills_holes_type).
+    // Never on ZFS, where nothing is allocated, nor where nothing is to be
+    // (fills_holes_on).
     if !fills_holes_on(&probe) {
         return Ok(None);
     }
@@ -742,7 +795,7 @@ mod tests {
             return;
         };
         if !fills_holes_on(&File::open(&path).unwrap()) {
-            eprintln!("ZFS: no holes filled in {}", dir.path().display());
+            eprintln!("ZFS, btrfs or bcachefs: no holes filled in {}", dir.path().display());
             assert!(!holes_to_fill(&path, len));
             return;
         }
@@ -944,6 +997,23 @@ mod tests {
         }
     }
 
+    /// btrfs allocates only a NOCOW file, bcachefs none, the others every
+    /// file (ZFS too: holes are left alone there by `fills_holes_type`).
+    #[test]
+    fn allocates_types() {
+        for (name, f_type, nocow, want) in [
+            ("btrfs", 0x9123_683e, false, false),
+            ("btrfs NOCOW", 0x9123_683e, true, true),
+            ("bcachefs", 0xca45_1a4e, false, false),
+            ("bcachefs nocow", 0xca45_1a4e, true, false),
+            ("ext4", 0xef53, false, true),
+            ("XFS", 0x5846_5342, false, true),
+            ("ZFS", 0x2fc1_2fc1, false, true),
+        ] {
+            assert_eq!(allocates_type(f_type, || nocow), want, "{name}");
+        }
+    }
+
     /// `BKO_TEST_ZFS_DIR` names a directory on ZFS with compression: a file
     /// whose zero records ZFS keeps as holes is left alone, not opened for
     /// writing (it is read-only, which fails as anyone but root), and not
@@ -970,6 +1040,54 @@ mod tests {
         let filled = fill_holes(&path, len);
         assert!(filled.error.is_none(), "{:?}", filled.error);
         assert!(!filled.changed);
+    }
+
+    /// `BKO_TEST_BTRFS_DIR` names a directory on btrfs: a file is only sized
+    /// by `preallocate`, and its holes are neither filled nor counted; a
+    /// NOCOW file (`chattr +C`) is allocated, and its holes filled.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn btrfs_allocates_only_nocow() {
+        let Some(dir) = std::env::var_os("BKO_TEST_BTRFS_DIR") else {
+            eprintln!("BKO_TEST_BTRFS_DIR not set");
+            return;
+        };
+        let dir = tempfile::tempdir_in(dir).unwrap();
+        let len: u64 = 4 << 20;
+        let create = |name: &str, nocow: bool| {
+            let path = dir.path().join(name);
+            let f = File::create_new(&path).unwrap();
+            if nocow {
+                let out = std::process::Command::new("chattr").arg("+C").arg(&path).output().unwrap();
+                assert!(out.status.success(), "chattr +C: {out:?}");
+            }
+            f.set_len(len).unwrap();
+            (path, f)
+        };
+        let blocks = |path: &Path| std::fs::metadata(path).unwrap().blocks();
+
+        let (plain, f) = create("plain", false);
+        assert_eq!(fs_type(&f), Some(BTRFS_SUPER_MAGIC), "not btrfs");
+        assert!(!allocates_on(&f));
+        super::super::preallocate(&f, len);
+        assert!(maybe_sparse(len, blocks(&plain)), "plain file preallocated");
+        assert!(!holes_to_fill(&plain, len));
+        let filled = fill_holes(&plain, len);
+        assert!(filled.error.is_none(), "{:?}", filled.error);
+        assert!(!filled.changed);
+        assert!(maybe_sparse(len, blocks(&plain)), "plain file's holes filled");
+
+        let (nocow, f) = create("nocow", true);
+        assert!(allocates_on(&f));
+        assert!(holes_to_fill(&nocow, len));
+        let filled = fill_holes(&nocow, len);
+        assert!(filled.error.is_none(), "{:?}", filled.error);
+        assert!(filled.changed);
+        assert!(!maybe_sparse(len, blocks(&nocow)), "NOCOW file's holes not filled");
+
+        let (pre, f) = create("nocow-preallocated", true);
+        super::super::preallocate(&f, len);
+        assert!(!maybe_sparse(len, blocks(&pre)), "NOCOW file not preallocated");
     }
 
     // On JFS and nilfs2, SEEK_HOLE finds no hole before the size, so the
