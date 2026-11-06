@@ -337,7 +337,9 @@ that either program restores what the other backed up.
   fit where the source did. A NOCOW file isn't compressed anyway, and gets
   its flag when it is created, before it is sized; bcachefs's
   no-copy-on-write is an inode option, not a file flag, and it has no swap
-  files. The file still gets every byte, so it has no holes either way. An
+  files. A new file still gets every byte, so it has no holes either way;
+  one the restore writes into keeps any hole that a blob of zeros already
+  matched (an interrupted restore's), where nothing allocates it. An
   existing file left as it is, of the right contents, has its holes
   allocated on Linux (a swap file left with holes by an
   interrupted restore), only where the snapshot says it had none: a
