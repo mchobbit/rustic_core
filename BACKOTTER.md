@@ -566,7 +566,10 @@ that either program restores what the other backed up.
   (`restore_target_is_fresh`: it doesn't exist, or holds only mount
   points, the directories on the path to them, and what mkfs or newfs
   makes itself: a `lost+found` or `.snap` directory, a `.sujournal`
-  regular file, nilfs2's empty regular file `.nilfs`; never one that
+  regular file, nilfs2's empty regular file `.nilfs`, and on Haiku the
+  empty `trash` directory its Tracker makes on every volume as it is
+  mounted, a new one too, without which a restored BFS root kept mkfs's
+  metadata and the time its last entry was made; never one that
   exists and is sticky or that others may write in, mode bits 01000 or
   0002, even an empty one such as /tmp or /dev/shm; rustic's
   BACKOTTER.md has the whole rule). It goes by the name it's saved as

@@ -161,7 +161,8 @@ impl SnapshotOrigin {
 /// - (a) an entry a file system makes itself ([`made_by_file_system`]:
 ///   `lost+found`, a directory; FreeBSD UFS's `.snap`, a directory, and
 ///   `.sujournal`, a regular file; nilfs2's `.nilfs`, an empty regular
-///   file), whatever it holds;
+///   file), whatever it holds; on Haiku also the empty `trash` directory
+///   its Tracker makes on every volume mounted ([`made_by_tracker`]);
 /// - (b) a directory that is a mount point: its device (`st_dev`) differs
 ///   from its parent's. That is also a ZFS dataset's and a btrfs
 ///   subvolume's root, which have devices of their own. What it holds
@@ -256,7 +257,7 @@ fn fresh_dir(
         let path = entry.ok()?.path();
         // Doesn't follow a symlink; does see what is mounted on `path`.
         let meta = std::fs::symlink_metadata(&path).ok()?;
-        if made_by_file_system(path.file_name()?, &meta) {
+        if made_by_file_system(path.file_name()?, &meta) || made_by_tracker(&path, &meta) {
             continue;
         }
         if !meta.is_dir() {
@@ -285,6 +286,25 @@ fn made_by_file_system(name: &std::ffi::OsStr, meta: &std::fs::Metadata) -> bool
     (file_type.is_dir() && (name == "lost+found" || name == ".snap"))
         || (file_type.is_file() && name == ".sujournal")
         || (file_type.is_file() && name == ".nilfs" && meta.len() == 0)
+}
+
+/// BackOtter: whether the entry `path`, with the (`lstat`) metadata
+/// `meta`, is the `trash` directory that Haiku's Tracker makes, empty, on
+/// every BFS volume as soon as it is mounted, a new one too (a Haiku
+/// rescuer runs the desktop): on Haiku only, where a new file system's
+/// root would otherwise never be fresh, and the restore would leave it
+/// mkfs's metadata and the time of its last entry's creation. One that
+/// holds anything, or isn't a directory, isn't Tracker's alone.
+fn made_by_tracker(path: &std::path::Path, meta: &std::fs::Metadata) -> bool {
+    cfg!(target_os = "haiku") && empty_trash(path, meta)
+}
+
+/// Whether `path`, with the (`lstat`) metadata `meta`, is an empty
+/// directory named `trash` ([`made_by_tracker`], on any system).
+fn empty_trash(path: &std::path::Path, meta: &std::fs::Metadata) -> bool {
+    meta.is_dir()
+        && path.file_name() == Some(std::ffi::OsStr::new("trash"))
+        && std::fs::read_dir(path).is_ok_and(|mut dir| dir.next().is_none())
 }
 
 /// Which files to restore sparse (BackOtter: new files that had holes are,
@@ -1861,6 +1881,55 @@ mod tests {
         std::fs::write(boot.join(".nilfs"), b"").unwrap();
         std::fs::write(boot.join("f"), b"").unwrap();
         assert!(!fresh(&d), "an empty file beside .nilfs");
+    }
+
+    /// Haiku's Tracker puts an empty `trash` directory on every volume it
+    /// sees mounted, a new one too: on Haiku that root is fresh, as with
+    /// lost+found, elsewhere not; a `trash` with something in it, or of
+    /// another type, or another name, is not Tracker's alone anywhere.
+    #[cfg(unix)]
+    #[test]
+    fn target_fresh_with_tracker_trash() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("d");
+        let trash = d.join("trash");
+        let lstat = |p: &std::path::Path| std::fs::symlink_metadata(p).unwrap();
+        std::fs::create_dir_all(&trash).unwrap();
+        assert!(empty_trash(&trash, &lstat(&trash)));
+        assert_eq!(
+            restore_target_is_fresh(&d),
+            cfg!(target_os = "haiku"),
+            "an empty trash only"
+        );
+        std::fs::create_dir(d.join("lost+found")).unwrap();
+        assert_eq!(
+            restore_target_is_fresh(&d),
+            cfg!(target_os = "haiku"),
+            "with lost+found"
+        );
+        std::fs::remove_dir(d.join("lost+found")).unwrap();
+
+        std::fs::write(trash.join("f"), b"").unwrap();
+        assert!(!empty_trash(&trash, &lstat(&trash)), "trash with a file");
+        assert!(!restore_target_is_fresh(&d), "trash with a file");
+        std::fs::remove_file(trash.join("f")).unwrap();
+        std::fs::remove_dir(&trash).unwrap();
+
+        std::fs::write(&trash, b"").unwrap();
+        assert!(!empty_trash(&trash, &lstat(&trash)), "trash a file");
+        assert!(!restore_target_is_fresh(&d), "trash a file");
+        std::fs::remove_file(&trash).unwrap();
+        // To an empty directory, so following it would accept it.
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        std::os::unix::fs::symlink(&empty, &trash).unwrap();
+        assert!(!empty_trash(&trash, &lstat(&trash)), "trash symlink");
+        assert!(!restore_target_is_fresh(&d), "trash symlink");
+        std::fs::remove_file(&trash).unwrap();
+        let other = d.join("Trash");
+        std::fs::create_dir(&other).unwrap();
+        assert!(!empty_trash(&other, &lstat(&other)), "another name");
+        assert!(!restore_target_is_fresh(&d), "another name");
     }
 
     /// As root on Linux, with tmpfs mounts: a new root with /boot and
