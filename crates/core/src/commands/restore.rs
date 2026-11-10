@@ -1280,7 +1280,7 @@ fn set_metadata(
     let set_attributes = |tally: &mut RestoreTally| {
         // BackOtter: stock rustic's names on FreeBSD and NetBSD
         // (`user.NAME`) in any snapshot not BackOtter's.
-        dest.set_extended_attributes(path, &node.meta.extended_attributes, !known_bko)
+        dest.set_extended_attributes_all(path, &node.meta.extended_attributes, !known_bko, opts.exact)
             .unwrap_or_else(|err| {
                 warn!(
                     "restore {}: setting extended attributes failed: {err}",
