@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use std::{
+    cell::Cell,
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
@@ -343,6 +344,72 @@ pub struct RestoreStats {
     pub files: FileDirStats,
     /// directory statistics
     pub dirs: FileDirStats,
+    /// BackOtter: failures while collecting and preparing (walking the
+    /// destination for `--delete`, removing what `--delete` or a node of
+    /// another type wants gone, flags that go on before entries or
+    /// contents), warned about each, which BackOtter's restic counts as
+    /// errors (exit 1)
+    pub errors: u64,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+#[non_exhaustive]
+/// BackOtter: what restoring a plan couldn't do and only warned about:
+/// metadata not set for a reason other than the target not supporting it,
+/// special files not made. BackOtter's restic counts each as an error (exit
+/// 1).
+pub struct RestoreOutcome {
+    /// Number of such failures
+    pub errors: u64,
+}
+
+/// BackOtter: the failures of setting metadata that the restore warns about
+/// and BackOtter's restic counts as errors (exit 1), by the same rules
+/// (`osattrs::restore_error_counts`, `LocalDestination::error_counts`).
+#[derive(Debug)]
+struct RestoreTally {
+    /// How many.
+    errors: u64,
+    /// Whether the restore runs as root.
+    root: bool,
+}
+
+impl RestoreTally {
+    fn new() -> Self {
+        Self {
+            errors: 0,
+            root: osattrs::is_root(),
+        }
+    }
+
+    /// Warns about `err` restoring the metadata of `path`
+    /// (`osattrs::warn_restore`), and counts it if restic would;
+    /// `not_root_ok` for the steps restic's restore not running as root
+    /// doesn't count a permission refused for.
+    fn io(&mut self, path: &std::path::Path, err: &std::io::Error, not_root_ok: bool) {
+        osattrs::warn_restore(path, err);
+        self.count(err, not_root_ok);
+    }
+
+    /// Counts `err`, warned about already, if restic would.
+    fn count(&mut self, err: &std::io::Error, not_root_ok: bool) {
+        if osattrs::restore_error_counts(err, not_root_ok, self.root) {
+            self.errors += 1;
+        }
+    }
+
+    /// Counts `err`, from the destination and warned about already, if
+    /// restic would.
+    fn dest(&mut self, err: &local_destination::LocalDestinationErrorKind) {
+        if LocalDestination::error_counts(err, self.root) {
+            self.errors += 1;
+        }
+    }
+
+    /// Counts a failure restic always counts (a special file not made).
+    const fn always(&mut self) {
+        self.errors += 1;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -369,13 +436,17 @@ struct HardlinkKey {
 /// # Errors
 ///
 /// * If the restore failed.
+///
+/// # Returns
+///
+/// BackOtter: what it couldn't do and only warned about ([`RestoreOutcome`]).
 pub(crate) fn restore_repository<S: IndexedTree>(
     file_infos: RestorePlan,
     repo: &Repository<S>,
     opts: RestoreOptions,
     node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
     dest: &LocalDestination,
-) -> RusticResult<()> {
+) -> RusticResult<RestoreOutcome> {
     repo.warm_up_wait(file_infos.to_packs().into_iter())?;
     let failed = restore_contents(
         repo,
@@ -388,7 +459,7 @@ pub(crate) fn restore_repository<S: IndexedTree>(
     )?;
 
     let p = repo.progress_spinner("setting metadata...");
-    restore_metadata(
+    let errors = restore_metadata(
         without_sockets(node_streamer),
         &file_infos.hardlink_candidates,
         opts,
@@ -406,7 +477,7 @@ pub(crate) fn restore_repository<S: IndexedTree>(
         .attach_context("count", failed.to_string()));
     }
 
-    Ok(())
+    Ok(RestoreOutcome { errors })
 }
 
 /// Collect restore information, scan existing files, create needed dirs and remove superfluous files
@@ -449,12 +520,35 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
     let mut stats = RestoreStats::default();
     let mut restore_infos = RestorePlan::default();
     let mut additional_existing = false;
+    // BackOtter: failures restic counts as errors (RestoreStats::errors); a
+    // Cell, as the closures below borrow parts of `stats` already.
+    let errors = Cell::new(0_u64);
+    let count = || errors.set(errors.get() + 1);
+    let root = osattrs::is_root();
+    // BackOtter: flags that go on before entries or contents, which count
+    // unless the file system doesn't support them.
+    let prepare_failed = |path: &PathBuf, err: &std::io::Error| {
+        warn!("restore {}: {err}", path.display());
+        if osattrs::restore_error_counts(err, false, root) {
+            count();
+        }
+    };
 
     let next_entry = |walker: &mut walkdir::IntoIter| -> Option<DirEntry> {
         walker
             .inspect(|r| {
                 if let Err(err) = r {
                     error!("Error during collection of files: {err:?}");
+                    // BackOtter: restic walks the destination only for
+                    // --delete, and fails then; a destination that isn't
+                    // there yet holds nothing to delete.
+                    let missing_root = err.depth() == 0
+                        && err
+                            .io_error()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+                    if opts.delete && !missing_root {
+                        count();
+                    }
                 }
             })
             .find_map(Result::ok)
@@ -493,11 +587,13 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                 (true, false, true) => {
                     if let Err(err) = dest.remove_dir(entry.path()) {
                         error!("error removing {}: {err}", entry.path().display());
+                        count();
                     }
                 }
                 (true, false, false) => {
                     if let Err(err) = dest.remove_file(entry.path()) {
                         error!("error removing {}: {err}", entry.path().display());
+                        count();
                     }
                 }
                 (false, _, _) => {
@@ -537,7 +633,10 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         std::fs::remove_dir(entry.path()).map_err(|err| err.to_string())
                     }
                 }
-                .map_err(|err| error!("error removing {}: {err}", entry.path().display()))
+                .map_err(|err| {
+                    error!("error removing {}: {err}", entry.path().display());
+                    count();
+                })
                 .is_ok()
             };
             if is_dir {
@@ -576,7 +675,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         && std::fs::read_dir(&target).is_ok_and(|mut dir| dir.next().is_none())
                         && let Err(err) = osattrs::prepare_dir(&target, node, known_bko)
                     {
-                        warn!("restore {}: {err}", path.display());
+                        prepare_failed(path, &err);
                     }
                 } else {
                     stats.dirs.restore += 1;
@@ -599,7 +698,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         // what it inherited.
                         if let Err(err) = osattrs::prepare_dir(&target, node, known_bko)
                         {
-                            warn!("restore {}: {err}", path.display());
+                            prepare_failed(path, &err);
                         }
                     }
                 }
@@ -632,6 +731,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         && let Err(err) = std::fs::remove_file(&target)
                     {
                         warn!("restore {}: {err}", path.display());
+                        count();
                     }
                 }
                 // BackOtter: whether the file goes into a new, empty file,
@@ -710,7 +810,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         if !dry_run
                             && let Err(err) = osattrs::prepare_file(&target, node)
                         {
-                            warn!("restore {}: {err}", path.display());
+                            prepare_failed(path, &err);
                         }
                     }
                 }
@@ -786,6 +886,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
         warn!("Note: additional entries exist in destination");
     }
 
+    stats.errors = errors.get();
     restore_infos.stats = stats;
     p.finish();
 
@@ -818,12 +919,18 @@ fn without_sockets(
 /// # Errors
 ///
 /// * If the restore failed.
+///
+/// # Returns
+///
+/// BackOtter: how many failures it warned about that BackOtter's restic
+/// counts as errors (exit 1).
 fn restore_metadata(
     mut node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
     hardlink_candidates: &BTreeMap<HardlinkKey, PathBuf>,
     opts: RestoreOptions,
     dest: &LocalDestination,
-) -> RusticResult<()> {
+) -> RusticResult<u64> {
+    let mut tally = RestoreTally::new();
     // BackOtter: file flags go on last of all (osattrs), once per file:
     // they belong to the file, not each of its names, and an immutable file
     // (on illumos) refuses having them set again. ZFS's DOS flags (Linux)
@@ -831,7 +938,7 @@ fn restore_metadata(
     let mut file_flags = Vec::new();
     let mut flags_linked = BTreeSet::new();
     let mut finish = |path: &PathBuf, node: &Node| {
-        let made = set_metadata(dest, opts, path, node);
+        let made = set_metadata(dest, opts, path, node, &mut tally);
         let late = LateAttrs {
             flags: osattrs::file_flags(node),
             dos_flags: osattrs::zfs_dos_flags(node),
@@ -901,29 +1008,31 @@ fn restore_metadata(
         let Ok(target) = dest.path(&path) else {
             continue;
         };
+        // BackOtter: these count as errors as root and not (restic's late
+        // flags pass), unless the file system doesn't support them.
         if let Some(attrs) = late.fat_attrs {
             osattrs::restore_fat_attrs(&target, &node_type, attrs)
-                .unwrap_or_else(|err| osattrs::warn_restore(&path, &err));
+                .unwrap_or_else(|err| tally.io(&path, &err, false));
         }
         if let Some(opts) = &late.xfs_options {
             osattrs::restore_xfs_options(&target, &node_type, opts)
-                .unwrap_or_else(|err| osattrs::warn_restore(&path, &err));
+                .unwrap_or_else(|err| tally.io(&path, &err, false));
         }
         let (flags, dos_flags) = (late.flags, late.dos_flags);
         if let Some(dos_flags) = dos_flags {
             osattrs::restore_zfs_dos_flags(&target, &node_type, dos_flags)
-                .unwrap_or_else(|err| osattrs::warn_restore(&path, &err));
+                .unwrap_or_else(|err| tally.io(&path, &err, false));
         }
         if let Some(flags) = flags {
             osattrs::restore_file_flags(&target, &node_type, flags, &xattrs)
-                .unwrap_or_else(|err| osattrs::warn_restore(&path, &err));
+                .unwrap_or_else(|err| tally.io(&path, &err, false));
         }
     }
     // BackOtter: how many files had metadata the file system doesn't
     // support, warned about once.
     osattrs::report_unsupported();
 
-    Ok(())
+    Ok(tally.errors)
 }
 
 /// BackOtter: the metadata the restore sets last, once every file has
@@ -1035,13 +1144,15 @@ fn hardlink_key(node: &Node) -> Option<HardlinkKey> {
 ///
 /// BackOtter: false if the node is a special file that couldn't be made,
 /// which then gets nothing else, as in BackOtter's restic: one warning for
-/// it (restic reports an error), not one more for each step after.
+/// it (restic reports an error), not one more for each step after. Each
+/// failure BackOtter's restic counts as an error is counted in `tally`.
 // TODO: Return a result here, introduce errors and get rid of logging.
-pub(crate) fn set_metadata(
+fn set_metadata(
     dest: &LocalDestination,
     opts: RestoreOptions,
     path: &PathBuf,
     node: &Node,
+    tally: &mut RestoreTally,
 ) -> bool {
     debug!("setting metadata for {}", path.display());
     if let Err(err) = dest.create_special(path, node) {
@@ -1049,6 +1160,7 @@ pub(crate) fn set_metadata(
             "restore {}: creating special file failed: {err}",
             path.display()
         );
+        tally.always();
         return false;
     }
     // BackOtter: by name, unless numeric ids are asked for (--numeric-id);
@@ -1061,7 +1173,9 @@ pub(crate) fn set_metadata(
     let Ok(target) = dest.path(path) else {
         return false;
     };
-    let chown_failed = |what: &str, err: &local_destination::LocalDestinationErrorKind| {
+    let chown_failed = |what: &str,
+                        err: &local_destination::LocalDestinationErrorKind,
+                        tally: &mut RestoreTally| {
         if LocalDestination::chown_refused_not_root(err) {
             debug!(
                 "not running as root, {} of {} not set: {err}",
@@ -1070,25 +1184,25 @@ pub(crate) fn set_metadata(
             );
         } else {
             warn!("restore {}: setting {what} failed.", path.display());
+            tally.dest(err);
         }
     };
     match ownership(opts) {
         Ownership::None => {}
         Ownership::Numeric => dest
             .set_uid_gid(path, &node.meta)
-            .unwrap_or_else(|err| chown_failed("UID/GID", &err)),
+            .unwrap_or_else(|err| chown_failed("UID/GID", &err, tally)),
         Ownership::ByName => dest
             .set_user_group(path, &node.meta)
-            .unwrap_or_else(|err| chown_failed("User/Group", &err)),
+            .unwrap_or_else(|err| chown_failed("User/Group", &err, tally)),
     }
     if ownership(opts) != Ownership::None {
-        osattrs::restore_owner(&target, node)
-            .unwrap_or_else(|err| osattrs::warn_restore(path, &err));
+        osattrs::restore_owner(&target, node).unwrap_or_else(|err| tally.io(path, &err, true));
     }
     // BackOtter: the attributes osattrs keeps; ACLs after the mode. One
     // warning naming each attribute not set, and its error.
     let known_bko = opts.origin.known_bko();
-    let set_attributes = || {
+    let set_attributes = |tally: &mut RestoreTally| {
         // BackOtter: stock rustic's names on FreeBSD and NetBSD
         // (`user.NAME`) in any snapshot not BackOtter's.
         dest.set_extended_attributes(path, &node.meta.extended_attributes, !known_bko)
@@ -1097,33 +1211,42 @@ pub(crate) fn set_metadata(
                     "restore {}: setting extended attributes failed: {err}",
                     path.display()
                 );
+                tally.dest(&err);
             });
         osattrs::restore_attributes(&target, node, known_bko)
-            .unwrap_or_else(|err| osattrs::warn_restore(path, &err));
+            .unwrap_or_else(|err| tally.io(path, &err, true));
     };
     // On Haiku before the mode: BFS wants write access to the file for
     // each attribute it writes, which a restore by a user other than root
     // wouldn't have on a read-only file.
     if cfg!(target_os = "haiku") {
-        set_attributes();
+        set_attributes(tally);
     }
     dest.set_permission(path, node, mode_zero_if_missing(opts, node))
-        .unwrap_or_else(|_| warn!("restore {}: chmod failed.", path.display()));
+        .unwrap_or_else(|err| {
+            warn!("restore {}: chmod failed.", path.display());
+            tally.dest(&err);
+        });
     if node.is_symlink() {
-        osattrs::restore_symlink_mode(&target, node)
-            .unwrap_or_else(|err| warn!("restore {}: {err}", path.display()));
+        osattrs::restore_symlink_mode(&target, node).unwrap_or_else(|err| {
+            warn!("restore {}: {err}", path.display());
+            tally.count(&err, true);
+        });
     }
     if !cfg!(target_os = "haiku") {
-        set_attributes();
+        set_attributes(tally);
     }
-    osattrs::restore_acls(&target, node)
-        .unwrap_or_else(|err| osattrs::warn_restore(path, &err));
+    osattrs::restore_acls(&target, node).unwrap_or_else(|err| tally.io(path, &err, true));
     // BackOtter: the birth time just before the times, which on FreeBSD and
     // NetBSD replace the earlier mtime it is set as.
-    osattrs::restore_birthtime(&target, node)
-        .unwrap_or_else(|err| warn!("restore {}: {err}", path.display()));
-    dest.set_times(path, &node.meta)
-        .unwrap_or_else(|_| warn!("restore {}: setting file times failed.", path.display()));
+    osattrs::restore_birthtime(&target, node).unwrap_or_else(|err| {
+        warn!("restore {}: {err}", path.display());
+        tally.count(&err, true);
+    });
+    dest.set_times(path, &node.meta).unwrap_or_else(|err| {
+        warn!("restore {}: setting file times failed.", path.display());
+        tally.dest(&err);
+    });
     true
 }
 

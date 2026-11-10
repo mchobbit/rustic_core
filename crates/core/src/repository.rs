@@ -50,7 +50,9 @@ use crate::{
             snapshots::{RepairSnapshotsOptions, repair_snapshots},
         },
         repoinfo::{IndexInfos, RepoFileInfos},
-        restore::{RestoreOptions, RestorePlan, collect_and_prepare, restore_repository},
+        restore::{
+            RestoreOptions, RestoreOutcome, RestorePlan, collect_and_prepare, restore_repository,
+        },
         rewrite::{RewriteOptions, rewrite_snapshots, rewrite_snapshots_and_trees},
     },
     crypto::aespoly1305::Key,
@@ -1604,13 +1606,21 @@ impl<S: IndexedTree> Repository<S> {
     /// # Errors
     ///
     // TODO: Document errors
+    ///
+    /// # Returns
+    ///
+    /// BackOtter: what the restore couldn't do and only warned about
+    /// (metadata not set for a reason other than the target not supporting
+    /// it, special files not made), which BackOtter's restic counts as
+    /// errors ([`RestoreOutcome`]). Contents that couldn't be restored are an
+    /// error.
     pub fn restore(
         &self,
         restore_infos: RestorePlan,
         opts: &RestoreOptions,
         node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
         dest: &LocalDestination,
-    ) -> RusticResult<()> {
+    ) -> RusticResult<RestoreOutcome> {
         restore_repository(restore_infos, self, *opts, node_streamer, dest)
     }
 

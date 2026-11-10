@@ -579,6 +579,13 @@ pub trait ReadSource: Sync + Send {
     fn dir_node(&self, _path: &Path) -> Option<Node> {
         None
     }
+    /// BackOtter: how many entries the source gave without some of their
+    /// metadata (flags, attributes, extended attributes, the metadata of a
+    /// directory above the backed-up paths) because it couldn't be read,
+    /// each warned about; 0 for a source that can't tell.
+    fn incomplete(&self) -> u64 {
+        0
+    }
 }
 
 /// The backends a repository can be initialized and operated on

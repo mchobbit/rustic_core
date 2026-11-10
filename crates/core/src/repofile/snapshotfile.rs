@@ -253,6 +253,13 @@ pub struct SnapshotSummary {
     /// Serialized only when non-zero so existing restic/rustic snapshots stay unchanged.
     #[serde(default, skip_serializing_if = "u64_is_zero")]
     pub error_count: u64,
+
+    /// BackOtter: how many entries, or parts of their metadata, the backup
+    /// left out because they couldn't be read (each one was warned about),
+    /// as BackOtter's restic counts them toward its exit status 3. Not
+    /// saved in the snapshot.
+    #[serde(skip)]
+    pub items_incomplete: u64,
 }
 
 // serde `skip_serializing_if` always passes a reference.
@@ -288,6 +295,7 @@ impl Default for SnapshotSummary {
             backup_duration: Default::default(),
             total_duration: Default::default(),
             error_count: Default::default(),
+            items_incomplete: 0,
         }
     }
 }

@@ -147,6 +147,11 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
     {
         let error_count = AtomicU64::new(0);
 
+        // BackOtter: entries the archiver itself left out (walker, parent and
+        // file archiver errors, each warned about), toward
+        // `SnapshotSummary::items_incomplete`; atomic, as the closures may
+        // run on other threads.
+        let dropped = AtomicU64::new(0);
         scope(|s| -> RusticResult<_> {
             // determine backup size in parallel to running backup
             let src_size_handle = s.spawn(|| {
@@ -165,6 +170,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
             let iter = src.entries().filter_map(|item| match item {
                 Err(err) => {
                     report_source_error(p, &error_count, "scan", &err);
+                    _ = dropped.fetch_add(1, Ordering::Relaxed);
                     None
                 }
                 Ok(ReadSourceEntry { path, mut node, open }) => {
@@ -212,6 +218,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                     Ok(item) => Some(item),
                     Err(err) => {
                         warn!("ignoring error reading parent snapshot: {err:?}");
+                        _ = dropped.fetch_add(1, Ordering::Relaxed);
                         None
                     }
                 },
@@ -223,6 +230,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                 Ok(item) => Some(item),
                 Err(err) => {
                     report_source_error(p, &error_count, "archival", &err);
+                    _ = dropped.fetch_add(1, Ordering::Relaxed);
                     None
                 }
             })
@@ -235,10 +243,16 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
             Ok(())
         })?;
 
+        // BackOtter: what the source left out of entries' metadata (it has
+        // warned about each), and the parent trees that couldn't be loaded.
+        let incomplete =
+            dropped.load(Ordering::Relaxed) + self.parent.load_errors() + src.incomplete();
+
         let stats = self.file_archiver.finalize()?;
         let (id, mut summary) = self.tree_archiver.finalize(self.parent.tree_id())?;
         stats.apply(&mut summary, BlobType::Data);
         summary.error_count = error_count.load(Ordering::Relaxed);
+        summary.items_incomplete = incomplete;
         self.snap.tree = id;
 
         self.indexer.write().unwrap().finalize()?;

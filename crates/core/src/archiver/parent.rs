@@ -32,6 +32,10 @@ pub struct Parent {
     ignore_ctime: bool,
     /// Ignore inode number when comparing nodes.
     ignore_inode: bool,
+    /// BackOtter: how many parent trees couldn't be loaded, and unchanged
+    /// files re-read as their blobs are missing from the index (each warned
+    /// about), which BackOtter's restic counts toward its exit status 3.
+    load_errors: u64,
 }
 
 /// The result of a parent search.
@@ -93,6 +97,7 @@ impl Parent {
         ignore_inode: bool,
     ) -> Self {
         // if tree_id is given, try to load tree from backend.
+        let mut load_errors = 0;
         let (trees, tree_ids) = tree_id
             .into_iter()
             .filter_map(|tree_id| match Tree::from_backend(be, index, tree_id) {
@@ -102,6 +107,7 @@ impl Parent {
                         "ignoring error when loading parent tree {tree_id:?}: {}",
                         err.display_log()
                     );
+                    load_errors += 1;
                     None
                 }
             })
@@ -113,7 +119,15 @@ impl Parent {
             stack: Vec::new(),
             ignore_ctime,
             ignore_inode,
+            load_errors,
         }
+    }
+
+    /// BackOtter: how many parent trees couldn't be loaded, and unchanged
+    /// files re-read as their blobs are missing from the index, each warned
+    /// about.
+    pub(crate) const fn load_errors(&self) -> u64 {
+        self.load_errors
     }
 
     /// Returns the parent node with the given name.
@@ -220,6 +234,7 @@ impl Parent {
         new_ids.sort();
         new_ids.dedup();
 
+        let mut load_errors = 0;
         let new_tree = new_ids
             .into_iter()
             .filter_map(|tree_id| match Tree::from_backend(be, index, tree_id) {
@@ -229,10 +244,12 @@ impl Parent {
                         "ignoring error when loading parent tree {tree_id}: {}",
                         err.display_log()
                     );
+                    load_errors += 1;
                     None
                 }
             })
             .collect();
+        self.load_errors += load_errors;
         let old_tree = std::mem::replace(&mut self.trees, new_tree);
         self.stack.push(old_tree);
     }
@@ -299,6 +316,10 @@ impl Parent {
                                 "missing blobs in index for unchanged file {}; re-reading file",
                                 path.display()
                             );
+                            // BackOtter: counted, as BackOtter's restic
+                            // counts "parts of ... not found in the
+                            // repository index; storing the file again".
+                            self.load_errors += 1;
                             ParentResult::NotFound
                         }
                     }
@@ -342,6 +363,7 @@ mod tests {
             stack: Vec::new(),
             ignore_ctime: false,
             ignore_inode,
+            load_errors: 0,
         };
 
         let result = parent.is_parent(&file_with_inode(2), OsStr::new("file"));

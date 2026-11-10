@@ -118,7 +118,12 @@ use other as os;
 /// this records their metadata then, which must come before their values
 /// are read (illumos has no `O_NOATIME`, and a read moves an attribute's
 /// atime).
-pub(crate) fn fill(path: &Path, node: &mut Node, m: &std::fs::Metadata, xattrs: bool) {
+///
+/// Returns whether it warned that file flags or attributes couldn't be read
+/// (left out of the node), which BackOtter's restic counts toward its exit
+/// status 3.
+pub(crate) fn fill(path: &Path, node: &mut Node, m: &std::fs::Metadata, xattrs: bool) -> bool {
+    let mut incomplete = false;
     // On Linux, the one open of the file for its flags, project ID and holes;
     // on illumos, of its system attribute view.
     let f = os::open_for_attrs(path, &node.node_type, m);
@@ -128,11 +133,15 @@ pub(crate) fn fill(path: &Path, node: &mut Node, m: &std::fs::Metadata, xattrs: 
         match os::file_flags(path, &node.node_type, m, f.as_ref()) {
             Ok(Some(flags)) => node.meta.generic_attributes.set_u64(name, flags.into()),
             Ok(None) => {}
-            Err(err) => warn!("ignoring file flags of {}: {err}", path.display()),
+            Err(err) => {
+                warn!("ignoring file flags of {}: {err}", path.display());
+                incomplete = true;
+            }
         }
     }
     if let Err(err) = os::fill_attributes(path, node, f.as_ref()) {
         warn!("ignoring attributes of {}: {err}", path.display());
+        incomplete = true;
     }
     if xattrs {
         os::fill_xattr_meta(path, node);
@@ -150,6 +159,7 @@ pub(crate) fn fill(path: &Path, node: &mut Node, m: &std::fs::Metadata, xattrs: 
     if node.is_file() && m.is_file() && sparse::has_holes(path, m, f.as_ref()) {
         node.meta.generic_attributes.set_true(UNIX_SPARSE);
     }
+    incomplete
 }
 
 /// Whether the file `node` had holes when it was backed up.
@@ -719,6 +729,19 @@ impl std::error::Error for RestoreErrors {}
 pub(crate) struct XattrErrors(Vec<(String, io::Error)>);
 
 impl XattrErrors {
+    /// Whether BackOtter's restic would count these failures as an error
+    /// (exit 1): any that isn't extended attributes the file system doesn't
+    /// support (`ErrorKind::Unsupported`, `ENOTSUP`, `EOPNOTSUPP`), nor,
+    /// not running as `root`, a permission refused (`trusted.*` or
+    /// `security.*` attributes, a file someone else owns), which restic's
+    /// restore not running as root only warns about (S2). Setting, removing
+    /// and listing alike.
+    pub(crate) fn counts(&self, root: bool) -> bool {
+        self.0
+            .iter()
+            .any(|(_, err)| !xattr_unsupported(err) && (root || !permission_refused(err)))
+    }
+
     /// Adds the failure of `what`: an attribute's name, for setting it, or
     /// what else was done (`removing NAME`, `listing`).
     #[cfg_attr(any(windows, target_os = "openbsd"), allow(dead_code))]
@@ -734,6 +757,110 @@ impl XattrErrors {
     #[cfg_attr(any(windows, target_os = "openbsd"), allow(dead_code))]
     pub(crate) fn into_result(self) -> Result<(), Self> {
         if self.0.is_empty() { Ok(()) } else { Err(self) }
+    }
+}
+
+/// Whether `err` says the file system doesn't support extended attributes:
+/// `ENOTSUP`/`EOPNOTSUPP`, or `ENOATTR` (`ENODATA` on Linux), which an
+/// SMB/CIFS mount can give instead, as BackOtter's restic takes them all
+/// (`handleXattrErr`, `xattrUnsupported`).
+pub(crate) fn xattr_unsupported(err: &io::Error) -> bool {
+    if err.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let no_attr = Some(libc::ENODATA);
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    let no_attr = Some(libc::ENOATTR);
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )))]
+    let no_attr: Option<i32> = None;
+    #[cfg(unix)]
+    {
+        matches!(err.raw_os_error(), Some(e) if e == libc::ENOTSUP || e == libc::EOPNOTSUPP)
+            || (no_attr.is_some() && err.raw_os_error() == no_attr)
+    }
+    #[cfg(not(unix))]
+    {
+        _ = no_attr;
+        false
+    }
+}
+
+/// Whether `err` is a permission refused (`EPERM`, `EACCES`).
+fn permission_refused(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::PermissionDenied
+}
+
+/// BackOtter: whether this process runs as root, as restic asks
+/// (`os.Geteuid() == 0`); always on Windows, where restic's `os.Geteuid()`
+/// is -1 and its not-root rules don't apply.
+pub(crate) fn is_root() -> bool {
+    #[cfg(unix)]
+    {
+        nix::unistd::geteuid().is_root()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// BackOtter: whether `err`, a failure to restore metadata that the restore
+/// warned about, is one BackOtter's restic counts as an error (exit 1): not
+/// metadata the file system doesn't support ([`Unsupported`],
+/// `ErrorKind::Unsupported`), a SID idmap couldn't map ([`SidUnmapped`]),
+/// nor, where `not_root_ok` and not running as root (`root`), a permission
+/// refused (`EPERM`, `EACCES`), which restic's restore not running as root
+/// only warns about (S2). Each of several ([`RestoreErrors`]) is judged
+/// alone.
+pub(crate) fn restore_error_counts(err: &io::Error, not_root_ok: bool, root: bool) -> bool {
+    let inner = err.get_ref();
+    if let Some(errors) = inner.and_then(|e| e.downcast_ref::<RestoreErrors>()) {
+        return errors
+            .0
+            .iter()
+            .any(|err| restore_error_counts(err, not_root_ok, root));
+    }
+    if inner.is_some_and(|e| e.is::<Unsupported>() || e.is::<SidUnmapped>()) {
+        return false;
+    }
+    if err.kind() == io::ErrorKind::Unsupported {
+        return false;
+    }
+    !(not_root_ok && !root && permission_refused(err))
+}
+
+/// BackOtter: the extended attributes of a file a backup read
+/// (`attrs`), and those it couldn't read (`unreadable`, each name with its
+/// error), which it leaves out with a warning each, keeping the others.
+#[derive(Debug, Default)]
+pub(crate) struct XattrsRead {
+    /// The attributes read.
+    pub(crate) attrs: Vec<ExtendedAttribute>,
+    /// The names of those that couldn't be read, with the errors.
+    pub(crate) unreadable: Vec<(String, io::Error)>,
+}
+
+impl From<Vec<ExtendedAttribute>> for XattrsRead {
+    fn from(attrs: Vec<ExtendedAttribute>) -> Self {
+        Self {
+            attrs,
+            unreadable: Vec::new(),
+        }
     }
 }
 
@@ -1013,10 +1140,16 @@ pub(crate) fn restore_symlink_mode(path: &Path, node: &Node) -> io::Result<()> {
 ///
 /// # Errors
 ///
-/// * If they can't be read, or this is neither illumos nor Haiku.
+/// * If they can't be listed (on illumos) or read (on Haiku), or this is
+///   neither illumos nor Haiku.
 #[cfg_attr(not(any(target_os = "illumos", target_os = "haiku")), allow(dead_code))]
-pub(crate) fn native_xattrs(path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
-    os::xattrs(path)
+pub(crate) fn native_xattrs(path: &Path) -> io::Result<XattrsRead> {
+    // BackOtter: on illumos, one whose value can't be read is left out
+    // alone (in `unreadable`), as BackOtter's restic does.
+    #[cfg(target_os = "illumos")]
+    return os::xattrs_read(path);
+    #[cfg(not(target_os = "illumos"))]
+    os::xattrs(path).map(XattrsRead::from)
 }
 
 /// Gives the file at `path` exactly the extended attributes `attrs`, on
@@ -1249,6 +1382,21 @@ fn path_error(op: &str, path: &Path, err: &io::Error) -> io::Error {
     io::Error::new(err.kind(), format!("{op} {}: {err}", path.display()))
 }
 
+/// BackOtter: `err`, an ACL that couldn't be set (the system's error
+/// `source`), as an `ErrorKind::Unsupported` one, with the same text, where
+/// it says the file system can't hold ACLs (`ENOTSUP`, `EOPNOTSUPP`):
+/// unsupported metadata, which BackOtter's restic doesn't count as an
+/// error (`restore_error_counts`).
+#[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "illumos"))]
+fn acl_set_error(err: io::Error, source: &io::Error) -> io::Error {
+    match source.raw_os_error() {
+        Some(e) if e == libc::ENOTSUP || e == libc::EOPNOTSUPP => {
+            io::Error::new(io::ErrorKind::Unsupported, err.to_string())
+        }
+        _ => err,
+    }
+}
+
 /// Calls `set` with `want`, the flags `attr` of the file at `path`, which
 /// `op` sets: 32 bits (`u32`), or 64 (`u64`, ZFS's DOS flags). If that
 /// fails, changes the flags from `current`, what the file has (0 if not
@@ -1367,6 +1515,60 @@ fn unsupported(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BackOtter: what `--strict-exit` counts of the failures a restore
+    /// warns about, as BackOtter's restic does: not unsupported metadata nor
+    /// unmapped SIDs, nor a permission refused to a restore not running as
+    /// root in the steps restic forgives that; anything else.
+    #[test]
+    #[cfg(unix)]
+    fn restore_errors_counted_as_restic() {
+        let eperm = || io::Error::from_raw_os_error(libc::EPERM);
+        let eio = || io::Error::from_raw_os_error(libc::EIO);
+        let unsupported = || Unsupported::error("linux.inode_flags", 0x10, eperm());
+        assert!(!restore_error_counts(&unsupported(), false, true));
+        let kind = io::Error::new(io::ErrorKind::Unsupported, "no ACLs here");
+        assert!(!restore_error_counts(&kind, false, true));
+        let sid = SidUnmapped::error("illumos.owner_sid", "S-1-5-21-1", eio());
+        assert!(!restore_error_counts(&sid, false, true));
+        let several = |errors| io::Error::other(RestoreErrors(errors));
+        let mixed = several(vec![unsupported(), eio()]);
+        assert!(restore_error_counts(&mixed, false, true));
+        let all_unsupported = several(vec![unsupported(), unsupported()]);
+        assert!(!restore_error_counts(&all_unsupported, false, true));
+        assert!(!restore_error_counts(&eperm(), true, false));
+        assert!(restore_error_counts(&eperm(), true, true));
+        assert!(restore_error_counts(&eperm(), false, false));
+        assert!(restore_error_counts(&eio(), true, false));
+        assert!(restore_error_counts(&eio(), false, true));
+    }
+
+    /// BackOtter: extended attributes the file system doesn't support
+    /// (`ENOATTR` included) don't count, nor, not running as root, a permission refused (listing
+    /// included); anything else does.
+    #[test]
+    #[cfg(unix)]
+    fn xattr_errors_counted_as_restic() {
+        let errors = |errno: i32, what: &str| {
+            let mut errors = XattrErrors::default();
+            errors.push(what, io::Error::from_raw_os_error(errno));
+            errors
+        };
+        for root in [true, false] {
+            assert!(!errors(libc::ENOTSUP, "user.a").counts(root));
+            assert!(!errors(libc::EOPNOTSUPP, "user.a").counts(root));
+            assert!(errors(libc::EIO, "user.a").counts(root));
+            // An SMB/CIFS mount's ENOATTR (ENODATA on Linux), as restic.
+            #[cfg(target_os = "linux")]
+            assert!(!errors(libc::ENODATA, "user.a").counts(root));
+            #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+            assert!(!errors(libc::ENOATTR, "user.a").counts(root));
+        }
+        assert!(!errors(libc::EPERM, "trusted.a").counts(false));
+        assert!(errors(libc::EPERM, "trusted.a").counts(true));
+        assert!(!errors(libc::EACCES, "listing").counts(false));
+        assert!(errors(libc::EACCES, "listing").counts(true));
+    }
 
     /// BackOtter: a node without file flags says its file had none only in
     /// a snapshot of BackOtter's; then, or where it has some, the restore

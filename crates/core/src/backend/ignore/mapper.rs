@@ -10,12 +10,14 @@ use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use super::{IgnoreErrorKind, IgnoreResult, OpenFile};
+use super::{IgnoreErrorKind, IgnoreResult, Incomplete, OpenFile};
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+use crate::backend::node::ExtendedAttribute;
 use crate::backend::{
     ReadSourceEntry,
     osattrs,
     node::{
-        ExtendedAttribute, Metadata, Node, NodeType,
+        Metadata, Node, NodeType,
         generic_attributes::GenericAttributes,
         modification::{DevIdOption, TimeOption, XattrOption},
     },
@@ -83,6 +85,22 @@ impl LocalSourceSaveOptions {
     /// * If metadata could not be read.
     /// * If the xattr of the entry could not be read.
     pub fn map_entry(self, entry: DirEntry) -> IgnoreResult<ReadSourceEntry<OpenFile>> {
+        self.map_entry_counted(entry, &Incomplete::default())
+    }
+
+    /// BackOtter: [`Self::map_entry`], counting in `incomplete` an entry
+    /// whose metadata couldn't all be read (each warned about), as
+    /// BackOtter's restic counts them toward its exit status 3.
+    ///
+    /// # Errors
+    ///
+    /// * If metadata could not be read.
+    /// * If a symlink's target could not be read.
+    pub(crate) fn map_entry_counted(
+        self,
+        entry: DirEntry,
+        incomplete: &Incomplete,
+    ) -> IgnoreResult<ReadSourceEntry<OpenFile>> {
         let name = entry.file_name();
         let m = entry
             .metadata()
@@ -90,7 +108,7 @@ impl LocalSourceSaveOptions {
                 name: name.to_string_lossy().to_string(),
                 source: err,
             })?;
-        let node = self.map_path(entry.path(), name, &m)?;
+        let node = self.map_path(entry.path(), name, &m, incomplete, false)?;
         let path = entry.into_path();
         // BackOtter: a file with holes is read by its data extents.
         let open = Some(OpenFile::new(path.clone(), osattrs::is_sparse(&node)));
@@ -102,6 +120,12 @@ impl LocalSourceSaveOptions {
     /// gives ([`Self::map_entry`]) and for a directory above the backed-up
     /// paths (`LocalSource`'s `dir_node`), as restic stores both.
     ///
+    /// Each part of the metadata it couldn't read and left out (file flags,
+    /// attributes, extended attributes, each one that couldn't be read) is
+    /// warned about and counted in `incomplete`; but not, for a directory
+    /// `above` the backed-up paths, extended attributes it may not list, as
+    /// restic ignores that error there.
+    ///
     /// # Errors
     ///
     /// * If a symlink's target could not be read.
@@ -110,6 +134,8 @@ impl LocalSourceSaveOptions {
         path: &Path,
         name: &OsStr,
         m: &std::fs::Metadata,
+        incomplete: &Incomplete,
+        above: bool,
     ) -> IgnoreResult<Node> {
         let mtime = m.modified().ok().and_then(|t| Timestamp::try_from(t).ok());
         let atime = || m.accessed().ok().and_then(|t| Timestamp::try_from(t).ok());
@@ -129,10 +155,24 @@ impl LocalSourceSaveOptions {
             .set_devid
             .unwrap_or_default()
             .map_or_else(|| Self::device_id(m), Self::hardlink(m));
-        let xattr = || {
-            Self::xattrs(path)
-                .inspect_err(|err| warn!("ignoring error obtaining xargs: {err}"))
-                .unwrap_or_default()
+        let xattr = || match Self::xattrs(path) {
+            Err(err) => {
+                warn!("ignoring error obtaining xargs: {err}");
+                if !(above && xattr_list_refused(&err)) {
+                    incomplete.add();
+                }
+                Vec::new()
+            }
+            Ok(read) => {
+                for (name, err) in &read.unreadable {
+                    warn!(
+                        "ignoring extended attribute {name} of {}: {err}",
+                        path.display()
+                    );
+                    incomplete.add();
+                }
+                read.attrs
+            }
         };
         let (mode, inode, links) = Self::nix_infos(m);
 
@@ -172,7 +212,9 @@ impl LocalSourceSaveOptions {
         // BackOtter: the extended attributes' values after osattrs, which on
         // illumos reads their metadata first: reading a value moves its atime.
         let set_xattrs = self.set_xattrs.unwrap_or_default();
-        osattrs::fill(path, &mut node, m, set_xattrs == XattrOption::Yes);
+        if osattrs::fill(path, &mut node, m, set_xattrs == XattrOption::Yes) {
+            incomplete.add();
+        }
         // BackOtter: a file illumos quarantined (av_quarantined) can't be
         // read, by root either, nor its extended attributes: its node is
         // kept without them or its contents, with a warning, as in
@@ -206,6 +248,18 @@ impl LocalSourceSaveOptions {
         };
         Ok(node)
     }
+}
+
+/// BackOtter: whether `err` is extended attributes the backup was refused
+/// permission to list or read, which restic ignores for the directories
+/// above the backed-up paths (`ignoreXattrListError`).
+fn xattr_list_refused(err: &IgnoreErrorKind) -> bool {
+    #[cfg(all(not(windows), not(target_os = "openbsd")))]
+    if let IgnoreErrorKind::ErrorXattr { source, .. } = err {
+        return source.kind() == std::io::ErrorKind::PermissionDenied;
+    }
+    _ = err;
+    false
 }
 
 #[cfg(not(windows))]
@@ -249,7 +303,7 @@ impl LocalSourceSaveOptions {
     ///
     /// * If they couldn't be listed or read
     #[cfg(any(target_os = "illumos", target_os = "haiku"))]
-    fn xattrs(path: &Path) -> IgnoreResult<Vec<ExtendedAttribute>> {
+    fn xattrs(path: &Path) -> IgnoreResult<osattrs::XattrsRead> {
         osattrs::native_xattrs(path).map_err(|err| IgnoreErrorKind::ErrorXattr {
             path: path.to_path_buf(),
             source: err,
@@ -266,19 +320,46 @@ impl LocalSourceSaveOptions {
     ///
     /// * If Xattr couldn't be listed or couldn't be read
     #[cfg(not(any(target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
-    fn xattrs(path: &Path) -> IgnoreResult<Vec<ExtendedAttribute>> {
+    fn xattrs(path: &Path) -> IgnoreResult<osattrs::XattrsRead> {
         // BackOtter: no warning for each file where the xattr crate has no
         // support.
         if !xattr::SUPPORTED_PLATFORM {
-            return Ok(Vec::new());
+            return Ok(osattrs::XattrsRead::default());
         }
+        Self::xattrs_with(
+            path,
+            || osattrs::xattr_list(path),
+            |name| osattrs::xattr_get(path, name),
+        )
+    }
+
+    /// BackOtter: the extended attributes of `path`, listed by `list` and
+    /// each read by `get`: [`Self::xattrs`], apart from where they come from.
+    ///
+    /// One that can't be read is left out and named in the result's
+    /// `unreadable`, with its error, and the others are kept, as BackOtter's
+    /// restic does (stock rustic dropped them all).
+    ///
+    /// # Errors
+    ///
+    /// * If they couldn't be listed
+    #[cfg(not(any(target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+    fn xattrs_with(
+        path: &Path,
+        list: impl FnOnce() -> std::io::Result<Vec<std::ffi::OsString>>,
+        mut get: impl FnMut(&OsStr) -> std::io::Result<Option<Vec<u8>>>,
+    ) -> IgnoreResult<osattrs::XattrsRead> {
         // BackOtter: osattrs::xattr_list, as the xattr crate's list misnames
         // one on FreeBSD; none where there can be none (a FIFO on ZFS), as
         // restic does; restic's names (osattrs::xattr_node_name); and in the
         // byte order of those names, as BackOtter's restic stores them, not
         // in the order the file system lists them.
-        let names = match osattrs::xattr_list(path) {
-            Err(err) if err.kind() == std::io::ErrorKind::Unsupported => Vec::new(),
+        // BackOtter: a list or a value the file system says it doesn't
+        // support (osattrs::xattr_unsupported, ENOATTR included, which an
+        // SMB/CIFS mount gives) is none: no attributes, or one kept without
+        // a value, as BackOtter's restic takes them (handleXattrErr).
+        let names = match list() {
+            Err(err) if osattrs::xattr_unsupported(&err) => Vec::new(),
             names => names.map_err(|err| IgnoreErrorKind::ErrorXattr {
                 path: path.to_path_buf(),
                 source: err,
@@ -289,25 +370,28 @@ impl LocalSourceSaveOptions {
             .filter_map(|name| Some((osattrs::xattr_node_name(&name)?, name)))
             .collect();
         names.sort_unstable();
-        names
-            .into_iter()
-            .map(|(node_name, name)| {
-                Ok(ExtendedAttribute {
+        let mut read = osattrs::XattrsRead::default();
+        for (node_name, name) in names {
+            match get(&name) {
+                Ok(value) => read.attrs.push(ExtendedAttribute {
                     name: node_name,
-                    value: osattrs::xattr_get(path, &name).map_err(|err| {
-                        IgnoreErrorKind::ErrorXattr {
-                            path: path.to_path_buf(),
-                            source: err,
-                        }
-                    })?,
-                })
-            })
-            .collect::<IgnoreResult<Vec<ExtendedAttribute>>>()
+                    value,
+                }),
+                Err(err) if osattrs::xattr_unsupported(&err) => {
+                    read.attrs.push(ExtendedAttribute {
+                        name: node_name,
+                        value: None,
+                    });
+                }
+                Err(err) => read.unreadable.push((node_name, err)),
+            }
+        }
+        Ok(read)
     }
 
     #[cfg(target_os = "openbsd")]
-    fn xattrs(_path: &Path) -> IgnoreResult<Vec<ExtendedAttribute>> {
-        Ok(Vec::new())
+    fn xattrs(_path: &Path) -> IgnoreResult<osattrs::XattrsRead> {
+        Ok(osattrs::XattrsRead::default())
     }
 
     fn to_node_other(self, name: &OsStr, m: &std::fs::Metadata, meta: Metadata) -> Node {
@@ -353,8 +437,8 @@ impl LocalSourceSaveOptions {
         (None, 0, 0)
     }
 
-    fn xattrs(_path: &Path) -> IgnoreResult<Vec<ExtendedAttribute>> {
-        Ok(Vec::new())
+    fn xattrs(_path: &Path) -> IgnoreResult<osattrs::XattrsRead> {
+        Ok(osattrs::XattrsRead::default())
     }
 
     fn to_node_other(self, name: &OsStr, _m: &std::fs::Metadata, meta: Metadata) -> Node {
@@ -377,10 +461,14 @@ mod tests {
         filetime::set_file_atime(&path, old).unwrap();
         let m = std::fs::symlink_metadata(&path).unwrap();
         let name = OsStr::new("file");
-        let node = LocalSourceSaveOptions::default().map_path(&path, name, &m).unwrap();
+        let node = LocalSourceSaveOptions::default()
+            .map_path(&path, name, &m, &Incomplete::default(), false)
+            .unwrap();
         assert_eq!(node.meta.atime, node.meta.mtime);
         let real = LocalSourceSaveOptions::default().set_atime(TimeOption::Yes);
-        let node = real.map_path(&path, name, &m).unwrap();
+        let node = real
+            .map_path(&path, name, &m, &Incomplete::default(), false)
+            .unwrap();
         assert_eq!(node.meta.atime.map(Timestamp::as_second), Some(old.unix_seconds()));
     }
 
@@ -400,6 +488,7 @@ mod tests {
         }
         let names: Vec<_> = LocalSourceSaveOptions::xattrs(&path)
             .unwrap()
+            .attrs
             .into_iter()
             .map(|attr| attr.name)
             .collect();
@@ -409,5 +498,73 @@ mod tests {
             .filter_map(|name| osattrs::xattr_node_name(name.as_ref()))
             .collect();
         assert_eq!(names, want);
+    }
+
+    /// BackOtter: one extended attribute that can't be read is left out
+    /// alone, named with its error, and the others are kept in order, as
+    /// BackOtter's restic does; one the list can't give fails them all.
+    #[cfg(not(target_os = "haiku"))]
+    #[test]
+    fn xattrs_with_skips_only_unreadable() {
+        use std::{ffi::OsString, io};
+
+        let path = Path::new("/nowhere");
+        let list = || {
+            Ok(["user.c", "user.a", "user.b"]
+                .into_iter()
+                .map(OsString::from)
+                .collect())
+        };
+        let get = |name: &OsStr| {
+            if name == "user.b" {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(Some(name.as_encoded_bytes().to_vec()))
+            }
+        };
+        let read = LocalSourceSaveOptions::xattrs_with(path, list, get).unwrap();
+        let kept: Vec<_> = read.attrs.iter().map(|attr| attr.name.as_str()).collect();
+        let want: Vec<_> = ["user.a", "user.c"]
+            .iter()
+            .filter_map(|name| osattrs::xattr_node_name(name.as_ref()))
+            .collect();
+        assert_eq!(kept, want);
+        for attr in &read.attrs {
+            assert_eq!(
+                attr.value.as_deref(),
+                Some(format!("user.{}", attr.name.trim_start_matches("user.")).as_bytes())
+            );
+        }
+        assert_eq!(read.unreadable.len(), 1);
+        let (name, err) = &read.unreadable[0];
+        assert_eq!(Some(name.clone()), osattrs::xattr_node_name("user.b".as_ref()));
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+
+        let refused = || Err(io::Error::from_raw_os_error(libc::EACCES));
+        let err = LocalSourceSaveOptions::xattrs_with(path, refused, get).unwrap_err();
+        assert!(matches!(err, IgnoreErrorKind::ErrorXattr { .. }));
+
+        // What the file system says it doesn't support is no error, as
+        // restic: a list is none, and a value kept as none.
+        let unsupported = || Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        let read = LocalSourceSaveOptions::xattrs_with(path, unsupported, get).unwrap();
+        assert!(read.attrs.is_empty() && read.unreadable.is_empty());
+        #[cfg(target_os = "linux")]
+        {
+            let no_data = || Err(io::Error::from_raw_os_error(libc::ENODATA));
+            let read = LocalSourceSaveOptions::xattrs_with(path, no_data, get).unwrap();
+            assert!(read.attrs.is_empty() && read.unreadable.is_empty());
+        }
+        let get_unsupported = |name: &OsStr| {
+            if name == "user.b" {
+                Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+            } else {
+                Ok(Some(name.as_encoded_bytes().to_vec()))
+            }
+        };
+        let read = LocalSourceSaveOptions::xattrs_with(path, list, get_unsupported).unwrap();
+        assert!(read.unreadable.is_empty());
+        assert_eq!(read.attrs.len(), 3);
+        assert!(read.attrs[1].value.is_none());
     }
 }

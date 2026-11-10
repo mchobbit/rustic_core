@@ -162,8 +162,8 @@ pub use crate::{
         repair::{index::RepairIndexOptions, snapshots::RepairSnapshotsOptions},
         repoinfo::{BlobInfo, IndexInfos, PackInfo, RepoFileInfo, RepoFileInfos},
         restore::{
-            FileDirStats, RestoreOptions, RestorePlan, RestoreStats, SnapshotOrigin, SparseRestore,
-            restore_target_is_fresh,
+            FileDirStats, RestoreOptions, RestoreOutcome, RestorePlan, RestoreStats,
+            SnapshotOrigin, SparseRestore, restore_target_is_fresh,
         },
         rewrite::RewriteOptions,
     },

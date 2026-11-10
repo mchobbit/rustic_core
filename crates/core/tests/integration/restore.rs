@@ -48,7 +48,7 @@ fn test_restore_preserves_hardlinks(
     let restore_opts = RestoreOptions::default();
     let restore = || -> Result<()> {
         let plan = repo.prepare_restore(&restore_opts, ls.clone(), &dest, false)?;
-        repo.restore(plan, &restore_opts, ls.clone(), &dest)?;
+        _ = repo.restore(plan, &restore_opts, ls.clone(), &dest)?;
         Ok(())
     };
     restore()?;
@@ -125,7 +125,7 @@ fn restore_with(
     )?;
     let ls = repo.ls(&node, &ls_opts)?.map(move |item| item.map(|(p, n)| (p, change(n))));
     let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false)?;
-    repo.restore(plan, &opts, ls, &dest)?;
+    _ = repo.restore(plan, &opts, ls, &dest)?;
     Ok(())
 }
 
@@ -392,5 +392,55 @@ fn test_restore_missing_mode(set_up_repo: Result<RepoOpen>) -> Result<()> {
     restore_with(&repo, restore_dir.path(), RestoreOptions::default(), no_mode)?;
     let shadow = restore_dir.path().join("test/shadow");
     assert_ne!(mode(&shadow)? & 0o600, 0, "restored as {:o}", mode(&shadow)?);
+    Ok(())
+}
+
+/// BackOtter: what `--delete` can't remove (an extra directory whose
+/// entries it may not remove) is counted in the plan's statistics
+/// (`RestoreStats::errors`), as BackOtter's restic counts it as an error
+/// (exit 1); the restore itself then fails at nothing
+/// (`RestoreOutcome::errors`). A plain restore counts none. Not as root,
+/// who may remove it.
+#[rstest]
+#[cfg(not(windows))]
+fn test_restore_counts_what_delete_left(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    use rustic_core::PathList;
+
+    if nix::unistd::geteuid().is_root() {
+        return Ok(());
+    }
+    let source = tempdir()?;
+    fs::write(source.path().join("a"), "a")?;
+    let repo = set_up_repo?.to_indexed_ids()?;
+    let opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
+    let paths = PathList::from_iter(Some(source.path().to_path_buf()));
+    let _snapshot = repo.backup(&opts, &paths, SnapshotFile::default())?;
+    let repo = repo.to_indexed()?;
+    let node = repo.node_from_snapshot_path("latest:test", |_| true)?;
+    let ls_opts = LsOptions::default();
+
+    let restore = |dir: &Path, opts: RestoreOptions| -> Result<(u64, u64)> {
+        let dest = LocalDestination::new(dir.to_str().unwrap(), true, false)?;
+        let ls = repo.ls(&node, &ls_opts)?;
+        let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false)?;
+        let planned = plan.stats.errors;
+        let outcome = repo.restore(plan, &opts, ls, &dest)?;
+        Ok((planned, outcome.errors))
+    };
+
+    let plain = tempdir()?;
+    assert_eq!(restore(plain.path(), RestoreOptions::default())?, (0, 0));
+
+    let target = tempdir()?;
+    let extra = target.path().join("extra");
+    fs::create_dir(&extra)?;
+    fs::write(extra.join("x"), "x")?;
+    fs::set_permissions(&extra, fs::Permissions::from_mode(0o555))?;
+    let result = restore(target.path(), RestoreOptions::default().delete(true));
+    fs::set_permissions(&extra, fs::Permissions::from_mode(0o755))?;
+    assert_eq!(result?, (1, 0));
+    assert_eq!(fs::read_to_string(target.path().join("a"))?, "a");
     Ok(())
 }
