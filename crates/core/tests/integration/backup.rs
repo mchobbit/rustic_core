@@ -368,3 +368,48 @@ fn test_backup_keeps_access_times(set_up_repo: Result<RepoOpen>) -> Result<()> {
     }
     Ok(())
 }
+
+/// BackOtter: a backup that leaves out what it can't read (a file it may
+/// not open, a directory it may not list) still saves its snapshot, with
+/// what it could read, and counts what it left out
+/// (`SnapshotSummary::items_incomplete`), as BackOtter's restic counts them
+/// toward its exit status 3; a backup of what can all be read counts none.
+/// Not as root, who reads them all.
+#[rstest]
+#[cfg(not(windows))]
+fn test_backup_counts_what_it_left_out(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    if nix::unistd::geteuid().is_root() {
+        return Ok(());
+    }
+    let repo = set_up_repo?.to_indexed_ids()?;
+    let opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
+
+    let plain = tempfile::tempdir()?;
+    fs::write(plain.path().join("ok"), "ok")?;
+    let paths = PathList::from_iter(Some(plain.path().to_path_buf()));
+    let snap = repo.backup(&opts, &paths, SnapshotFile::default())?;
+    assert_eq!(snap.summary.as_ref().unwrap().items_incomplete, 0);
+
+    let source = tempfile::tempdir()?;
+    let base = source.path();
+    fs::write(base.join("ok"), "ok")?;
+    fs::write(base.join("secret"), "secret")?;
+    fs::create_dir(base.join("closed"))?;
+    fs::write(base.join("closed").join("inner"), "inner")?;
+    let mode = |path: &Path, mode: u32| fs::set_permissions(path, fs::Permissions::from_mode(mode));
+    mode(&base.join("secret"), 0o000)?;
+    mode(&base.join("closed"), 0o000)?;
+    let paths = PathList::from_iter(Some(base.to_path_buf()));
+    let result = repo.backup(&opts, &paths, SnapshotFile::default());
+    mode(&base.join("closed"), 0o755)?;
+    mode(&base.join("secret"), 0o644)?;
+    let snap = result?;
+    assert!(snap.summary.as_ref().unwrap().items_incomplete >= 2);
+
+    let repo = repo.to_indexed()?;
+    let node = repo.node_from_snapshot_path(&format!("{}:test/ok", snap.id), |_| true)?;
+    assert!(node.is_file());
+    Ok(())
+}

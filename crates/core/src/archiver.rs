@@ -4,6 +4,7 @@ pub(crate) mod tree;
 pub(crate) mod tree_archiver;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::thread::scope;
 
 use jiff::Zoned;
@@ -138,6 +139,11 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
         <R as ReadSource>::Open: Send,
         <R as ReadSource>::Iter: Send,
     {
+        // BackOtter: entries the archiver itself left out (walker, parent and
+        // file archiver errors, each warned about), toward
+        // `SnapshotSummary::items_incomplete`; atomic, as the closures may
+        // run on other threads.
+        let dropped = AtomicU64::new(0);
         scope(|s| -> RusticResult<_> {
             // determine backup size in parallel to running backup
             let src_size_handle = s.spawn(|| {
@@ -156,6 +162,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
             let iter = src.entries().filter_map(|item| match item {
                 Err(err) => {
                     warn!("ignoring error: {}", err.display_log());
+                    _ = dropped.fetch_add(1, AtomicOrdering::Relaxed);
                     None
                 }
                 Ok(ReadSourceEntry { path, mut node, open }) => {
@@ -203,6 +210,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                     Ok(item) => Some(item),
                     Err(err) => {
                         warn!("ignoring error reading parent snapshot: {err:?}");
+                        _ = dropped.fetch_add(1, AtomicOrdering::Relaxed);
                         None
                     }
                 },
@@ -214,6 +222,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                 Ok(item) => Some(item),
                 Err(err) => {
                     warn!("ignoring error: {}", err.display_log());
+                    _ = dropped.fetch_add(1, AtomicOrdering::Relaxed);
                     None
                 }
             })
@@ -226,9 +235,15 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
             Ok(())
         })?;
 
+        // BackOtter: what the source left out of entries' metadata (it has
+        // warned about each), and the parent trees that couldn't be loaded.
+        let incomplete =
+            dropped.load(AtomicOrdering::Relaxed) + self.parent.load_errors() + src.incomplete();
+
         let stats = self.file_archiver.finalize()?;
         let (id, mut summary) = self.tree_archiver.finalize(self.parent.tree_id())?;
         stats.apply(&mut summary, BlobType::Data);
+        summary.items_incomplete = incomplete;
         self.snap.tree = id;
 
         self.indexer.write().unwrap().finalize()?;

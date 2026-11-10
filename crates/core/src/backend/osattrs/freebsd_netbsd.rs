@@ -15,7 +15,7 @@ use serde_derive::{Deserialize, Serialize};
 use serde_with::{DefaultOnNull, base64::Base64, serde_as};
 
 use super::{
-    c_path, check,
+    acl_set_error, c_path, check,
     freebsd_acl::{self, AclEntry, AclType, MAX_ENTRIES, Os},
     path_error,
 };
@@ -166,7 +166,7 @@ fn set_acl(path: &Path, typ: AclType, acl: &[AclEntry]) -> io::Result<()> {
     }
     // SAFETY: raw is a struct acl holding cnt entries.
     _ = check(unsafe { sys::acl_set_link(p.as_ptr(), typ as libc::c_int, &raw mut *raw) })
-        .map_err(|err| path_error("__acl_set_link", path, &err))?;
+        .map_err(|err| acl_set_error(path_error("__acl_set_link", path, &err), &err))?;
     Ok(())
 }
 

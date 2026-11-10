@@ -105,7 +105,9 @@ impl XattrOption {
 #[allow(clippy::struct_field_names)]
 /// [`NodeModification`] describes how nodes will be modified
 pub struct NodeModification {
-    /// Set access time [default: mtime]
+    // BackOtter: the stored one, as BackOtter's restic's rewrite keeps them;
+    // stock rustic's default was mtime.
+    /// Set access time [default: yes]
     #[cfg_attr(feature = "clap", clap(long))]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
     pub set_atime: Option<TimeOption>,
@@ -144,7 +146,7 @@ impl NodeModification {
         let mtime = meta.mtime;
         meta.atime = self
             .set_atime
-            .unwrap_or(TimeOption::Mtime)
+            .unwrap_or(TimeOption::Yes)
             .map_or_else(|| meta.atime, mtime);
         meta.ctime = self
             .set_ctime
@@ -163,5 +165,34 @@ impl NodeModification {
         let changed = node.meta != meta;
         node.meta = meta;
         changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::node::{Metadata, NodeType};
+
+    fn node() -> Node {
+        let meta = Metadata {
+            mtime: Some(Timestamp::from_second(1_577_836_800).unwrap()),
+            atime: Some(Timestamp::from_second(978_307_200).unwrap()),
+            ..Default::default()
+        };
+        Node::new_node("file".as_ref(), NodeType::File, meta)
+    }
+
+    /// BackOtter: a rewrite keeps the stored atime by default, as
+    /// BackOtter's restic's does; `--set-atime mtime` still replaces it.
+    #[test]
+    fn rewrite_keeps_atime_by_default() {
+        let mut keep = node();
+        assert!(!NodeModification::default().modify_node(&mut keep));
+        assert_eq!(keep, node());
+
+        let mut set = node();
+        let mtime = NodeModification::default().set_atime(TimeOption::Mtime);
+        assert!(mtime.modify_node(&mut set));
+        assert_eq!(set.meta.atime, set.meta.mtime);
     }
 }

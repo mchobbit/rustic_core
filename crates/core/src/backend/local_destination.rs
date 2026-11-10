@@ -451,6 +451,31 @@ impl LocalDestination {
         false
     }
 
+    // BackOtter's.
+    /// Whether `err`, a failure to set an owner, extended attributes, the
+    /// permissions or the times that the restore warned about, is one
+    /// BackOtter's restic counts as an error (exit 1): not, not running as
+    /// `root`, a permission refused (a change of owner, `trusted.*` or
+    /// `security.*` attributes, a file someone else owns), nor extended
+    /// attributes or times the file system doesn't support
+    /// ([`osattrs::XattrErrors::counts`], `osattrs::restore_error_counts`).
+    pub(crate) fn error_counts(err: &LocalDestinationErrorKind, root: bool) -> bool {
+        match err {
+            #[cfg(not(windows))]
+            LocalDestinationErrorKind::FromErrnoError(Errno::EPERM | Errno::EACCES) => root,
+            #[cfg(not(any(windows, target_os = "openbsd")))]
+            LocalDestinationErrorKind::XattrsNotSet(errors) => errors.counts(root),
+            LocalDestinationErrorKind::SettingTimeMetadataFailed(err) => {
+                osattrs::restore_error_counts(err, true, root)
+            }
+            #[cfg(not(windows))]
+            LocalDestinationErrorKind::SettingFilePermissionsFailed(err) => {
+                osattrs::restore_error_counts(err, true, root)
+            }
+            _ => true,
+        }
+    }
+
     #[cfg(windows)]
     // TODO: Windows support
     /// Set permissions for `item` (relative to the base path) from `node`
@@ -1395,6 +1420,9 @@ mod tests {
         attrs: std::cell::RefCell<std::collections::BTreeMap<String, Vec<u8>>>,
         not_empty: Vec<&'static str>,
         warned: std::cell::RefCell<Vec<String>>,
+        /// The error those in `not_empty` are refused with, if not
+        /// `ENOTEMPTY`.
+        errno: Option<i32>,
     }
 
     impl FakeXattrs {
@@ -1408,12 +1436,15 @@ mod tests {
                 ),
                 not_empty: not_empty.to_vec(),
                 warned: std::cell::RefCell::default(),
+                errno: None,
             }
         }
 
         fn refuse(&self, name: &str) -> std::io::Result<()> {
             if self.not_empty.contains(&name) {
-                return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY));
+                return Err(std::io::Error::from_raw_os_error(
+                    self.errno.unwrap_or(libc::ENOTEMPTY),
+                ));
             }
             Ok(())
         }
@@ -1477,6 +1508,27 @@ mod tests {
         assert!(err.starts_with("user.notempty: "), "{err}");
         assert_eq!(calls.names(), ["user.b"]);
         assert!(calls.warned.borrow().is_empty());
+    }
+
+    /// BackOtter: an extended attribute the file system doesn't support
+    /// (`EOPNOTSUPP`) isn't counted as an error under `--strict-exit`, as
+    /// root or not; one that couldn't be set for another reason (`EIO`) is.
+    #[test]
+    fn xattrs_not_set_count_unless_unsupported() {
+        let file = Path::new("/r/f");
+        for (errno, counts) in [(libc::EOPNOTSUPP, false), (libc::EIO, true)] {
+            let mut calls = FakeXattrs::with(&[], &["user.a"]);
+            calls.errno = Some(errno);
+            let errors =
+                set_xattrs_with(&calls, file, &[xattr("user.a", b"1")], false).unwrap_err();
+            let err = LocalDestinationErrorKind::XattrsNotSet(errors);
+            assert_eq!(LocalDestination::error_counts(&err, true), counts, "{errno}");
+            assert_eq!(LocalDestination::error_counts(&err, false), counts, "{errno}");
+        }
+        // A change of owner refused counts as root only.
+        let err = LocalDestinationErrorKind::FromErrnoError(Errno::EPERM);
+        assert!(LocalDestination::error_counts(&err, true));
+        assert!(!LocalDestination::error_counts(&err, false));
     }
 
     /// BackOtter: the same for removing `bcachefs.casefold` from a

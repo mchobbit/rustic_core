@@ -247,6 +247,13 @@ pub struct SnapshotSummary {
 
     /// Total duration that the rustic command ran in seconds
     pub total_duration: f64,
+
+    /// BackOtter: how many entries, or parts of their metadata, the backup
+    /// left out because they couldn't be read (each one was warned about),
+    /// as BackOtter's restic counts them toward its exit status 3. Not
+    /// saved in the snapshot.
+    #[serde(skip)]
+    pub items_incomplete: u64,
 }
 
 impl Default for SnapshotSummary {
@@ -275,6 +282,7 @@ impl Default for SnapshotSummary {
             backup_end: Zoned::now(),
             backup_duration: Default::default(),
             total_duration: Default::default(),
+            items_incomplete: 0,
         }
     }
 }

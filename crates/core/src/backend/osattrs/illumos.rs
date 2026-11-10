@@ -32,7 +32,8 @@ use jiff::Timestamp;
 use log::{debug, warn};
 
 use super::{
-    RestoreErrors, SidUnmapped, Unsupported, XattrErrors, c_path, check,
+    RestoreErrors, SidUnmapped, Unsupported, XattrErrors, XattrsRead, acl_set_error, c_path,
+    check,
     illumos_acl::{self, AceEntry, NOBODY},
     illumos_idmap,
     illumos_project::ZfsProject,
@@ -175,7 +176,12 @@ fn set_ace(of: AclOf<'_>, entries: &[AceEntry]) -> io::Result<()> {
     // raw holds n ace_t.
     _ = of
         .call(ACE_SETACL, n, raw.as_mut_ptr().cast())
-        .map_err(|err| path_error(&format!("{} ACE_SETACL", of.op()), of.path(), &err))?;
+        .map_err(|err| {
+            acl_set_error(
+                path_error(&format!("{} ACE_SETACL", of.op()), of.path(), &err),
+                &err,
+            )
+        })?;
     Ok(())
 }
 
@@ -718,21 +724,27 @@ fn open_attr(dir: &File, name: &str, how: libc::c_int) -> io::Result<File> {
 
 /// The extended attributes of the file at `path`: on illumos, named
 /// attribute files (`runat(1)`, `fsattr(5)`), which the xattr crate doesn't
-/// support.
-pub(super) fn xattrs(path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
+/// support. One whose value can't be read is left out and named in
+/// `unreadable`, and the others are kept, as BackOtter's restic does.
+///
+/// # Errors
+///
+/// * If the attribute directory couldn't be opened or listed.
+pub(super) fn xattrs_read(path: &Path) -> io::Result<XattrsRead> {
+    let mut read = XattrsRead::default();
     let Some(dir) = attr_dir(path)? else {
-        return Ok(Vec::new());
+        return Ok(read);
     };
-    attr_names(&dir)?
-        .into_iter()
-        .map(|name| {
-            let value = attr_value(&dir, &name)?;
-            Ok(ExtendedAttribute {
+    for name in attr_names(&dir)? {
+        match attr_value(&dir, &name) {
+            Ok(value) => read.attrs.push(ExtendedAttribute {
                 name,
                 value: Some(value),
-            })
-        })
-        .collect()
+            }),
+            Err(err) => read.unreadable.push((name, err)),
+        }
+    }
+    Ok(read)
 }
 
 /// The value of the extended attribute `name` in `dir`, an attribute
@@ -1031,7 +1043,7 @@ mod tests {
         assert_eq!(mtime("empty"), before[1]);
         assert_eq!(mtime("same"), before[2]);
         assert_eq!(
-            xattrs(&file).unwrap(),
+            xattrs_read(&file).unwrap().attrs,
             [
                 xattr("diff", b"new"),
                 xattr("empty", b""),

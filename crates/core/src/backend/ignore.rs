@@ -5,6 +5,10 @@ use std::{
     ffi::OsString,
     fs::File,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use bytesize::ByteSize;
@@ -53,6 +57,24 @@ pub enum IgnoreErrorKind {
 
 pub(crate) type IgnoreResult<T> = Result<T, IgnoreErrorKind>;
 
+/// BackOtter: how many entries a [`LocalSource`] gave without some of their
+/// metadata because it couldn't be read (each warned about), shared by the
+/// source and its walkers ([`ReadSource::incomplete`]).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Incomplete(Arc<AtomicU64>);
+
+impl Incomplete {
+    /// Counts one more.
+    pub(crate) fn add(&self) {
+        _ = self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The count.
+    pub(crate) fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// A [`LocalSource`] is a source from local paths which is used to be read from (i.e. to backup it).
 #[derive(Debug)]
 pub struct LocalSource {
@@ -60,6 +82,8 @@ pub struct LocalSource {
     builder: WalkBuilder,
     /// The save options to use.
     save_opts: LocalSourceSaveOptions,
+    /// BackOtter: entries given without some of their metadata.
+    incomplete: Incomplete,
 }
 
 #[serde_as]
@@ -214,7 +238,11 @@ impl LocalSource {
 
         let builder = walk_builder;
 
-        Ok(Self { builder, save_opts })
+        Ok(Self {
+            builder,
+            save_opts,
+            incomplete: Incomplete::default(),
+        })
     }
 }
 
@@ -318,29 +346,57 @@ impl ReadSource for LocalSource {
         LocalSourceWalker {
             walker: self.builder.build(),
             save_opts: self.save_opts,
+            incomplete: self.incomplete.clone(),
         }
     }
 
     /// BackOtter: the node of a directory above the backed-up paths, from
-    /// its own `lstat`, as an entry's node is made, as restic stores it. A
-    /// path that can't be read, or isn't a directory, gets none (a node of
-    /// rustic's own making), with a warning.
+    /// its own `lstat`, as an entry's node is made, as restic stores it; for
+    /// a symlink (a relative path's "home" -> "usr/home"), that of the
+    /// directory it leads to, as restic follows it there. A path that can't
+    /// be read, or isn't a directory, gets none (a node of rustic's own
+    /// making), with a warning.
     fn dir_node(&self, path: &Path) -> Option<Node> {
         let name = path.file_name()?;
-        let m = std::fs::symlink_metadata(path)
-            .inspect_err(|err| warn!("{}: {err}, saved without its metadata", path.display()))
+        // BackOtter: each "saved without its metadata" counts, as restic
+        // fails such a snapshot.
+        let (read_path, m) = std::fs::symlink_metadata(path)
+            .and_then(|m| {
+                if m.file_type().is_symlink() {
+                    let target = std::fs::canonicalize(path)?;
+                    let m = std::fs::symlink_metadata(&target)?;
+                    Ok((target, m))
+                } else {
+                    Ok((path.to_path_buf(), m))
+                }
+            })
+            .inspect_err(|err| {
+                warn!("{}: {err}, saved without its metadata", path.display());
+                self.incomplete.add();
+            })
             .ok()?;
         if !m.is_dir() {
             warn!(
                 "{} is not a directory, saved without its metadata",
                 path.display()
             );
+            self.incomplete.add();
             return None;
         }
         self.save_opts
-            .map_path(path, name, &m)
-            .inspect_err(|err| warn!("{}: {err}, saved without its metadata", path.display()))
+            .map_path(&read_path, name, &m, &self.incomplete, true)
+            .inspect_err(|err| {
+                warn!("{}: {err}, saved without its metadata", path.display());
+                self.incomplete.add();
+            })
             .ok()
+    }
+
+    /// BackOtter: entries given without some of their metadata (flags,
+    /// attributes, extended attributes; a directory above the backed-up
+    /// paths saved without its own), each warned about.
+    fn incomplete(&self) -> u64 {
+        self.incomplete.get()
     }
 }
 
@@ -376,62 +432,92 @@ pub struct LocalSourceWalker {
     walker: Walk,
     /// The save options to use.
     save_opts: LocalSourceSaveOptions,
+    /// BackOtter: entries given without some of their metadata, shared with
+    /// the [`LocalSource`].
+    incomplete: Incomplete,
 }
 
 impl Iterator for LocalSourceWalker {
     type Item = RusticResult<ReadSourceEntry<OpenFile>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        #[cfg(unix)]
-        let mut next = self.walker.next();
-        #[cfg(not(unix))]
-        let next = self.walker.next();
-        // BackOtter: sockets are skipped, as restic skips them: a socket is
-        // only the name a running program listens on, made again when it
-        // starts, and a restored one has nobody listening. So are illumos'
-        // doors (skipped_type).
-        #[cfg(unix)]
-        while let Some(Ok(entry)) = &next
-            && let Some(what) = entry.file_type().and_then(skipped_type)
-        {
-            debug!("{} is {what}, ignoring", entry.path().display());
-            next = self.walker.next();
-        }
-        match next {
-            // ignore root dir, i.e. an entry with depth 0 of type dir
-            // BackOtter: ... unless it has a name. A directory backed up keeps
-            // its own metadata, as restic keeps it, for a restore of
-            // "SNAP:path" to give the destination; "/" has no node in a
-            // snapshot, in restic either.
-            Some(Ok(entry))
-                if entry.depth() == 0
-                    && entry.file_type().unwrap().is_dir()
-                    && entry.path().file_name().is_none() =>
+        loop {
+            #[cfg(unix)]
+            let mut next = self.walker.next();
+            #[cfg(not(unix))]
+            let next = self.walker.next();
+            // BackOtter: sockets are skipped, as restic skips them: a socket
+            // is only the name a running program listens on, made again when
+            // it starts, and a restored one has nobody listening. So are
+            // illumos' doors (skipped_type).
+            #[cfg(unix)]
+            while let Some(Ok(entry)) = &next
+                && let Some(what) = entry.file_type().and_then(skipped_type)
             {
-                self.walker.next()
+                debug!("{} is {what}, ignoring", entry.path().display());
+                next = self.walker.next();
             }
-            item => item,
-        }
-        .map(|e| {
-            self.save_opts
-                .map_entry(e.map_err(|err| {
+            let next = match next {
+                // ignore root dir, i.e. an entry with depth 0 of type dir
+                // BackOtter: ... unless it has a name. A directory backed up
+                // keeps its own metadata, as restic keeps it, for a restore
+                // of "SNAP:path" to give the destination; "/" has no node in
+                // a snapshot, in restic either.
+                Some(Ok(entry))
+                    if entry.depth() == 0
+                        && entry.file_type().unwrap().is_dir()
+                        && entry.path().file_name().is_none() =>
+                {
+                    self.walker.next()
+                }
+                item => item,
+            }?;
+            // BackOtter: an entry below a backed-up path that was deleted
+            // after its directory was listed is warned about as before, but
+            // is not an error the source returns (which counts toward exit
+            // status 3), as BackOtter's restic ignores it.
+            let mut vanished = false;
+            let item = next
+                .map_err(|err| {
+                    vanished = is_vanished(&err, err.depth());
                     RusticError::with_source(
                         ErrorKind::Internal,
                         "Failed to get next entry from walk iterator.",
                         err,
                     )
                     .ask_report()
-                })?)
-                .map_err(|err| {
-                    RusticError::with_source(
-                        ErrorKind::Internal,
-                        "Failed to map Directory entry to ReadSourceEntry.",
-                        err,
-                    )
-                    .ask_report()
                 })
-        })
+                .and_then(|entry| {
+                    let depth = entry.depth();
+                    self.save_opts
+                        .map_entry_counted(entry, &self.incomplete)
+                        .map_err(|err| {
+                            if let IgnoreErrorKind::AcquiringMetadataFailed { source, .. } = &err {
+                                vanished = is_vanished(source, Some(depth));
+                            }
+                            RusticError::with_source(
+                                ErrorKind::Internal,
+                                "Failed to map Directory entry to ReadSourceEntry.",
+                                err,
+                            )
+                            .ask_report()
+                        })
+                });
+            match item {
+                Err(err) if vanished => warn!("ignoring error: {}", err.display_log()),
+                item => return Some(item),
+            }
+        }
     }
+}
+
+/// BackOtter: whether `err`, for an entry at `depth` of the walk, is one
+/// below a backed-up path (depth above 0) that no longer exists.
+fn is_vanished(err: &ignore::Error, depth: Option<usize>) -> bool {
+    depth.is_some_and(|depth| depth > 0)
+        && err
+            .io_error()
+            .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound)
 }
 
 #[cfg(all(test, unix))]

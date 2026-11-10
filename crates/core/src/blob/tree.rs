@@ -5,7 +5,7 @@ pub mod rewrite;
 use std::{
     borrow::Cow,
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, BinaryHeap},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
     ffi::OsStr,
     mem,
     path::{Component, Path, PathBuf, Prefix},
@@ -476,6 +476,12 @@ pub struct TreeStreamerOptions {
     /// recursively list the dir
     #[cfg_attr(feature = "clap", clap(long))]
     pub recursive: bool,
+
+    /// BackOtter: give the directories above each node the globs let
+    /// through, that they don't let through themselves, just before
+    /// it (once each), as a restore needs them, with their metadata
+    #[cfg_attr(feature = "clap", clap(skip))]
+    pub with_parents: bool,
 }
 
 impl Default for TreeStreamerOptions {
@@ -483,6 +489,7 @@ impl Default for TreeStreamerOptions {
         Self {
             excludes: Excludes::default(),
             recursive: true,
+            with_parents: false,
         }
     }
 }
@@ -508,6 +515,15 @@ where
     overrides: Option<Override>,
     /// Whether to stream recursively
     recursive: bool,
+    /// BackOtter: whether to give the directories above a node let through
+    /// that aren't let through themselves ([`TreeStreamerOptions::with_parents`])
+    with_parents: bool,
+    /// BackOtter: for each of `open_iterators`, its directory, while it is
+    /// held back: not let through itself, and no node below it let through
+    /// yet
+    held: Vec<Option<(PathBuf, Node)>>,
+    /// BackOtter: the nodes to give before reading on
+    queue: VecDeque<(PathBuf, Node)>,
 }
 
 impl<'a, BE, I> NodeStreamer<'a, BE, I>
@@ -523,6 +539,8 @@ where
     /// * `node` - The node to start from.
     /// * `overrides` - The glob overrides.
     /// * `recursive` - Whether to stream recursively.
+    /// * `with_parents` - Whether to give the directories above a node let
+    ///   through that aren't let through themselves.
     ///
     /// # Errors
     ///
@@ -534,6 +552,7 @@ where
         node: &Node,
         overrides: Option<Override>,
         recursive: bool,
+        with_parents: bool,
     ) -> RusticResult<Self> {
         let inner = if node.is_dir() {
             if let Some(subtree) = node.subtree {
@@ -552,6 +571,9 @@ where
             index,
             overrides,
             recursive,
+            with_parents,
+            held: Vec::new(),
+            queue: VecDeque::new(),
         })
     }
 
@@ -575,7 +597,14 @@ where
         opts: &TreeStreamerOptions,
     ) -> RusticResult<Self> {
         let overrides = opts.excludes.as_override()?;
-        Self::new_streamer(be, index, node, Some(overrides), opts.recursive)
+        Self::new_streamer(
+            be,
+            index,
+            node,
+            Some(overrides),
+            opts.recursive,
+            opts.with_parents,
+        )
     }
 }
 
@@ -588,9 +617,15 @@ where
     type Item = NodeStreamItem;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(item) = self.queue.pop_front() {
+            return Some(Ok(item));
+        }
         loop {
             if let Some(node) = self.inner.next() {
                 let path = self.path.join(node.name());
+                let ignored = self.overrides.as_ref().is_some_and(|overrides| {
+                    matches!(overrides.matched(&path, false), Match::Ignore(_))
+                });
                 if self.recursive
                     && let Some(id) = node.subtree
                 {
@@ -602,18 +637,29 @@ where
                     };
                     let old_inner = mem::replace(&mut self.inner, tree.nodes.into_iter());
                     self.open_iterators.push(old_inner);
+                    // BackOtter: a directory not let through is held back,
+                    // to be given just before the first node below it that
+                    // is.
+                    let held = self.with_parents && ignored;
+                    self.held.push(held.then(|| (path.clone(), node.clone())));
                 }
 
-                if let Some(overrides) = &self.overrides
-                    && let Match::Ignore(_) = overrides.matched(&path, false)
-                {
+                if ignored {
                     continue;
                 }
-                return Some(Ok((path, node)));
+                if !self.with_parents {
+                    return Some(Ok((path, node)));
+                }
+                // BackOtter: the held directories above it first, outermost
+                // first, each once.
+                self.queue.extend(self.held.iter_mut().filter_map(Option::take));
+                self.queue.push_back((path, node));
+                return self.queue.pop_front().map(Ok);
             }
             // if inner was empty, go to parent path
             self.inner = self.open_iterators.pop()?;
             _ = self.path.pop();
+            _ = self.held.pop();
         }
     }
 }

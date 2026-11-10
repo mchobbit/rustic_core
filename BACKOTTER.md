@@ -224,8 +224,10 @@ that either program restores what the other backed up.
   atimes change whenever something reads a file, so they cost new trees on
   backups where nothing else changed (about 2.3 MB a backup for a
   1,164-directory tree with symlinks; 2026-11-03): a step back from stock
-  for anyone who didn't ask for them. `rewrite`'s `--set-atime` defaults to
-  `mtime` again too, as in stock rustic. With `--set-atime yes` a backup
+  for anyone who didn't ask for them. `rewrite` keeps the stored atimes by
+  default (`--set-atime yes`), as BackOtter's restic does; `--set-atime
+  mtime` or `no` still replace them (stock rustic's rewrite gave every node
+  its mtime as its atime by default). With `--set-atime yes` a backup
   doesn't change the access times it saves: on
   Linux and Android, files are read and directories listed with
   `O_NOATIME`, and, where that is refused (`EPERM`: neither the owner nor
@@ -369,7 +371,8 @@ that either program restores what the other backed up.
   file system has allocated part of it: its blocks are looked at again
   after any failure); one whose holes couldn't be filled otherwise
   (`ENOSPC`, `EIO`, can't be opened for writing) is a warning ("holes not
-  filled"), and the restore goes on, exiting 0 as for other metadata.
+  filled"), and the restore goes on, exiting 0 even under rustic's
+  `--strict-exit`, as restic only warns.
   `--dry-run` looks at the file the same way (never opening it for
   writing) and counts one whose holes would be filled as modified, as
   BackOtter's restic reports it as updated.
@@ -518,12 +521,25 @@ that either program restores what the other backed up.
   Haiku's creation time (`st_crtim`) isn't kept: `unix.birthtime` is
   neither saved nor restored there.
 - A file that can't have extended attributes (a FIFO on ZFS) has none,
-  rather than a warning, as in restic.
+  rather than a warning, as in restic; so does one whose attributes can't
+  be listed with `ENOATTR` (`ENODATA` on Linux), as an SMB/CIFS mount
+  gives, and an attribute whose value the file system says it doesn't
+  support (`ENOTSUP`, `EOPNOTSUPP`, `ENOATTR`) is kept without a value, as
+  restic's `handleXattrErr` takes these (`osattrs::xattr_unsupported`).
+  On restore, these errors are unsupported metadata, as restic's
+  `xattrUnsupported` says.
 - Extended attributes are stored in the byte order of their names, on
   every system (Linux, macOS, FreeBSD, NetBSD, illumos), as BackOtter's
   restic stores them; stock rustic keeps the order the file system lists
   them in. The order means nothing to a restore, which sets each attribute
   by name.
+- One extended attribute whose value can't be read is left out with a
+  warning naming it (`ignoring extended attribute NAME of PATH: ERR`), and
+  the file's others are kept, as in BackOtter's restic; stock rustic
+  dropped them all, with one warning (`ignoring error obtaining xargs`),
+  which is still what a list of them that can't be read gives
+  (`LocalSourceSaveOptions::xattrs_with` in `backend/ignore/mapper.rs`; on
+  illumos `xattrs_read` in `osattrs/illumos.rs`; Haiku's are read whole).
 - bcachefs' `bcachefs_effective.*` extended attributes aren't kept, nor
   set or removed by a restore (one in a snapshot of stock restic's is
   skipped): they show the options a file has, its own (`bcachefs.*`, kept
@@ -549,7 +565,8 @@ that either program restores what the other backed up.
   project (reading it opens the file). One warning names it
   (`PATH: av_quarantined: contents not backed up (N bytes)`) and the backup
   exits 0. Any other file that can't be opened is left out, as before,
-  with `ignoring error: Failed to open ...`. The source's attribute is
+  with `ignoring error: Failed to open ...`, and counts toward exit 3
+  under rustic's `--strict-exit`. The source's attribute is
   never cleared or changed. A restore makes such a file empty, a new one
   in place of any file there (which may be quarantined, its contents and
   extended attributes closed to the restore too), as BackOtter's restic
@@ -663,15 +680,36 @@ that either program restores what the other backed up.
   naming the first file, and the number of files at the end, as do SIDs
   idmap can't map on illumos (per attribute). Any other
   failure (`EPERM`, `EDQUOT`, `EIO`, ...) is warned about for each file.
-  Neither changes the exit status: like stock rustic's, the restore only
-  warns about metadata it can't set, where BackOtter's restic fails (exit
-  1) for failures other than unsupported ones. That is the one difference in
-  exit status left between the two. ACLs the file system can't hold
-  (`EOPNOTSUPP`/`ENOTSUP`; on illumos an NFSv4 ACL, `illumos.acl` or one in
-  `illumos.xattr_meta`, refused with `ENOSYS` by tmpfs and UFS, which have
-  only POSIX-draft ACLs) are warned about per file, and the file keeps the
-  mode restored before it; BackOtter's restic now does the same and exits
-  0 (it had failed, exit 1).
+  By default neither changes the exit status: like stock rustic's, the
+  restore only warns about metadata it can't set. With rustic's
+  `--strict-exit` the failures BackOtter's restic counts as errors make the
+  restore exit 1, as restic does (`RestoreStats::errors` for those of the
+  collect phase, `RestoreOutcome::errors` for the rest): a special file
+  that couldn't be made, an owner, extended attribute, attribute (FreeBSD's
+  system extended attributes, illumos' attribute metadata, project IDs,
+  Haiku's attributes), mode, symlink mode, ACL, birth time or times that
+  couldn't be set, flags that go on before a directory's entries or a
+  file's contents, the late flags, DOS flags, FAT attributes and XFS
+  options, an entry `--delete` couldn't remove (or a failed walk of the
+  destination with `--delete`), and what has a node's name but another
+  type and couldn't be removed. What stays a warning, exit 0, as in
+  restic: metadata the file system doesn't support (`Unsupported`,
+  `ErrorKind::Unsupported`), SIDs idmap couldn't map, a permission refused
+  (`EPERM`, `EACCES`) to a restore not running as root for the owner,
+  extended attributes, attributes, mode, ACLs, birth time and times (as
+  restic's restore forgives them then: `trusted.*` and `security.*`
+  attributes, files someone else owns; the late flags still count, as in
+  restic), user or group names unknown here, casefolding not restored,
+  unknown or malformed generic attributes, holes not filled, and a file
+  whose contents weren't backed up (`av_quarantined`). Contents that
+  couldn't be written fail the restore with or without it (above). ACLs
+  the file system can't hold (`EOPNOTSUPP`/`ENOTSUP`, which the FreeBSD,
+  NetBSD and illumos code gives as `ErrorKind::Unsupported`; on illumos an
+  NFSv4 ACL, `illumos.acl` or one in `illumos.xattr_meta`, refused with
+  `ENOSYS` by tmpfs and UFS, which have only POSIX-draft ACLs) are warned
+  about per file, and the file keeps the mode restored before it;
+  BackOtter's restic now does the same and exits 0 (it had failed, exit
+  1), and so does rustic-bko under `--strict-exit`.
 - A restore not running as root says nothing about an owner it isn't
   permitted to set (`EPERM`, `EACCES`; debug log only), as BackOtter's
   restic and stock restic (and `cp -a`, `rsync -a`) don't: stock rustic
@@ -750,8 +788,8 @@ that either program restores what the other backed up.
   special file that can't be made (a device node, as an unprivileged user)
   gets one warning and nothing else, not one more for each metadata step
   after. restic reports it once too, but as an error (`ignoring error for
-  /chardev: mknod ...`, exit 1): the one difference in exit status left,
-  above.
+  /chardev: mknod ...`, exit 1); so does rustic-bko under `--strict-exit`,
+  exit 1, as restic (above).
 - A backup stores special files' nodes as restic does: a character
   device's mode has Go's `ModeDevice` and `ModeCharDevice` (stock rustic
   ANDs the two bits, which gives none), only a regular file has a size
@@ -841,8 +879,15 @@ that either program restores what the other backed up.
   append-only file on ZFS couldn't change it (a warning per step; restic
   exited 1); OpenZFS 2.3.9 clears both. The same in BackOtter's restic.
 - Partial restores (`--glob`, `--iglob`): directories above the matches
-  that aren't matched themselves aren't streamed, so the restore creates
-  them without any metadata, casefolding included, as stock rustic does.
+  that aren't matched themselves are streamed too, each just before the
+  first match below it (`TreeStreamerOptions::with_parents`, which rustic's
+  restore sets; `ls`, `find`, `diff` and `dump` keep the stock stream), so
+  the restore gives them their metadata and casefolding, as BackOtter's
+  restic does; stock rustic created them without any. Accepted
+  difference: a directory whose only match is a socket is created (restic
+  skips sockets before matching). As in stock rustic, the children of a
+  directory excluded with `--glob '!dir'` are still restored (each path is
+  matched on its own); that directory now gets its metadata too.
 - Birth times are restored just before the atime and mtime, as part of
   setting the times, after contents, extended attributes, mode and ACLs
   (none of which changes them) and before the late flags pass. illumos sets
@@ -937,6 +982,52 @@ that either program restores what the other backed up.
   pairs for a Debian system's backup). A backup of a 35,000-path, 1.4 GB
   tree took 13.5 s before and takes 4.0 s now, with the same snapshot,
   tree IDs and all (see BACKOTTER.md in rustic, "Building").
+- What a backup left out, and what a restore couldn't do, are counted, for
+  rustic's `--strict-exit` to exit as BackOtter's restic does (3 for an
+  incomplete backup, 1 for a restore with errors); without it nothing
+  changes, the counts are only there. `SnapshotSummary::items_incomplete`
+  (not saved in the snapshot: `#[serde(skip)]`, so snapshot files and
+  `--json` stay as they were) counts the entries, or parts of their
+  metadata, a backup left out because they couldn't be read, each warned
+  about; the archiver sums its own drops (`archiver.rs`), the parent trees
+  it couldn't load and the unchanged files it re-read for blobs missing
+  from the index (`archiver/parent.rs`) and the source's own count
+  (`ReadSource::incomplete`, 0 by default; `LocalSource` counts in each of
+  its walkers). Counted, as restic counts them: an entry the walk couldn't
+  give (a directory that can't be listed, an `lstat` or `readlink` that
+  failed, a backup path that doesn't exist, an ignore file's error), an
+  entry the parent's tree stack lost, a file that couldn't be opened or
+  read, a parent tree that couldn't be loaded, an unchanged file whose
+  blobs are missing from the index (`missing blobs in index for unchanged
+  file ...; re-reading file`, as restic's `parts of ... not found in the
+  repository index; storing the file again`), file flags or attributes
+  (ACLs, project IDs, DOS, FAT and XFS attributes, system attributes) that
+  couldn't be read, extended attributes that couldn't be listed or read
+  (but not, for a directory above the backed-up paths, a permission
+  refused, which restic ignores there), and a directory above the
+  backed-up paths saved without its own metadata (restic fails such a
+  snapshot; rustic-bko keeps it, with a node of its own making, and exits
+  3); such a directory that is a symlink (a relative path's `home` ->
+  `usr/home`) is stored with the metadata of the directory it leads to, as
+  restic follows it, not counted. Not counted, as restic only warns or
+  never sees them: an entry below a backed-up path deleted after its
+  directory was listed (its `lstat`, or listing it, gives `NotFound`:
+  still warned about, `ignoring error: ...`, where restic is silent), a
+  parent node that is no tree, extended attributes the file system says
+  it doesn't support (`ENOTSUP`, `EOPNOTSUPP`, or `ENOATTR`/`ENODATA`, as
+  an SMB/CIFS mount gives: no attributes listed, or one kept without a
+  value, as restic's `handleXattrErr`), `idmap offline: SID owners not
+  kept`, `av_quarantined: contents not
+  backed up`, a Haiku attribute name that isn't UTF-8, errors of the size
+  scan, `--exclude-if-xattr` errors (the entry is still backed up), sockets
+  and doors skipped, and the errors of opening a file for its flags, which
+  are only logged at debug level. On restore,
+  `RestoreStats::errors` counts the failures of preparing (walking the
+  destination for `--delete`, removing what is in the way, flags before
+  entries or contents) and `Repository::restore` returns a
+  `RestoreOutcome`, whose `errors` counts those of setting metadata and
+  making special files, by restic's rules (above, under metadata the target
+  file system doesn't support).
 - The version reads `X.Y.Z+backotter.N`.
 
 The system calls need `unsafe`, which the workspace lints now deny (not
