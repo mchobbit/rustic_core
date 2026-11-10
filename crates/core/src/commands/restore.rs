@@ -32,6 +32,9 @@ use crate::{
     repository::{IndexedFull, IndexedTree, Open, Repository},
 };
 
+mod exact;
+pub use exact::CloneSources;
+
 pub(crate) mod constants {
     /// The maximum number of reader threads to use for restoring.
     pub(crate) const MAX_READER_THREADS_NUM: usize = 20;
@@ -79,6 +82,12 @@ pub struct RestoreOptions {
     #[cfg_attr(feature = "clap", clap(long))]
     pub verify_existing: bool,
 
+    // BackOtter: for bko-holt's btrfs snapshots, each a snapshot of a tree
+    // restored before (commands/restore/exact.rs).
+    /// Make the destination exactly the snapshot, writing only what differs: implies --delete and --verify-existing; a file with other names gets a name of its own first; an entry whose metadata already matches is left untouched
+    #[cfg_attr(feature = "clap", clap(long))]
+    pub exact: bool,
+
     // BackOtter: new files that had holes ("unix.sparse") are restored
     // sparse anyway, see write_sparse.
     /// Restore sparse files: by-content makes holes for zero runs in every new file [default: only in new files that had holes]
@@ -112,6 +121,19 @@ pub enum SnapshotOrigin {
     Restic,
     /// BackOtter's restic or rustic: missing attributes are zero or none
     BackOtter,
+}
+
+impl RestoreOptions {
+    /// BackOtter: the options as the restore applies them: `exact` implies
+    /// `delete` and `verify_existing`.
+    #[must_use]
+    pub const fn resolved(mut self) -> Self {
+        if self.exact {
+            self.delete = true;
+            self.verify_existing = true;
+        }
+        self
+    }
 }
 
 impl SnapshotOrigin {
@@ -734,6 +756,17 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         count();
                     }
                 }
+                // BackOtter: under --exact, a file there with other names
+                // gets one of its own first, so that no write reaches them.
+                if opts.exact
+                    && exists
+                    && !dry_run
+                    && exact::has_other_names(&target)
+                    && let Err(err) = exact::break_link(&target)
+                {
+                    error!("restore {}: its hard link not broken: {err}", path.display());
+                    count();
+                }
                 // BackOtter: whether the file goes into a new, empty file,
                 // which can be restored sparse (write_sparse): nothing is
                 // there now, seen by the walk of the destination or not (a
@@ -765,6 +798,11 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                     }
                     filled.changed
                 };
+                // BackOtter: under --exact, a file restored elsewhere with
+                // the same contents (--clone-from) is cloned, not written.
+                let clone = (opts.exact && !dry_run && exact::clone_ok(node))
+                    .then(|| node.content.as_deref().and_then(|c| dest.clone_source(c)))
+                    .flatten();
                 // collect blobs needed for restoring
                 match (
                     exists,
@@ -775,8 +813,17 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         repo,
                         opts.verify_existing,
                         sparse,
+                        clone.as_deref(),
                     )?,
                 ) {
+                    (true, AddFileResult::Cloned) => {
+                        stats.files.modify += 1;
+                        debug!("cloned: {}", path.display());
+                    }
+                    (false, AddFileResult::Cloned) => {
+                        stats.files.restore += 1;
+                        debug!("cloned: {}", path.display());
+                    }
                     // Note that exists = false and Existing or Verified can happen if the file is changed between scanning the dir
                     // and calling add_file. So we don't care about exists but trust add_file here.
                     (_, AddFileResult::Existing) => {
@@ -855,9 +902,15 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                             osattrs::clear_restricting_flags(destination.path());
                         }
                         // process existing node
+                        // BackOtter: under --exact, a special file that is
+                        // already the same (a symlink to the same target)
+                        // stays, and so stays shared.
+                        let kept_special = node.is_special()
+                            && opts.exact
+                            && exact::same_type(destination.path(), node);
                         if (node.is_dir() && !destination.file_type().is_dir())
                             || (node.is_file() && !destination.file_type().is_file())
-                            || node.is_special()
+                            || (node.is_special() && !kept_special)
                         {
                             // if types do not match, first remove the existing file
                             let removed;
@@ -937,8 +990,24 @@ fn restore_metadata(
     // just before them.
     let mut file_flags = Vec::new();
     let mut flags_linked = BTreeSet::new();
+    let numeric = ownership(opts) == Ownership::Numeric;
+    let owned = ownership(opts) != Ownership::None;
     let mut finish = |path: &PathBuf, node: &Node| {
-        let made = set_metadata(dest, opts, path, node, &mut tally);
+        // BackOtter: under --exact, an entry whose metadata already matches
+        // is left untouched: setting it again would change its inode (the
+        // change time), which a btrfs snapshot then no longer shares.
+        if opts.exact
+            && dest
+                .path(path)
+                .is_ok_and(|t| exact::already_matches(&t, node, numeric, owned))
+        {
+            trace!("metadata already matches: {}", path.display());
+            return;
+        }
+        let create = !(opts.exact
+            && node.is_special()
+            && dest.path(path).is_ok_and(|t| exact::same_type(&t, node)));
+        let made = set_metadata(dest, opts, path, node, create, &mut tally);
         let late = LateAttrs {
             flags: osattrs::file_flags(node),
             dos_flags: osattrs::zfs_dos_flags(node),
@@ -964,6 +1033,10 @@ fn restore_metadata(
         if let Some(key) = hardlink_key(&node)
             && let Some(canonical) = hardlink_candidates.get(&key)
             && canonical != &path
+            // BackOtter: under --exact, a name already of that file stays.
+            && !(opts.exact
+                && matches!((dest.path(canonical), dest.path(&path)),
+                    (Ok(a), Ok(b)) if exact::same_file(&a, &b)))
         {
             debug!(
                 "restoring hardlink {} -> {}",
@@ -1152,10 +1225,12 @@ fn set_metadata(
     opts: RestoreOptions,
     path: &PathBuf,
     node: &Node,
+    create: bool,
     tally: &mut RestoreTally,
 ) -> bool {
     debug!("setting metadata for {}", path.display());
-    if let Err(err) = dest.create_special(path, node) {
+    // BackOtter: not a special file kept as it was (--exact).
+    if create && let Err(err) = dest.create_special(path, node) {
         warn!(
             "restore {}: creating special file failed: {err}",
             path.display()
@@ -1508,6 +1583,8 @@ pub struct RestorePlan {
     pub restore_size: u64,
     /// The total size of matched content, i.e. content with needs no restore.
     pub matched_size: u64,
+    /// BackOtter: the total size of the files cloned (`--clone-from`)
+    pub cloned_size: u64,
     /// Statistics about the restore.
     pub stats: RestoreStats,
 }
@@ -1531,6 +1608,8 @@ enum AddFileResult {
     Existing,
     Verified,
     Modify,
+    /// BackOtter: cloned whole from a file restored elsewhere
+    Cloned,
 }
 
 impl RestorePlan {
@@ -1561,6 +1640,7 @@ impl RestorePlan {
         repo: &Repository<S>,
         ignore_mtime: bool,
         sparse: bool,
+        clone: Option<&std::path::Path>,
     ) -> RusticResult<AddFileResult> {
         let mut open_file = dest.get_matching_file(&name, file.meta.size);
 
@@ -1611,9 +1691,9 @@ impl RestorePlan {
             }
 
         let file_idx = self.names.len();
-        self.names.push(name);
         let mut file_pos = 0;
         let mut has_unmatched = false;
+        let mut blobs = Vec::new();
         for id in file.content.iter().flatten() {
             let ie = repo.get_index_entry(id)?;
             let bl = ie.location;
@@ -1622,22 +1702,51 @@ impl RestorePlan {
             let matches = open_file
                 .as_mut()
                 .is_some_and(|file| id.blob_matches_reader(length, file));
+            has_unmatched |= !matches;
+            blobs.push((ie.pack, bl, file_pos, length, matches));
+            file_pos += length;
+        }
 
-            let blob_location = self.r.entry((ie.pack, bl)).or_default();
-            blob_location.push(FileLocation {
+        // BackOtter: a file that doesn't match, whose contents a file
+        // restored elsewhere has (--clone-from), is cloned whole; if the
+        // clone fails, it is written, all of it (the clone may have emptied
+        // it).
+        let mut emptied = false;
+        if has_unmatched && let Some(src) = clone {
+            drop(open_file.take());
+            let target = dest.path(&name).map_err(|err| {
+                RusticError::with_source(
+                    ErrorKind::InputOutput,
+                    "Invalid path in snapshot for restore destination: `{path}`.",
+                    err,
+                )
+                .attach_context("path", name.display().to_string())
+            })?;
+            match exact::clone_file(src, &target, file.meta.size) {
+                Ok(()) => {
+                    self.cloned_size += file.meta.size;
+                    return Ok(AddFileResult::Cloned);
+                }
+                Err(err) => {
+                    debug!("not cloned from {}: {err}", src.display());
+                    emptied = true;
+                }
+            }
+        }
+
+        self.names.push(name);
+        for (pack, bl, file_start, length, matches) in blobs {
+            let matches = matches && !emptied;
+            self.r.entry((pack, bl)).or_default().push(FileLocation {
                 file_idx,
-                file_start: file_pos,
+                file_start,
                 matches,
             });
-
             if matches {
                 self.matched_size += length;
             } else {
                 self.restore_size += length;
-                has_unmatched = true;
             }
-
-            file_pos += length;
         }
 
         self.file_lengths.push(file_pos);

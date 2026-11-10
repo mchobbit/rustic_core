@@ -147,9 +147,25 @@ pub struct LocalDestination {
     path: PathBuf,
     /// Whether we expect a single file as destination.
     is_file: bool,
+    /// BackOtter: files restored elsewhere, which `restore --exact` may
+    /// clone (`--clone-from`)
+    clone_sources: Option<std::sync::Arc<crate::commands::restore::CloneSources>>,
 }
 
 impl LocalDestination {
+    /// BackOtter: the destination, with files restored elsewhere on its file
+    /// system that `restore --exact` may clone instead of writing.
+    #[must_use]
+    pub fn with_clone_sources(mut self, sources: crate::commands::restore::CloneSources) -> Self {
+        self.clone_sources = Some(std::sync::Arc::new(sources));
+        self
+    }
+
+    /// BackOtter: a file restored elsewhere that holds `content`, if any.
+    pub(crate) fn clone_source(&self, content: &[crate::blob::DataId]) -> Option<PathBuf> {
+        self.clone_sources.as_ref()?.get(content).map(Path::to_path_buf)
+    }
+
     /// Create a new [`LocalDestination`]
     ///
     /// # Arguments
@@ -192,7 +208,7 @@ impl LocalDestination {
             }
         }
 
-        Ok(Self { path, is_file })
+        Ok(Self { path, is_file, clone_sources: None })
     }
 
     /// Path to the given item (relative to the base path)
