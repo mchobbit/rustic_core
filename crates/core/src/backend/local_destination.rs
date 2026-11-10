@@ -577,6 +577,19 @@ impl LocalDestination {
         Ok(())
     }
 
+    #[cfg(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku"))]
+    /// BackOtter: [`Self::set_extended_attributes`]; the SELinux label is
+    /// Linux's only.
+    pub(crate) fn set_extended_attributes_all(
+        &self,
+        item: impl AsRef<Path>,
+        extended_attributes: &[ExtendedAttribute],
+        stock_names: bool,
+        _remove_label: bool,
+    ) -> LocalDestinationResult<()> {
+        self.set_extended_attributes(item, extended_attributes, stock_names)
+    }
+
     #[cfg(any(target_os = "illumos", target_os = "haiku"))]
     /// BackOtter: set extended attributes for `item` (relative to the base
     /// path): on illumos, named attribute files, and on Haiku, attributes of
@@ -622,6 +635,19 @@ impl LocalDestination {
         extended_attributes: &[ExtendedAttribute],
         stock_names: bool,
     ) -> LocalDestinationResult<()> {
+        self.set_extended_attributes_all(item, extended_attributes, stock_names, false)
+    }
+
+    #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+    /// BackOtter: [`Self::set_extended_attributes`]; with `remove_label`
+    /// (`restore --exact`), an SELinux label the node doesn't have goes too.
+    pub(crate) fn set_extended_attributes_all(
+        &self,
+        item: impl AsRef<Path>,
+        extended_attributes: &[ExtendedAttribute],
+        stock_names: bool,
+        remove_label: bool,
+    ) -> LocalDestinationResult<()> {
         let filename = self.path(item)?;
         // BackOtter: nothing to do where the xattr crate has no support,
         // rather than an error for each file.
@@ -629,7 +655,7 @@ impl LocalDestination {
             return Ok(());
         }
         let bsd_stock = stock_names && cfg!(any(target_os = "freebsd", target_os = "netbsd"));
-        set_xattrs_with(&SystemXattrs, &filename, extended_attributes, bsd_stock)
+        set_xattrs_all(&SystemXattrs, &filename, extended_attributes, bsd_stock, remove_label)
             .map_err(LocalDestinationErrorKind::XattrsNotSet)
     }
 
@@ -1079,6 +1105,19 @@ fn set_xattrs_with(
     extended_attributes: &[ExtendedAttribute],
     bsd_stock: bool,
 ) -> Result<(), osattrs::XattrErrors> {
+    set_xattrs_all(calls, filename, extended_attributes, bsd_stock, false)
+}
+
+/// BackOtter: [`set_xattrs_with`]; with `remove_label`, an SELinux label
+/// that isn't among `extended_attributes` is removed too (`restore --exact`).
+#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+fn set_xattrs_all(
+    calls: &impl XattrCalls,
+    filename: &Path,
+    extended_attributes: &[ExtendedAttribute],
+    bsd_stock: bool,
+    remove_label: bool,
+) -> Result<(), osattrs::XattrErrors> {
     let names: Vec<_> = extended_attributes
         .iter()
         .map(|ExtendedAttribute { name, .. }| xattr_restore_names(name, bsd_stock))
@@ -1130,7 +1169,7 @@ fn set_xattrs_with(
                 }
             }
             // BackOtter: nor the SELinux label (osattrs::xattr_never_removed).
-            None if osattrs::xattr_never_removed(&curr_node_name) => {}
+            None if !remove_label && osattrs::xattr_never_removed(&curr_node_name) => {}
             None => {
                 if let Err(err) = calls.remove(filename, &curr_name) {
                     // BackOtter: bcachefs refusing to clear casefolding
