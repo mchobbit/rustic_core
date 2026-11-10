@@ -73,16 +73,31 @@ pub(super) fn clone_ok(node: &Node) -> bool {
     osattrs::takes_nothing_before_data(node)
 }
 
+/// Why [`clone_file`] didn't clone.
+#[derive(Debug)]
+pub(super) enum CloneFailed {
+    /// Nothing was done: `dst` is as it was.
+    Untouched(io::Error),
+    /// `dst` was made or emptied first.
+    Emptied(io::Error),
+}
+
 /// The file `dst` (made, or emptied) gets the whole contents of `src`,
 /// sharing its extents, if the file system can.  `size` is what `src` must
-/// hold.
-pub(super) fn clone_file(src: &Path, dst: &Path, size: u64) -> io::Result<()> {
-    let s = std::fs::File::open(src)?;
-    if s.metadata()?.len() != size {
-        return Err(io::Error::other(format!("{} isn't {size} bytes", src.display())));
+/// hold; `dst` is touched only once `src` is open and that size.
+pub(super) fn clone_file(src: &Path, dst: &Path, size: u64) -> Result<(), CloneFailed> {
+    let s = std::fs::File::open(src).map_err(CloneFailed::Untouched)?;
+    let len = s.metadata().map_err(CloneFailed::Untouched)?.len();
+    if len != size {
+        return Err(CloneFailed::Untouched(io::Error::other(format!("{} isn't {size} bytes", src.display()))));
     }
-    let d = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(dst)?;
-    osattrs::clone_contents(&s, &d)
+    let d = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(dst)
+        .map_err(CloneFailed::Untouched)?;
+    osattrs::clone_contents(&s, &d).map_err(CloneFailed::Emptied)
 }
 
 /// The existing file `path`, which has other names: its name gets a file of
@@ -97,7 +112,9 @@ pub(super) fn break_link(path: &Path) -> io::Result<bool> {
     let tmp = dir.join(tmp_name);
     let cloned = (|| {
         let size = std::fs::symlink_metadata(path)?.len();
-        clone_file(path, &tmp, size)?;
+        clone_file(path, &tmp, size).map_err(|e| match e {
+            CloneFailed::Untouched(e) | CloneFailed::Emptied(e) => e,
+        })?;
         std::fs::rename(&tmp, path)
     })();
     match cloned {

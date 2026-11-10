@@ -1849,16 +1849,22 @@ impl<S: IndexedFull> Repository<S> {
 
     /// BackOtter: the files under `node` (a directory of a snapshot, or a
     /// file), restored at `dir`, by their contents: what `restore --exact`
-    /// may clone from ([`LocalDestination::with_clone_sources`]).  `dir`
-    /// must hold `node` as restored, unchanged since.
+    /// may clone from ([`LocalDestination::with_clone_sources`]): those that
+    /// are there, of their size.  `dir` must hold `node` as restored,
+    /// unchanged since.
     ///
     /// # Errors
     ///
     /// * If the trees below `node` can't be read.
     pub fn clone_sources(&self, node: &Node, dir: &Path) -> RusticResult<CloneSources> {
         let mut sources = CloneSources::new();
+        // Only files that are there, of their size: not what `dir` doesn't
+        // hold (the paths below other subvolumes' mount points, aliases).
         let mut add = |path: PathBuf, n: &Node| {
-            if n.is_file() && n.meta.size > 0 {
+            if n.is_file()
+                && n.meta.size > 0
+                && std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file() && m.len() == n.meta.size)
+            {
                 if let Some(content) = n.content.as_ref().filter(|c| !c.is_empty()) {
                     sources.insert(content.clone(), path);
                 }

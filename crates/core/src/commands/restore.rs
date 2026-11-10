@@ -1727,7 +1727,10 @@ impl RestorePlan {
                     self.cloned_size += file.meta.size;
                     return Ok(AddFileResult::Cloned);
                 }
-                Err(err) => {
+                Err(exact::CloneFailed::Untouched(err)) => {
+                    debug!("not cloned from {}: {err}", src.display());
+                }
+                Err(exact::CloneFailed::Emptied(err)) => {
                     debug!("not cloned from {}: {err}", src.display());
                     emptied = true;
                 }
