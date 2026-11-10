@@ -286,6 +286,40 @@ pub(crate) fn unread_size(node: &Node) -> Option<u64> {
 /// # Errors
 ///
 /// * If the file can't be created, or the flags set.
+/// BackOtter: `dst` gets `src`'s whole contents, sharing its extents
+/// (Linux's `FICLONE`), where the file system can; `restore --clone-from`.
+pub(crate) fn clone_contents(src: &File, dst: &File) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        /// `_IOW(0x94, 9, int)`
+        const FICLONE: libc::Ioctl = 0x4004_9409;
+        // SAFETY: FICLONE takes the source's descriptor as its argument;
+        // both are open for the call's duration.
+        if unsafe { libc::ioctl(dst.as_raw_fd(), FICLONE, src.as_raw_fd()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        _ = (src, dst);
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
+/// BackOtter: whether [`prepare_file`] has nothing to do for `node`: no flag
+/// or option that goes on before the data, so that its contents may come
+/// whole from a clone (`restore --clone-from`).
+pub(crate) fn takes_nothing_before_data(node: &Node) -> bool {
+    let flags = file_flags(node).is_none_or(|f| f & os::FLAGS_BEFORE_DATA == 0);
+    #[cfg(target_os = "linux")]
+    let options = xfs_options(node).is_none();
+    #[cfg(not(target_os = "linux"))]
+    let options = true;
+    flags && options
+}
+
 pub(crate) fn prepare_file(path: &Path, node: &Node) -> io::Result<()> {
     let flags = match file_flags(node) {
         Some(flags) if flags & os::FLAGS_BEFORE_DATA != 0 => {

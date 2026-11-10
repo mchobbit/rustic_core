@@ -51,7 +51,8 @@ use crate::{
         },
         repoinfo::{IndexInfos, RepoFileInfos},
         restore::{
-            RestoreOptions, RestoreOutcome, RestorePlan, collect_and_prepare, restore_repository,
+            CloneSources, RestoreOptions, RestoreOutcome, RestorePlan, collect_and_prepare,
+            restore_repository,
         },
         rewrite::{RewriteOptions, rewrite_snapshots, rewrite_snapshots_and_trees},
     },
@@ -1621,7 +1622,7 @@ impl<S: IndexedTree> Repository<S> {
         node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
         dest: &LocalDestination,
     ) -> RusticResult<RestoreOutcome> {
-        restore_repository(restore_infos, self, *opts, node_streamer, dest)
+        restore_repository(restore_infos, self, opts.resolved(), node_streamer, dest)
     }
 
     /// Merge the given trees.
@@ -1843,7 +1844,36 @@ impl<S: IndexedFull> Repository<S> {
         dest: &LocalDestination,
         dry_run: bool,
     ) -> RusticResult<RestorePlan> {
-        collect_and_prepare(self, *opts, node_streamer, dest, dry_run)
+        collect_and_prepare(self, opts.resolved(), node_streamer, dest, dry_run)
+    }
+
+    /// BackOtter: the files under `node` (a directory of a snapshot, or a
+    /// file), restored at `dir`, by their contents: what `restore --exact`
+    /// may clone from ([`LocalDestination::with_clone_sources`]).  `dir`
+    /// must hold `node` as restored, unchanged since.
+    ///
+    /// # Errors
+    ///
+    /// * If the trees below `node` can't be read.
+    pub fn clone_sources(&self, node: &Node, dir: &Path) -> RusticResult<CloneSources> {
+        let mut sources = CloneSources::new();
+        let mut add = |path: PathBuf, n: &Node| {
+            if n.is_file() && n.meta.size > 0 {
+                if let Some(content) = n.content.as_ref().filter(|c| !c.is_empty()) {
+                    sources.insert(content.clone(), path);
+                }
+            }
+        };
+        if node.is_dir() {
+            let ls_opts = LsOptions::default().recursive(true);
+            for item in self.ls(node, &ls_opts)? {
+                let (path, n) = item?;
+                add(dir.join(path), &n);
+            }
+        } else {
+            add(dir.to_path_buf(), node);
+        }
+        Ok(sources)
     }
 
     /// Copy the given `snapshots` to `repo_dest`.
