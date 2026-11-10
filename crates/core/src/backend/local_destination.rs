@@ -629,6 +629,7 @@ impl LocalDestination {
     /// # Returns
     ///
     /// Ok if the extended attributes were set.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_extended_attributes(
         &self,
         item: impl AsRef<Path>,
@@ -1099,6 +1100,7 @@ fn xattr_restore_names(name: &str, bsd_stock: bool) -> (Option<String>, String) 
 /// * Each extended attribute that couldn't be set or removed, and a failure
 ///   to list them, all in one.
 #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn set_xattrs_with(
     calls: &impl XattrCalls,
     filename: &Path,
