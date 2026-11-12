@@ -127,8 +127,9 @@ pub const KNOWN: &[&str] = &[
 
 /// The value of [`LINUX_XFS_OPTIONS`]: the kept `fsx_xflags` (extent size
 /// hint `e`, its inheritance `E`, nodefrag `f`, filestream `S`, nosymlinks
-/// `n`, copy-on-write extent size hint `C`), and the two hints' sizes in
-/// bytes, left out when 0, as BackOtter's restic writes them:
+/// `n`, copy-on-write extent size hint `C`, and on a directory realtime
+/// inheritance `t`), and the two hints' sizes in bytes, left out when 0, as
+/// BackOtter's restic writes them:
 /// `{"cowextsize":2097152,"extsize":1048576,"xflags":67584}`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct XfsOptions {

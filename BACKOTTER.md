@@ -142,15 +142,18 @@ that either program restores what the other backed up.
     `0x58465342`; `FS_IOC_FSGETXATTR`) that `linux.inode_flags` and
     `linux.project_id` don't carry, as
     `{"cowextsize":2097152,"extsize":1048576,"xflags":67584}`: of
-    `fsx_xflags`, nosymlinks (`n`, `0x400`), the extent size hint (`e`,
-    `0x800`), its inheritance (`E`, `0x1000`), nodefrag (`f`, `0x2000`),
-    filestream (`S`, `0x4000`) and the copy-on-write extent size hint
-    (`C`, `0x10000`), with the hints' sizes in bytes, each left out when 0
-    (XFS gives a size only with its flag); the keys in byte order, as
-    serde_json writes them and BackOtter's restic too. Regular files and
-    directories that have any of them. Not realtime and its inheritance,
-    which need a realtime device, nor DAX; nor preallocated (`p`), which a
-    dense restore gives every file it preallocates, and a sparse one none:
+    `fsx_xflags`, realtime inheritance (`t`, `0x100`, directories only),
+    nosymlinks (`n`, `0x400`), the extent size hint (`e`, `0x800`), its
+    inheritance (`E`, `0x1000`), nodefrag (`f`, `0x2000`), filestream
+    (`S`, `0x4000`) and the copy-on-write extent size hint (`C`,
+    `0x10000`), with the hints' sizes in bytes, each left out when 0 (XFS
+    gives a size only with its flag); the keys in byte order, as serde_json
+    writes them and BackOtter's restic too. Regular files and directories
+    that have any of them. Realtime inheritance is only a directory's (XFS
+    gives a regular file none), and a directory takes it without a realtime
+    device; not realtime (`r`, `0x1`), which only a regular file on a
+    realtime device has, nor DAX; nor preallocated (`p`), which a dense
+    restore gives every file it preallocates, and a sparse one none:
     an accepted difference, in both tools, as the blocks themselves are.
   - `haiku.attributes`: Haiku's file attributes (BFS, `listattr(1)`) other
     than its extended attributes (below), with their type codes. BackOtter's
