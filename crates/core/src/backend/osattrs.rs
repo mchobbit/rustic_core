@@ -489,6 +489,22 @@ pub(crate) fn restore_fat_attrs(path: &Path, node_type: &NodeType, attrs: u32) -
     }
 }
 
+/// Takes the XFS options (Linux) off the existing directory at `path`, which
+/// the restore is about to put entries in, so that they inherit none of them
+/// (XFS passes each to the entries a directory gets after it), and returns
+/// those it had, if it took any off, for [`restore_xfs_options`] to put back
+/// in the late pass where the directory's node has none. Only on XFS; an
+/// error leaves the directory as it is. Elsewhere nothing.
+pub(crate) fn clear_dir_xfs_options(path: &Path) -> Option<XfsOptions> {
+    #[cfg(target_os = "linux")]
+    return os::clear_dir_xfs_options(path);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// Sets the XFS options (Linux) of the file at `path`, of type `node_type`,
 /// to `opts`, before [`restore_file_flags`]. Elsewhere nothing.
 ///
@@ -496,7 +512,10 @@ pub(crate) fn restore_fat_attrs(path: &Path, node_type: &NodeType, attrs: u32) -
 ///
 /// * If they couldn't be set: an [`Unsupported`] error if the file system
 ///   isn't XFS, or refuses them (`EINVAL`: a new extent size hint on a file
-///   that has data).
+///   that has data); a directory refused realtime inheritance alone
+///   (`EINVAL`: with an extent size hint's inheritance whose size isn't a
+///   multiple of the realtime extent size) gets the rest, with an
+///   [`Unsupported`] error for bit `0x100`.
 pub(crate) fn restore_xfs_options(
     path: &Path,
     node_type: &NodeType,
@@ -630,7 +649,7 @@ pub(crate) fn holes_to_fill(path: &Path, len: u64) -> bool {
 pub(crate) struct Unsupported {
     /// The generic attribute.
     pub(crate) attr: &'static str,
-    /// The file flags refused, or 0.
+    /// The file flags refused, or XFS options' `fsx_xflags`, or 0.
     pub(crate) bits: u64,
     /// The system's error.
     pub(crate) source: io::Error,

@@ -444,3 +444,101 @@ fn test_restore_counts_what_delete_left(set_up_repo: Result<RepoOpen>) -> Result
     assert_eq!(fs::read_to_string(target.path().join("a"))?, "a");
     Ok(())
 }
+
+/// BackOtter: the kept `fsx_xflags` (realtime too) of the file at `path` on
+/// XFS, as `xfs_io`'s stat shows them.
+#[cfg(target_os = "linux")]
+fn xfs_xflags(path: &Path) -> u64 {
+    let out = std::process::Command::new("xfs_io").args(["-r", "-c", "stat"]).arg(path).output().unwrap();
+    let out = String::from_utf8_lossy(&out.stdout);
+    let x = out
+        .lines()
+        .find_map(|l| l.strip_prefix("fsxattr.xflags = 0x"))
+        .and_then(|h| u64::from_str_radix(h.split_whitespace().next()?, 16).ok())
+        .unwrap_or_else(|| panic!("no xflags for {}: {out}", path.display()));
+    x & 0x1_7d01
+}
+
+/// BackOtter: with root, on a loop XFS: a directory's XFS options
+/// (`linux.xfs_options`, realtime inheritance among them) go on in the last
+/// pass, so that the entries restored in it, a file and a directory,
+/// inherit none of them; and restoring again over that tree, the entries
+/// the restore makes in it inherit none either, as in a new target. A
+/// directory whose node has none keeps those it had. As in BackOtter's
+/// restic (`TestRestorerXFSOptions`, `TestRestorerXFSOptionsOverExisting`).
+#[rstest]
+#[cfg(target_os = "linux")]
+fn test_restore_xfs_options(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    use std::process::Command;
+
+    use rustic_core::PathList;
+
+    /// Unmounts its path when dropped.
+    struct Unmount<'a>(&'a Path);
+    impl Drop for Unmount<'_> {
+        fn drop(&mut self) {
+            _ = Command::new("umount").arg(self.0).status();
+        }
+    }
+
+    if !nix::unistd::geteuid().is_root() {
+        eprintln!("skipped: needs root, to mount a file system");
+        return Ok(());
+    }
+    let scratch = tempdir()?;
+    let (img, mnt) = (scratch.path().join("fs.img"), scratch.path().join("mnt"));
+    File::create(&img)?.set_len(320 << 20)?;
+    fs::create_dir(&mnt)?;
+    let ok = |cmd: &mut Command| cmd.output().is_ok_and(|o| o.status.success());
+    if !ok(Command::new("mkfs.xfs").args(["-q", "-f"]).arg(&img)) {
+        eprintln!("skipped: no mkfs.xfs");
+        return Ok(());
+    }
+    if !ok(Command::new("mount").args(["-o", "loop"]).arg(&img).arg(&mnt)) {
+        eprintln!("skipped: mount failed");
+        return Ok(());
+    }
+    let _unmount = Unmount(&mnt);
+
+    let source = tempdir()?;
+    fs::create_dir_all(source.path().join("dir/sub"))?;
+    fs::write(source.path().join("dir/in"), "in")?;
+    fs::write(source.path().join("dir/sub/f"), "f")?;
+    fs::create_dir_all(source.path().join("plain/sub"))?;
+    let repo = set_up_repo?.to_indexed_ids()?;
+    let opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
+    let paths = PathList::from_iter(Some(source.path().to_path_buf()));
+    let _snapshot = repo.backup(&opts, &paths, SnapshotFile::default())?;
+    let repo = repo.to_indexed()?;
+    // As restic or rustic-bko would back it up from XFS: the directory
+    // with realtime inheritance, its extent size hint's inheritance and
+    // filestream, and a 2 MiB hint.
+    let with_options = |mut node: rustic_core::repofile::Node| {
+        if node.is_dir() && &*node.name() == std::ffi::OsStr::new("dir") {
+            let opts = std::collections::BTreeMap::from([("extsize", 2_u32 << 20), ("xflags", 0x5100)]);
+            node.meta.generic_attributes.set("linux.xfs_options", &opts).unwrap();
+        }
+        node
+    };
+    let dst = mnt.join("dst");
+    restore_with(&repo, &dst, RestoreOptions::default(), with_options)?;
+    let t = dst.join("test");
+    for (name, want) in [("dir", 0x5100), ("dir/in", 0), ("dir/sub", 0), ("dir/sub/f", 0), ("plain", 0)] {
+        assert_eq!(xfs_xflags(&t.join(name)), want, "{name}");
+    }
+
+    // Again over that tree, with what it holds made anew, and realtime
+    // inheritance on a directory whose node has no XFS options.
+    for name in ["dir/in", "dir/sub", "plain/sub"] {
+        let p = t.join(name);
+        if p.is_dir() { fs::remove_dir_all(p)? } else { fs::remove_file(p)? }
+    }
+    assert!(ok(Command::new("xfs_io").args(["-c", "chattr +t"]).arg(t.join("plain"))));
+    restore_with(&repo, &dst, RestoreOptions::default(), with_options)?;
+    for (name, want) in
+        [("dir", 0x5100), ("dir/in", 0), ("dir/sub", 0), ("dir/sub/f", 0), ("plain", 0x100), ("plain/sub", 0)]
+    {
+        assert_eq!(xfs_xflags(&t.join(name)), want, "again: {name}");
+    }
+    Ok(())
+}

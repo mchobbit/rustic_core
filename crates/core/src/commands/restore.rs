@@ -484,6 +484,7 @@ pub(crate) fn restore_repository<S: IndexedTree>(
     let errors = restore_metadata(
         without_sockets(node_streamer),
         &file_infos.hardlink_candidates,
+        file_infos.xfs_cleared,
         opts,
         dest,
     )?;
@@ -689,6 +690,18 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                 if exists {
                     stats.dirs.modify += 1;
                     trace!("existing dir {}", path.display());
+                    // BackOtter: a directory there loses its XFS options
+                    // until the late pass, so that the entries the restore
+                    // makes in it inherit none of them (as in one it
+                    // creates, which gets them last): realtime inheritance
+                    // would make its new regular files realtime, on an XFS
+                    // with a realtime device, for good once they have data.
+                    if !dry_run
+                        && std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir())
+                        && let Some(had) = osattrs::clear_dir_xfs_options(&target)
+                    {
+                        _ = restore_infos.xfs_cleared.insert(path.clone(), had);
+                    }
                     // BackOtter: an empty directory (a mount point, the
                     // destination of SNAP:subfolder) gets the flags that go
                     // on before entries as one the restore creates.
@@ -980,6 +993,7 @@ fn without_sockets(
 fn restore_metadata(
     mut node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
     hardlink_candidates: &BTreeMap<HardlinkKey, PathBuf>,
+    mut xfs_cleared: BTreeMap<PathBuf, XfsOptions>,
     opts: RestoreOptions,
     dest: &LocalDestination,
 ) -> RusticResult<u64> {
@@ -993,31 +1007,37 @@ fn restore_metadata(
     let numeric = ownership(opts) == Ownership::Numeric;
     let owned = ownership(opts) != Ownership::None;
     let mut finish = |path: &PathBuf, node: &Node| {
+        // BackOtter: a directory whose XFS options came off before its
+        // entries went in gets those it had back, last, where its node has
+        // none, and wherever nothing else is set on it here.
+        let had_xfs = if node.is_dir() { xfs_cleared.remove(path) } else { None };
+        let only_had_xfs = LateAttrs { flags: None, dos_flags: None, fat_attrs: None, xfs_options: had_xfs };
         // BackOtter: under --exact, an entry whose metadata already matches
         // is left untouched: setting it again would change its inode (the
         // change time), which a btrfs snapshot then no longer shares.
-        if opts.exact
+        let late = if opts.exact
             && dest
                 .path(path)
                 .is_ok_and(|t| exact::already_matches(&t, node, numeric, owned))
         {
             trace!("metadata already matches: {}", path.display());
-            return;
-        }
-        let create = !(opts.exact
-            && node.is_special()
-            && dest.path(path).is_ok_and(|t| exact::same_type(&t, node)));
-        let made = set_metadata(dest, opts, path, node, create, &mut tally);
-        let late = LateAttrs {
-            flags: osattrs::file_flags(node),
-            dos_flags: osattrs::zfs_dos_flags(node),
-            fat_attrs: osattrs::fat_attrs(node),
-            xfs_options: osattrs::xfs_options(node),
+            only_had_xfs
+        } else {
+            let create = !(opts.exact
+                && node.is_special()
+                && dest.path(path).is_ok_and(|t| exact::same_type(&t, node)));
+            if set_metadata(dest, opts, path, node, create, &mut tally) {
+                LateAttrs {
+                    flags: osattrs::file_flags(node),
+                    dos_flags: osattrs::zfs_dos_flags(node),
+                    fat_attrs: osattrs::fat_attrs(node),
+                    xfs_options: osattrs::xfs_options(node).or(had_xfs),
+                }
+            } else {
+                only_had_xfs
+            }
         };
-        if made
-            && late.any()
-            && hardlink_key(node).is_none_or(|key| flags_linked.insert(key))
-        {
+        if late.any() && hardlink_key(node).is_none_or(|key| flags_linked.insert(key)) {
             file_flags.push((
                 path.clone(),
                 node.node_type.clone(),
@@ -1579,6 +1599,10 @@ pub struct RestorePlan {
     r: RestoreInfo,
     /// candidates for hardlinks
     hardlink_candidates: BTreeMap<HardlinkKey, PathBuf>,
+    /// BackOtter: the existing directories whose XFS options came off
+    /// before the restore put entries in them, with those they had, for the
+    /// late pass to put back where their nodes have none.
+    xfs_cleared: BTreeMap<PathBuf, XfsOptions>,
     /// The total restore size
     pub restore_size: u64,
     /// The total size of matched content, i.e. content with needs no restore.

@@ -657,15 +657,26 @@ that either program restores what the other backed up.
   number of files at the end.
 - So do XFS's options (`linux.xfs_options`): a directory's go on in that
   last pass, so the entries the restore makes in it inherit nothing (each
-  has its own node); a regular file's go on also as soon as the restore
-  creates it, while it is empty (with the no-copy-on-write flag), since XFS
-  takes an extent size hint on no file with data (`EINVAL`), and again in
-  the last pass, which leaves options that are right alone. A file the
+  has its own node); one that was there (an earlier restore's) loses its
+  options before they go in, and gets back in the last pass its node's, or
+  those it had where its node has none. A regular file's go on also as
+  soon as the restore creates it, while it is empty (with the
+  no-copy-on-write flag), since XFS takes an extent size hint on no file
+  with data (`EINVAL`), and again in the last pass, which leaves options
+  that are right alone. A file the
   restore writes over (one that was there, with data) can't get a new
-  extent size hint: that is unsupported, one warning per restore. On a file
-  system other than XFS: one warning per restore ("linux.xfs_options not
-  supported by the file system: not XFS") and the number of files. As in
-  BackOtter's restic.
+  extent size hint: that is unsupported, one warning per restore. A
+  directory XFS refuses realtime inheritance along with an extent size
+  hint's inheritance (`EINVAL`: a hint that isn't a multiple of the
+  target's realtime extent size) gets the rest, and realtime inheritance
+  alone is unsupported ("linux.xfs_options 0x100 not supported by the file
+  system"). A snapshot from before rustic_core 0.13.0+backotter.9 or
+  BackOtter's restic 0.19.1+backotter.6 has no realtime inheritance:
+  restored over a directory that has it, a node with XFS options takes it
+  off (they say it had none), one without leaves it: an accepted
+  difference, in both tools. On a file system other than XFS: one warning
+  per restore ("linux.xfs_options not supported by the file system: not
+  XFS") and the number of files. As in BackOtter's restic.
 - An extended attribute the restore can't set (`trusted.*` not as root,
   one the file system refuses) doesn't keep the others from being set, or
   those the node hasn't from being removed, as in BackOtter's restic: each
