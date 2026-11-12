@@ -539,8 +539,50 @@ fn set_xfs_options(f: &File, path: &Path, opts: &XfsOptions, dir: bool) -> io::R
         return Ok(());
     }
     // XFS refuses (EINVAL) a new extent size hint on a regular file that has
-    // data: one restored over an existing file.
-    set_fsxattr(f, &want).map_err(|err| unsupported_or("FS_IOC_FSSETXATTR", err))
+    // data: one restored over an existing file. It refuses a directory
+    // realtime inheritance along with the inheritance of an extent size hint
+    // that isn't a multiple of its realtime extent size
+    // (xfs_ioctl_setattr_check_extsize): the directory then gets the rest,
+    // and only realtime inheritance is unsupported. As in BackOtter's restic.
+    set_fsxattr(f, &want).map_err(|err| {
+        if dir && err.raw_os_error() == Some(libc::EINVAL) && want.xflags & FS_XFLAG_RTINHERIT != 0 {
+            let mut rest = want;
+            rest.xflags &= !FS_XFLAG_RTINHERIT;
+            if set_fsxattr(f, &rest).is_ok() {
+                return Unsupported::error(
+                    LINUX_XFS_OPTIONS,
+                    FS_XFLAG_RTINHERIT.into(),
+                    path_error("FS_IOC_FSSETXATTR", path, &err),
+                );
+            }
+        }
+        unsupported_or("FS_IOC_FSSETXATTR", err)
+    })
+}
+
+/// Takes the [`xfs_kept`] options off the existing directory at `path`,
+/// which the restore is about to put entries in, so that none of them
+/// inherits any (XFS passes each to the entries a directory gets after it),
+/// and returns those it had, if it took any off, for the late pass to put
+/// back where the directory's node has none. Only on XFS; an error leaves
+/// the directory as it is. As in BackOtter's restic.
+pub(super) fn clear_dir_xfs_options(path: &Path) -> Option<XfsOptions> {
+    let cleared = (|| -> io::Result<Option<XfsOptions>> {
+        let f = open_for_flags(path, &NodeType::Dir, None)?;
+        if !is_on(&f, XFS_SUPER_MAGIC)? {
+            return Ok(None);
+        }
+        let cur = get_fsxattr(&f)?;
+        let Some(had) = xfs_options(&cur, true) else {
+            return Ok(None);
+        };
+        set_fsxattr(&f, &wanted_fsxattr(&cur, &XfsOptions::default(), true))?;
+        Ok(Some(had))
+    })();
+    cleared.unwrap_or_else(|err| {
+        debug!("XFS options of {} not cleared: {err}", path.display());
+        None
+    })
 }
 
 /// Gives the regular file or directory at `path` the XFS options `opts`
@@ -1543,6 +1585,41 @@ mod tests {
         // Taken off again.
         restore_xfs_options(&rdir, &NodeType::Dir, &XfsOptions::default()).unwrap();
         assert_eq!(opts(&rdir, NodeType::Dir), None);
+        // An existing directory's come off before the restore puts entries
+        // in it, and are given back as they were.
+        assert_eq!(clear_dir_xfs_options(&rdir), None);
+        restore_xfs_options(&rdir, &NodeType::Dir, &dopts).unwrap();
+        assert_eq!(clear_dir_xfs_options(&rdir), Some(dopts));
+        assert_eq!(opts(&rdir, NodeType::Dir), None);
+        restore_xfs_options(&rdir, &NodeType::Dir, &dopts).unwrap();
+        assert_eq!(opts(&rdir, NodeType::Dir), Some(dopts));
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert_eq!(clear_dir_xfs_options(elsewhere.path()), None);
+    }
+
+    // With root, on a loop XFS whose realtime extent size (64k, without a
+    // realtime device) is no multiple of a directory's 12k extent size
+    // hint: XFS refuses realtime inheritance along with that hint's
+    // inheritance (EINVAL), so the directory gets the rest, and only
+    // realtime inheritance is unsupported. As in BackOtter's restic.
+    #[test]
+    fn xfs_rtinherit_refused_alone() {
+        let Some(mnt) = LoopMount::new(320 << 20, "mkfs.xfs", &["-q", "-f", "-r", "extsize=64k"]) else {
+            return;
+        };
+        let dir = mnt.path().join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        let mut want = XfsOptions { xflags: 0x100 | 0x1000 | 0x2000, extsize: 12 << 10, cowextsize: 0 };
+        let err = restore_xfs_options(&dir, &NodeType::Dir, &want).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
+        let refused = err.get_ref().and_then(|e| e.downcast_ref::<Unsupported>()).map(|u| u.bits);
+        assert_eq!(refused, Some(0x100), "{err}");
+        let opts = |p: &Path| filled(p, &NodeType::Dir).meta.generic_attributes.decoded::<XfsOptions>(LINUX_XFS_OPTIONS);
+        assert_eq!(opts(&dir), Some(XfsOptions { xflags: 0x3000, ..want }));
+        // A hint that is a multiple goes on with it.
+        want.extsize = 128 << 10;
+        restore_xfs_options(&dir, &NodeType::Dir, &want).unwrap();
+        assert_eq!(opts(&dir), Some(want));
     }
 
     #[test]
