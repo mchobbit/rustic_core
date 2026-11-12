@@ -303,6 +303,8 @@ impl LocalDestination {
     ///
     /// This will create the directory structure recursively.
     pub(crate) fn create_dir(&self, item: impl AsRef<Path>) -> LocalDestinationResult<()> {
+        // BackOtter: waits for the exit once XFS options are put back for it.
+        let _making = crate::commands::restore::making_entries();
         let dirname = self.path(item)?;
         fs::create_dir_all(dirname).map_err(LocalDestinationErrorKind::DirectoryCreationFailed)?;
         Ok(())
@@ -689,6 +691,8 @@ impl LocalDestination {
         size: u64,
         sparse: bool,
     ) -> LocalDestinationResult<()> {
+        // BackOtter: waits for the exit once XFS options are put back for it.
+        let _making = crate::commands::restore::making_entries();
         let filename = self.path(item)?;
         let dir = filename
             .parent()
@@ -752,6 +756,8 @@ impl LocalDestination {
         item: impl AsRef<Path>,
         node: &Node,
     ) -> LocalDestinationResult<()> {
+        // BackOtter: waits for the exit once XFS options are put back for it.
+        let _making = crate::commands::restore::making_entries();
         let filename = self.path(item)?;
 
         match &node.node_type {
@@ -933,6 +939,8 @@ impl LocalDestination {
         offset: u64,
         data: &[u8],
     ) -> LocalDestinationResult<()> {
+        // BackOtter: waits for the exit once XFS options are put back for it.
+        let _making = crate::commands::restore::making_entries();
         let filename = self.path(item)?;
         let mut file = OpenOptions::new()
             .create(true)
@@ -966,6 +974,8 @@ impl LocalDestination {
         offset: u64,
         data: &[u8],
     ) -> LocalDestinationResult<()> {
+        // BackOtter: waits for the exit once XFS options are put back for it.
+        let _making = crate::commands::restore::making_entries();
         let filename = self.path(item)?;
         let mut file = OpenOptions::new()
             .create(true)
@@ -1011,6 +1021,8 @@ impl LocalDestination {
         source_item: impl AsRef<Path>,
         item: impl AsRef<Path>,
     ) -> LocalDestinationResult<()> {
+        // BackOtter: waits for the exit once XFS options are put back for it.
+        let _making = crate::commands::restore::making_entries();
         let source_path = self.path(source_item)?;
         let filename = self.path(item)?;
         let dir = filename

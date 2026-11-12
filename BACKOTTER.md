@@ -663,8 +663,9 @@ that either program restores what the other backed up.
   (the destination, which keeps its own metadata, those it had). A restore
   that stops before (an error, a plan that isn't restored, an interrupt,
   for which a program calls `put_back_xfs_options` before it exits, as
-  rustic-bko does) puts back those it had, which a node without options
-  can't give. A regular file's go on also as
+  rustic-bko does, after which the restore makes no entry, its threads
+  waiting for the exit, so that none inherits them) puts back those it
+  had, which a node without options can't give. A regular file's go on also as
   soon as the restore creates it, while it is empty (with the
   no-copy-on-write flag), since XFS takes an extent size hint on no file
   with data (`EINVAL`), and again in the last pass, which leaves options

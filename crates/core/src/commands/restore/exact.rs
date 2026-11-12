@@ -86,6 +86,8 @@ pub(super) enum CloneFailed {
 /// sharing its extents, if the file system can.  `size` is what `src` must
 /// hold; `dst` is touched only once `src` is open and that size.
 pub(super) fn clone_file(src: &Path, dst: &Path, size: u64) -> Result<(), CloneFailed> {
+    // BackOtter: waits for the exit once XFS options are put back for it.
+    let _making = super::making_entries();
     let s = std::fs::File::open(src).map_err(CloneFailed::Untouched)?;
     let len = s.metadata().map_err(CloneFailed::Untouched)?.len();
     if len != size {
