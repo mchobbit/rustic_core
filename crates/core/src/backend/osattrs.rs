@@ -321,6 +321,9 @@ pub(crate) fn takes_nothing_before_data(node: &Node) -> bool {
 }
 
 pub(crate) fn prepare_file(path: &Path, node: &Node) -> io::Result<()> {
+    // BackOtter: it creates the file when there is none, so it waits for the
+    // exit once XFS options are put back.
+    let _making = crate::commands::restore::making_entries();
     let flags = match file_flags(node) {
         Some(flags) if flags & os::FLAGS_BEFORE_DATA != 0 => {
             os::prepare_file_for_flags(path, flags & os::FLAGS_BEFORE_DATA)
