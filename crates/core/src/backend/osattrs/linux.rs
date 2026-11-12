@@ -146,6 +146,7 @@ const FAT_KEPT: u32 = FAT_READONLY | 0x02 | 0x04 | FAT_ARCHIVE;
 const XFS_SUPER_MAGIC: u32 = 0x5846_5342;
 
 // fsx_xflags of XFS's options, from <linux/fs.h>.
+const FS_XFLAG_RTINHERIT: u32 = 0x0000_0100; // t
 const FS_XFLAG_EXTSIZE: u32 = 0x0000_0800; // e
 const FS_XFLAG_EXTSZINHERIT: u32 = 0x0000_1000; // E
 const FS_XFLAG_COWEXTSIZE: u32 = 0x0001_0000; // C
@@ -154,16 +155,25 @@ const FS_XFLAG_COWEXTSIZE: u32 = 0x0001_0000; // C
 /// `linux.inode_flags` doesn't carry (it has immutable, append-only, sync,
 /// noatime, nodump and project inheritance) and that a file can be given:
 /// nosymlinks (n), the extent size hint (e), its inheritance (E), nodefrag
-/// (f), filestream (S) and the copy-on-write extent size hint (C). Not
-/// realtime and its inheritance, which need a realtime device, nor DAX;
-/// not preallocated (p), which a restore that preallocates gives every file
-/// it writes dense, and none it writes sparse.
+/// (f), filestream (S) and the copy-on-write extent size hint (C); on a
+/// directory also realtime inheritance (t, [`xfs_kept`]). Not realtime
+/// (r), which a file has only on a realtime device, nor DAX; not
+/// preallocated (p), which a restore that preallocates gives every file it
+/// writes dense, and none it writes sparse.
 const XFS_KEPT: u32 = 0x0000_0400 // FS_XFLAG_NOSYMLINKS n
     | FS_XFLAG_EXTSIZE
     | FS_XFLAG_EXTSZINHERIT
     | 0x0000_2000 // FS_XFLAG_NODEFRAG f
     | 0x0000_4000 // FS_XFLAG_FILESTREAM S
     | FS_XFLAG_COWEXTSIZE;
+
+/// The `fsx_xflags` kept on XFS for a directory (`dir`) or a regular file:
+/// [`XFS_KEPT`], and on a directory realtime inheritance (t), which XFS
+/// takes on a directory with or without a realtime device and on no regular
+/// file.
+const fn xfs_kept(dir: bool) -> u32 {
+    if dir { XFS_KEPT | FS_XFLAG_RTINHERIT } else { XFS_KEPT }
+}
 
 /// Opens a regular file or directory for `FS_IOC_GETFLAGS` and
 /// `FS_IOC_SETFLAGS`, as `lsattr(1)` and `chattr(1)` do, so as not to follow
@@ -371,7 +381,7 @@ pub(super) fn fill_attributes(path: &Path, node: &mut Node, f: Option<&File>) ->
         Ok(attr) => {
             node.meta.generic_attributes.set_number(LINUX_PROJECT_ID, file_projid(f, &attr));
             if is_on(f, XFS_SUPER_MAGIC).unwrap_or(false)
-                && let Some(opts) = xfs_options(&attr)
+                && let Some(opts) = xfs_options(&attr, node.is_dir())
             {
                 node.meta
                     .generic_attributes
@@ -419,12 +429,12 @@ const fn wanted_fat_attrs(current: u32, attrs: u32) -> u32 {
     (current & !FAT_KEPT) | (attrs & FAT_KEPT)
 }
 
-/// The XFS options of a file whose `FS_IOC_FSGETXATTR` gave `attr`, if it
-/// has any: the [`XFS_KEPT`] flags, with the extent size hint where its
-/// flag or its inheritance is set, and the copy-on-write one where its flag
-/// is. As in BackOtter's restic.
-const fn xfs_options(attr: &FsXattr) -> Option<XfsOptions> {
-    let xflags = attr.xflags & XFS_KEPT;
+/// The XFS options of a directory (`dir`) or regular file whose
+/// `FS_IOC_FSGETXATTR` gave `attr`, if it has any: the [`xfs_kept`] flags,
+/// with the extent size hint where its flag or its inheritance is set, and
+/// the copy-on-write one where its flag is. As in BackOtter's restic.
+const fn xfs_options(attr: &FsXattr, dir: bool) -> Option<XfsOptions> {
+    let xflags = attr.xflags & xfs_kept(dir);
     if xflags == 0 {
         return None;
     }
@@ -435,13 +445,14 @@ const fn xfs_options(attr: &FsXattr) -> Option<XfsOptions> {
     })
 }
 
-/// `cur`, a file's `struct fsxattr`, with the options `opts` in place of its
-/// own: the [`XFS_KEPT`] flags, and the hints' sizes, 0 where their flags
-/// are off (XFS refuses a size without its flag). The rest (other flags,
-/// the project ID) stays as it is.
-const fn wanted_fsxattr(cur: &FsXattr, opts: &XfsOptions) -> FsXattr {
+/// `cur`, the `struct fsxattr` of a directory (`dir`) or regular file, with
+/// the options `opts` in place of its own: the [`xfs_kept`] flags, and the
+/// hints' sizes, 0 where their flags are off (XFS refuses a size without its
+/// flag). The rest (other flags, the project ID) stays as it is.
+const fn wanted_fsxattr(cur: &FsXattr, opts: &XfsOptions, dir: bool) -> FsXattr {
+    let kept = xfs_kept(dir);
     let mut want = *cur;
-    want.xflags = (cur.xflags & !XFS_KEPT) | (opts.xflags & XFS_KEPT);
+    want.xflags = (cur.xflags & !kept) | (opts.xflags & kept);
     want.extsize = if want.xflags & (FS_XFLAG_EXTSIZE | FS_XFLAG_EXTSZINHERIT) == 0 { 0 } else { opts.extsize };
     want.cowextsize = if want.xflags & FS_XFLAG_COWEXTSIZE == 0 { 0 } else { opts.cowextsize };
     want
@@ -512,9 +523,9 @@ fn restore_fat_attrs_with(
     })
 }
 
-/// Gives the file `f` at `path` the XFS options `opts`, unless it has them
-/// already.
-fn set_xfs_options(f: &File, path: &Path, opts: &XfsOptions) -> io::Result<()> {
+/// Gives the directory (`dir`) or regular file `f` at `path` the XFS options
+/// `opts`, unless it has them already.
+fn set_xfs_options(f: &File, path: &Path, opts: &XfsOptions, dir: bool) -> io::Result<()> {
     let unsupported_or = |op: &str, err: io::Error| {
         if unsupported(&err) {
             Unsupported::error(LINUX_XFS_OPTIONS, 0, path_error(op, path, &err))
@@ -523,7 +534,7 @@ fn set_xfs_options(f: &File, path: &Path, opts: &XfsOptions) -> io::Result<()> {
         }
     };
     let cur = get_fsxattr(f).map_err(|err| unsupported_or("FS_IOC_FSGETXATTR", err))?;
-    let want = wanted_fsxattr(&cur, opts);
+    let want = wanted_fsxattr(&cur, opts, dir);
     if same_xfs_options(&cur, &want) {
         return Ok(());
     }
@@ -544,7 +555,7 @@ pub(super) fn restore_xfs_options(path: &Path, typ: &NodeType, opts: &XfsOptions
             io::Error::new(io::ErrorKind::Unsupported, "not XFS"),
         ));
     }
-    set_xfs_options(&f, path, opts)
+    set_xfs_options(&f, path, opts, matches!(typ, NodeType::Dir))
 }
 
 /// Gives the regular file at `path`, which the restore is about to write,
@@ -572,7 +583,7 @@ pub(super) fn prepare_file_for_xfs(path: &Path, opts: &XfsOptions) {
         if f.metadata()?.len() != 0 || !is_on(&f, XFS_SUPER_MAGIC)? {
             return Ok(());
         }
-        set_xfs_options(&f, path, opts)
+        set_xfs_options(&f, path, opts, false)
     });
     if let Err(err) = set {
         debug!("XFS options of {} not set early: {err}", path.display());
@@ -1321,33 +1332,49 @@ mod tests {
     fn xfs_options_kept_as_restic_keeps_them() {
         let fsx = |xflags, extsize, cowextsize| FsXattr { xflags, extsize, cowextsize, ..FsXattr::default() };
         // hasattr, prealloc, immutable, projinherit: none of them.
-        assert_eq!(xfs_options(&fsx(0x8000_0002 | 0x8 | 0x200, 0, 0)), None);
+        for dir in [false, true] {
+            assert_eq!(xfs_options(&fsx(0x8000_0002 | 0x8 | 0x200, 0, 0), dir), None);
+            assert_eq!(
+                xfs_options(&fsx(0x8000_0802, 1 << 20, 0), dir),
+                Some(XfsOptions { xflags: 0x800, extsize: 1 << 20, cowextsize: 0 })
+            );
+            assert_eq!(
+                xfs_options(&fsx(0x1000 | 0x4000 | 0x1_0000, 2 << 20, 4 << 20), dir),
+                Some(XfsOptions { xflags: 0x1_5000, extsize: 2 << 20, cowextsize: 4 << 20 })
+            );
+            assert_eq!(
+                xfs_options(&fsx(0x2000, 4096, 0), dir),
+                Some(XfsOptions { xflags: 0x2000, extsize: 0, cowextsize: 0 })
+            );
+        }
+        // Realtime (r) never; realtime inheritance (t) on a directory only.
+        assert_eq!(xfs_options(&fsx(0x1, 0, 0), false), None);
+        assert_eq!(xfs_options(&fsx(0x1, 0, 0), true), None);
+        assert_eq!(xfs_options(&fsx(0x100, 0, 0), false), None);
         assert_eq!(
-            xfs_options(&fsx(0x8000_0802, 1 << 20, 0)),
-            Some(XfsOptions { xflags: 0x800, extsize: 1 << 20, cowextsize: 0 })
-        );
-        assert_eq!(
-            xfs_options(&fsx(0x1000 | 0x4000 | 0x1_0000, 2 << 20, 4 << 20)),
-            Some(XfsOptions { xflags: 0x1_5000, extsize: 2 << 20, cowextsize: 4 << 20 })
-        );
-        assert_eq!(
-            xfs_options(&fsx(0x2000, 4096, 0)),
-            Some(XfsOptions { xflags: 0x2000, extsize: 0, cowextsize: 0 })
+            xfs_options(&fsx(0x1 | 0x100 | 0x1000, 1 << 20, 0), true),
+            Some(XfsOptions { xflags: 0x1100, extsize: 1 << 20, cowextsize: 0 })
         );
         // The kept flags and sizes replaced; prealloc, immutable and the
         // project ID left as they are.
         let mut cur = fsx(0x8000_0002 | 0x8 | 0x2000, 0, 0);
         cur.projid = 7;
-        let want = wanted_fsxattr(&cur, &XfsOptions { xflags: 0x800, extsize: 1 << 20, cowextsize: 0 });
+        let want = wanted_fsxattr(&cur, &XfsOptions { xflags: 0x800, extsize: 1 << 20, cowextsize: 0 }, false);
         assert_eq!(
             (want.xflags, want.extsize, want.cowextsize, want.projid),
             (0x8000_0002 | 0x8 | 0x800, 1 << 20, 0, 7)
         );
         assert!(!same_xfs_options(&cur, &want));
-        let want = wanted_fsxattr(&fsx(0x800, 1 << 20, 0), &XfsOptions::default());
+        let want = wanted_fsxattr(&fsx(0x800, 1 << 20, 0), &XfsOptions::default(), false);
         assert_eq!((want.xflags, want.extsize, want.cowextsize), (0, 0, 0));
         let cur = fsx(0x2000, 0, 0);
-        assert!(same_xfs_options(&cur, &wanted_fsxattr(&cur, &XfsOptions { xflags: 0x2000, ..XfsOptions::default() })));
+        assert!(same_xfs_options(&cur, &wanted_fsxattr(&cur, &XfsOptions { xflags: 0x2000, ..XfsOptions::default() }, false)));
+        // Realtime inheritance goes on and off a directory, and never on a
+        // regular file; realtime on neither.
+        let rt = XfsOptions { xflags: 0x1 | 0x100 | 0x2000, ..XfsOptions::default() };
+        assert_eq!(wanted_fsxattr(&fsx(0, 0, 0), &rt, true).xflags, 0x2100);
+        assert_eq!(wanted_fsxattr(&fsx(0, 0, 0), &rt, false).xflags, 0x2000);
+        assert_eq!(wanted_fsxattr(&fsx(0x100, 0, 0), &XfsOptions::default(), true).xflags, 0);
     }
 
     #[test]
@@ -1477,7 +1504,7 @@ mod tests {
         std::fs::write(&file, b"").unwrap();
         std::fs::create_dir(&dir).unwrap();
         xfs_io(&["-c", "extsize 1m", "-c", "chattr +f", file.to_str().unwrap()]);
-        xfs_io(&["-c", "extsize 2m", "-c", "chattr +S", dir.to_str().unwrap()]);
+        xfs_io(&["-c", "extsize 2m", "-c", "chattr +St", dir.to_str().unwrap()]);
         std::fs::write(&file, vec![0_u8; 65536]).unwrap();
         let opts = |p: &Path, typ: NodeType| {
             filled(p, &typ).meta.generic_attributes.decoded::<XfsOptions>(LINUX_XFS_OPTIONS)
@@ -1485,7 +1512,8 @@ mod tests {
         let fopts = opts(&file, NodeType::File).expect("file's XFS options not kept");
         assert_eq!(fopts, XfsOptions { xflags: 0x2800, extsize: 1 << 20, cowextsize: 0 });
         let dopts = opts(&dir, NodeType::Dir).expect("directory's XFS options not kept");
-        assert_eq!(dopts, XfsOptions { xflags: 0x5000, extsize: 2 << 20, cowextsize: 0 });
+        // Realtime inheritance (t) too, without a realtime device.
+        assert_eq!(dopts, XfsOptions { xflags: 0x5100, extsize: 2 << 20, cowextsize: 0 });
         let plain = mnt.join("plain");
         {
             let mut f = File::create(&plain).unwrap();
@@ -1503,6 +1531,12 @@ mod tests {
         std::fs::create_dir(&rdir).unwrap();
         restore_xfs_options(&rdir, &NodeType::Dir, &dopts).unwrap();
         assert_eq!(opts(&rdir, NodeType::Dir), Some(dopts));
+        // A regular file takes no realtime inheritance: left out, no error.
+        let tfile = mnt.join("tfile");
+        let topts = XfsOptions { xflags: 0x2100, ..XfsOptions::default() };
+        prepare_file_for_xfs(&tfile, &topts);
+        restore_xfs_options(&tfile, &NodeType::File, &topts).unwrap();
+        assert_eq!(opts(&tfile, NodeType::File), Some(XfsOptions { xflags: 0x2000, ..topts }));
         // Too late for a file with data: unsupported (EINVAL).
         let err = restore_xfs_options(&plain, &NodeType::File, &fopts).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
