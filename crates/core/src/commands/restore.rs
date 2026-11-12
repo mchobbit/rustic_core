@@ -2450,14 +2450,29 @@ mod tests {
         // A second call (none should come) returns.
         put_back_xfs_options();
         let (tx, rx) = std::sync::mpsc::channel();
+        let tx2 = tx.clone();
         _ = std::thread::spawn(move || {
             _ = dest.set_length("after", 1, false);
             _ = tx.send(());
+        });
+        // The plan's own creation of a file that takes a flag before its
+        // data (btrfs's no-copy-on-write), on the main thread.
+        let early = dir.path().join("early");
+        let mut nocow = Node::default();
+        nocow.meta.generic_attributes.set_u64(
+            crate::backend::node::generic_attributes::LINUX_INODE_FLAGS,
+            0x0080_0000,
+        );
+        let path = early.clone();
+        _ = std::thread::spawn(move || {
+            _ = osattrs::prepare_file(&path, &nocow);
+            _ = tx2.send(());
         });
         assert!(
             rx.recv_timeout(std::time::Duration::from_millis(500)).is_err(),
             "a file was made after the put-back"
         );
         assert!(!dir.path().join("after").exists());
+        assert!(!early.exists());
     }
 }
