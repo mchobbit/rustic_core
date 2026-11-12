@@ -11,7 +11,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::{Mutex, PoisonError},
+    sync::{Mutex, PoisonError, RwLock, RwLockReadGuard},
 };
 
 use itertools::Itertools;
@@ -211,7 +211,7 @@ impl SnapshotOrigin {
 /// directory is a mount point, and there are no such mode bits. As in
 /// BackOtter's restic. Call it before the restore starts.
 #[must_use]
-pub fn restore_target_is_fresh(dest: impl AsRef<std::path::Path>) -> bool {
+pub fn restore_target_is_fresh(dest: impl AsRef<Path>) -> bool {
     fresh_target_with(dest.as_ref(), &|_, meta| device_of(meta))
 }
 
@@ -246,10 +246,10 @@ const fn shared_dir(_meta: &std::fs::Metadata) -> bool {
 }
 
 /// The device of a path, given its (`lstat`) metadata.
-type DeviceOf<'a> = dyn Fn(&std::path::Path, &std::fs::Metadata) -> Option<u64> + 'a;
+type DeviceOf<'a> = dyn Fn(&Path, &std::fs::Metadata) -> Option<u64> + 'a;
 
 /// [`restore_target_is_fresh`], with the devices from `device`.
-fn fresh_target_with(dest: &std::path::Path, device: &DeviceOf<'_>) -> bool {
+fn fresh_target_with(dest: &Path, device: &DeviceOf<'_>) -> bool {
     match std::fs::symlink_metadata(dest) {
         Err(err) => err.kind() == std::io::ErrorKind::NotFound,
         Ok(meta) if meta.is_dir() && !shared_dir(&meta) => {
@@ -269,7 +269,7 @@ const FRESH_TARGET_MAX_DIRS: usize = 4096;
 /// whether it holds a mount point at some depth. Looks at no more than
 /// `budget` directories, `dir` included, and takes those off it.
 fn fresh_dir(
-    dir: &std::path::Path,
+    dir: &Path,
     dev: Option<u64>,
     device: &DeviceOf<'_>,
     budget: &mut usize,
@@ -318,13 +318,13 @@ fn made_by_file_system(name: &std::ffi::OsStr, meta: &std::fs::Metadata) -> bool
 /// root would otherwise never be fresh, and the restore would leave it
 /// mkfs's metadata and the time of its last entry's creation. One that
 /// holds anything, or isn't a directory, isn't Tracker's alone.
-fn made_by_tracker(path: &std::path::Path, meta: &std::fs::Metadata) -> bool {
+fn made_by_tracker(path: &Path, meta: &std::fs::Metadata) -> bool {
     cfg!(target_os = "haiku") && empty_trash(path, meta)
 }
 
 /// Whether `path`, with the (`lstat`) metadata `meta`, is an empty
 /// directory named `trash` ([`made_by_tracker`], on any system).
-fn empty_trash(path: &std::path::Path, meta: &std::fs::Metadata) -> bool {
+fn empty_trash(path: &Path, meta: &std::fs::Metadata) -> bool {
     meta.is_dir()
         && path.file_name() == Some(std::ffi::OsStr::new("trash"))
         && std::fs::read_dir(path).is_ok_and(|mut dir| dir.next().is_none())
@@ -408,7 +408,7 @@ impl RestoreTally {
     /// (`osattrs::warn_restore`), and counts it if restic would;
     /// `not_root_ok` for the steps restic's restore not running as root
     /// doesn't count a permission refused for.
-    fn io(&mut self, path: &std::path::Path, err: &std::io::Error, not_root_ok: bool) {
+    fn io(&mut self, path: &Path, err: &std::io::Error, not_root_ok: bool) {
         osattrs::warn_restore(path, err);
         self.count(err, not_root_ok);
     }
@@ -1593,17 +1593,6 @@ fn restore_contents<S: Open>(
     Ok(failed.lock().unwrap().len())
 }
 
-/// Information about what will be restored.
-///
-/// Struct that contains information of file contents grouped by
-/// 1) pack ID,
-/// 2) blob within this pack
-/// 3) the actual files and position of this blob within those
-/// 4) Statistical information
-///
-/// BackOtter: it also says which files are restored sparse: those the
-/// restore options and the files' `unix.sparse` marks make sparse, and only
-/// where nothing was at their path when the plan was made.
 /// BackOtter: the existing directories whose XFS options came off before the
 /// restore put entries in them ([`XfsCleared::clear`]), by path in the
 /// snapshot ("" for the destination itself), with their target and the
@@ -1685,12 +1674,32 @@ impl Drop for XfsCleared {
     }
 }
 
-/// BackOtter: puts back the XFS options a restore in this process took off
-/// existing directories and hasn't put back yet, as they were: for a program
-/// about to exit on an interrupt, which leaves a restore stopped where it
-/// is, without its late pass. After it, no restore in this process takes a
+/// BackOtter: held (shared) by a restore while it makes an entry in the
+/// destination, or writes to one ([`making_entries`]); [`put_back_xfs_options`]
+/// takes it for good, so that nothing is made after it in a directory whose
+/// options are back, to inherit them (realtime, an extent size hint, which
+/// XFS changes on no file with data).
+static MAKING_ENTRIES: RwLock<()> = RwLock::new(());
+
+/// BackOtter: for a restore about to make an entry in the destination, or
+/// write to one: it waits for the exit once [`put_back_xfs_options`] ran.
+pub(crate) fn making_entries() -> RwLockReadGuard<'static, ()> {
+    MAKING_ENTRIES.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// BackOtter: puts back, as they were, the XFS options a restore in this
+/// process took off existing directories and hasn't put back yet.
+///
+/// For a program about to exit on an interrupt, which leaves a restore
+/// stopped where it is, without its late pass: call it once, before exiting.
+/// Once the entries being made are, no restore in this process makes or
+/// writes one ([`making_entries`]: its threads wait for the exit) or takes a
 /// directory's options off. Best effort: what fails is a warning.
 pub fn put_back_xfs_options() {
+    if XFS_PENDING.lock().unwrap_or_else(PoisonError::into_inner).is_none() {
+        return;
+    }
+    std::mem::forget(MAKING_ENTRIES.write().unwrap_or_else(PoisonError::into_inner));
     let Some(pending) = XFS_PENDING.lock().unwrap_or_else(PoisonError::into_inner).take() else {
         return;
     };
@@ -1702,6 +1711,17 @@ pub fn put_back_xfs_options() {
     }
 }
 
+/// Information about what will be restored.
+///
+/// Struct that contains information of file contents grouped by
+/// 1) pack ID,
+/// 2) blob within this pack
+/// 3) the actual files and position of this blob within those
+/// 4) Statistical information
+///
+/// BackOtter: it also says which files are restored sparse: those the
+/// restore options and the files' `unix.sparse` marks make sparse, and only
+/// where nothing was at their path when the plan was made.
 #[derive(Debug, Default)]
 pub struct RestorePlan {
     /// The names of the files to restore
@@ -1780,7 +1800,7 @@ impl RestorePlan {
         repo: &Repository<S>,
         ignore_mtime: bool,
         sparse: bool,
-        clone: Option<&std::path::Path>,
+        clone: Option<&Path>,
     ) -> RusticResult<AddFileResult> {
         let mut open_file = dest.get_matching_file(&name, file.meta.size);
 
@@ -2066,12 +2086,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().join("d");
         let mounts = std::cell::RefCell::new(Vec::<PathBuf>::new());
-        let device = |path: &std::path::Path, _: &std::fs::Metadata| {
+        let device = |path: &Path, _: &std::fs::Metadata| {
             let mounts = mounts.borrow();
             let i = mounts.iter().position(|m| path.starts_with(m));
             Some(i.map_or(0, |i| i as u64 + 1))
         };
-        let fresh = |d: &std::path::Path| fresh_target_with(d, &device);
+        let fresh = |d: &Path| fresh_target_with(d, &device);
         let mount = |sub: &str| {
             std::fs::create_dir_all(d.join(sub)).unwrap();
             // The deepest first, so that it is found first.
@@ -2209,12 +2229,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().join("d");
         let mounts = std::cell::RefCell::new(Vec::<PathBuf>::new());
-        let device = |path: &std::path::Path, _: &std::fs::Metadata| {
+        let device = |path: &Path, _: &std::fs::Metadata| {
             let mounts = mounts.borrow();
             let i = mounts.iter().position(|m| path.starts_with(m));
             Some(i.map_or(0, |i| i as u64 + 1))
         };
-        let fresh = |d: &std::path::Path| fresh_target_with(d, &device);
+        let fresh = |d: &Path| fresh_target_with(d, &device);
         let nilfs = d.join(".nilfs");
         std::fs::create_dir(&d).unwrap();
         std::fs::write(&nilfs, b"").unwrap();
@@ -2268,7 +2288,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().join("d");
         let trash = d.join("trash");
-        let lstat = |p: &std::path::Path| std::fs::symlink_metadata(p).unwrap();
+        let lstat = |p: &Path| std::fs::symlink_metadata(p).unwrap();
         std::fs::create_dir_all(&trash).unwrap();
         assert!(empty_trash(&trash, &lstat(&trash)));
         assert_eq!(
@@ -2321,7 +2341,7 @@ mod tests {
         let d = dir.path();
         let boot = d.join("boot");
         let efi = boot.join("efi");
-        let mount = |at: &std::path::Path| {
+        let mount = |at: &Path| {
             std::fs::create_dir_all(at).unwrap();
             std::process::Command::new("mount")
                 .args(["-t", "tmpfs", "bkotest"])
@@ -2399,5 +2419,45 @@ mod tests {
         assert!(parse(&["--by-name", "--numeric-id"]).is_err());
         assert!(parse(&["--by-name", "--no-ownership"]).is_err());
         assert!(parse(&["--ownership-by-name", "--numeric-id"]).is_err());
+    }
+
+    /// BackOtter: once `put_back_xfs_options` ran (an interrupt, about to
+    /// exit), a restore makes no entry: it waits for the exit, so that
+    /// nothing inherits the options put back. In a child of this test
+    /// binary, as it holds every restore in the process for good.
+    #[test]
+    fn no_entry_after_put_back() {
+        const CHILD: &str = "BKO_TEST_PUT_BACK_CHILD";
+        let name = format!(
+            "{}::no_entry_after_put_back",
+            module_path!().split_once("::").unwrap().1
+        );
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--test-threads=1"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "{name} in a child: {status}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dest =
+            LocalDestination::new(dir.path().to_str().unwrap(), false, false).unwrap();
+        dest.create_dir("before").unwrap();
+        assert!(dir.path().join("before").is_dir());
+        put_back_xfs_options();
+        // A second call (none should come) returns.
+        put_back_xfs_options();
+        let (tx, rx) = std::sync::mpsc::channel();
+        _ = std::thread::spawn(move || {
+            _ = dest.set_length("after", 1, false);
+            _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(500)).is_err(),
+            "a file was made after the put-back"
+        );
+        assert!(!dir.path().join("after").exists());
     }
 }
