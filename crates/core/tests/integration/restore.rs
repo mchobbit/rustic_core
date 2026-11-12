@@ -459,6 +459,83 @@ fn xfs_xflags(path: &Path) -> u64 {
     x & 0x1_7d01
 }
 
+/// BackOtter: a loop XFS, mounted until dropped.
+#[cfg(target_os = "linux")]
+struct LoopXfs {
+    _scratch: tempfile::TempDir,
+    mnt: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LoopXfs {
+    fn drop(&mut self) {
+        _ = std::process::Command::new("umount").arg(&self.mnt).status();
+    }
+}
+
+/// BackOtter: whether `cmd` runs and succeeds.
+#[cfg(target_os = "linux")]
+fn ok(cmd: &mut std::process::Command) -> bool {
+    cmd.output().is_ok_and(|o| o.status.success())
+}
+
+/// BackOtter: with root, a new loop XFS of 320 MiB; None, with why, where
+/// it can't be had.
+#[cfg(target_os = "linux")]
+fn loop_xfs() -> Result<Option<LoopXfs>> {
+    use std::process::Command;
+
+    if !nix::unistd::geteuid().is_root() {
+        eprintln!("skipped: needs root, to mount a file system");
+        return Ok(None);
+    }
+    let scratch = tempdir()?;
+    let (img, mnt) = (scratch.path().join("fs.img"), scratch.path().join("mnt"));
+    File::create(&img)?.set_len(320 << 20)?;
+    fs::create_dir(&mnt)?;
+    if !ok(Command::new("mkfs.xfs").args(["-q", "-f"]).arg(&img)) {
+        eprintln!("skipped: no mkfs.xfs");
+        return Ok(None);
+    }
+    if !ok(Command::new("mount").args(["-o", "loop"]).arg(&img).arg(&mnt)) {
+        eprintln!("skipped: mount failed");
+        return Ok(None);
+    }
+    Ok(Some(LoopXfs { _scratch: scratch, mnt }))
+}
+
+/// BackOtter: a snapshot ("test") of dir, holding in and sub/f, and plain,
+/// holding sub; restored through [`with_xfs_options`], dir has XFS options.
+#[cfg(target_os = "linux")]
+fn xfs_snapshot(
+    set_up_repo: Result<RepoOpen>,
+) -> Result<rustic_core::Repository<rustic_core::IndexedFullStatus>> {
+    use rustic_core::PathList;
+
+    let source = tempdir()?;
+    fs::create_dir_all(source.path().join("dir/sub"))?;
+    fs::write(source.path().join("dir/in"), "in")?;
+    fs::write(source.path().join("dir/sub/f"), "f")?;
+    fs::create_dir_all(source.path().join("plain/sub"))?;
+    let repo = set_up_repo?.to_indexed_ids()?;
+    let opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
+    let paths = PathList::from_iter(Some(source.path().to_path_buf()));
+    let _snapshot = repo.backup(&opts, &paths, SnapshotFile::default())?;
+    Ok(repo.to_indexed()?)
+}
+
+/// BackOtter: `node` as restic or rustic-bko would back it up from XFS: the
+/// directory dir with realtime inheritance, its extent size hint's
+/// inheritance and filestream, and a 2 MiB hint.
+#[cfg(target_os = "linux")]
+fn with_xfs_options(mut node: rustic_core::repofile::Node) -> rustic_core::repofile::Node {
+    if node.is_dir() && &*node.name() == std::ffi::OsStr::new("dir") {
+        let opts = std::collections::BTreeMap::from([("extsize", 2_u32 << 20), ("xflags", 0x5100)]);
+        node.meta.generic_attributes.set("linux.xfs_options", &opts).unwrap();
+    }
+    node
+}
+
 /// BackOtter: with root, on a loop XFS: a directory's XFS options
 /// (`linux.xfs_options`, realtime inheritance among them) go on in the last
 /// pass, so that the entries restored in it, a file and a directory,
@@ -471,57 +548,10 @@ fn xfs_xflags(path: &Path) -> u64 {
 fn test_restore_xfs_options(set_up_repo: Result<RepoOpen>) -> Result<()> {
     use std::process::Command;
 
-    use rustic_core::PathList;
-
-    /// Unmounts its path when dropped.
-    struct Unmount<'a>(&'a Path);
-    impl Drop for Unmount<'_> {
-        fn drop(&mut self) {
-            _ = Command::new("umount").arg(self.0).status();
-        }
-    }
-
-    if !nix::unistd::geteuid().is_root() {
-        eprintln!("skipped: needs root, to mount a file system");
-        return Ok(());
-    }
-    let scratch = tempdir()?;
-    let (img, mnt) = (scratch.path().join("fs.img"), scratch.path().join("mnt"));
-    File::create(&img)?.set_len(320 << 20)?;
-    fs::create_dir(&mnt)?;
-    let ok = |cmd: &mut Command| cmd.output().is_ok_and(|o| o.status.success());
-    if !ok(Command::new("mkfs.xfs").args(["-q", "-f"]).arg(&img)) {
-        eprintln!("skipped: no mkfs.xfs");
-        return Ok(());
-    }
-    if !ok(Command::new("mount").args(["-o", "loop"]).arg(&img).arg(&mnt)) {
-        eprintln!("skipped: mount failed");
-        return Ok(());
-    }
-    let _unmount = Unmount(&mnt);
-
-    let source = tempdir()?;
-    fs::create_dir_all(source.path().join("dir/sub"))?;
-    fs::write(source.path().join("dir/in"), "in")?;
-    fs::write(source.path().join("dir/sub/f"), "f")?;
-    fs::create_dir_all(source.path().join("plain/sub"))?;
-    let repo = set_up_repo?.to_indexed_ids()?;
-    let opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
-    let paths = PathList::from_iter(Some(source.path().to_path_buf()));
-    let _snapshot = repo.backup(&opts, &paths, SnapshotFile::default())?;
-    let repo = repo.to_indexed()?;
-    // As restic or rustic-bko would back it up from XFS: the directory
-    // with realtime inheritance, its extent size hint's inheritance and
-    // filestream, and a 2 MiB hint.
-    let with_options = |mut node: rustic_core::repofile::Node| {
-        if node.is_dir() && &*node.name() == std::ffi::OsStr::new("dir") {
-            let opts = std::collections::BTreeMap::from([("extsize", 2_u32 << 20), ("xflags", 0x5100)]);
-            node.meta.generic_attributes.set("linux.xfs_options", &opts).unwrap();
-        }
-        node
-    };
-    let dst = mnt.join("dst");
-    restore_with(&repo, &dst, RestoreOptions::default(), with_options)?;
+    let Some(xfs) = loop_xfs()? else { return Ok(()) };
+    let repo = xfs_snapshot(set_up_repo)?;
+    let dst = xfs.mnt.join("dst");
+    restore_with(&repo, &dst, RestoreOptions::default(), with_xfs_options)?;
     let t = dst.join("test");
     for (name, want) in [("dir", 0x5100), ("dir/in", 0), ("dir/sub", 0), ("dir/sub/f", 0), ("plain", 0)] {
         assert_eq!(xfs_xflags(&t.join(name)), want, "{name}");
@@ -534,11 +564,92 @@ fn test_restore_xfs_options(set_up_repo: Result<RepoOpen>) -> Result<()> {
         if p.is_dir() { fs::remove_dir_all(p)? } else { fs::remove_file(p)? }
     }
     assert!(ok(Command::new("xfs_io").args(["-c", "chattr +t"]).arg(t.join("plain"))));
-    restore_with(&repo, &dst, RestoreOptions::default(), with_options)?;
+    restore_with(&repo, &dst, RestoreOptions::default(), with_xfs_options)?;
     for (name, want) in
         [("dir", 0x5100), ("dir/in", 0), ("dir/sub", 0), ("dir/sub/f", 0), ("plain", 0x100), ("plain/sub", 0)]
     {
         assert_eq!(xfs_xflags(&t.join(name)), want, "again: {name}");
+    }
+    Ok(())
+}
+
+/// BackOtter: with root, on a loop XFS: a restore that stops between
+/// planning and the late pass puts back the XFS options planning took off
+/// the directories there, also those of a directory whose node has none
+/// (plain's realtime inheritance), which the snapshot can't give back: a
+/// plan dropped without being restored (`--dry-run-warmup`, an error in
+/// `warm_up_wait`), and a restore whose node stream fails. As in
+/// BackOtter's restic (`TestRestorerXFSOptionsInterrupted`).
+#[rstest]
+#[cfg(target_os = "linux")]
+fn test_restore_xfs_options_stopped(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    use std::process::Command;
+
+    use rustic_core::{ErrorKind, RusticError};
+
+    let Some(xfs) = loop_xfs()? else { return Ok(()) };
+    let repo = xfs_snapshot(set_up_repo)?;
+    let dst = xfs.mnt.join("dst");
+    restore_with(&repo, &dst, RestoreOptions::default(), with_xfs_options)?;
+    let t = dst.join("test");
+    assert!(ok(Command::new("xfs_io").args(["-c", "chattr +t"]).arg(t.join("plain"))));
+    let check = |when: &str| {
+        for (name, want) in [("dir", 0x5100), ("plain", 0x100)] {
+            assert_eq!(xfs_xflags(&t.join(name)), want, "{when}: {name}");
+        }
+    };
+
+    let node = repo.node_from_snapshot_path("latest", |_| true)?;
+    let dest = LocalDestination::new(dst.to_str().expect("restore path is valid utf-8"), true, false)?;
+    let ls = repo.ls(&node, &LsOptions::default())?.map(|item| item.map(|(p, n)| (p, with_xfs_options(n))));
+    let opts = RestoreOptions::default();
+
+    // Planned, and not restored.
+    let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false)?;
+    assert_eq!(xfs_xflags(&t.join("plain")), 0, "planned: plain's cleared");
+    drop(plan);
+    check("plan dropped");
+
+    // Restored with a node stream that fails after its first two nodes.
+    let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false)?;
+    let failing = ls
+        .take(2)
+        .chain(std::iter::once(Err(RusticError::new(ErrorKind::Internal, "stopped by the test"))));
+    assert!(repo.restore(plan, &opts, failing, &dest).is_err(), "the failing restore succeeded");
+    check("restore failed");
+
+    restore_with(&repo, &dst, opts, with_xfs_options)?;
+    check("restored again");
+    Ok(())
+}
+
+/// BackOtter: with root, on a loop XFS: the destination, which keeps its own
+/// metadata (a whole snapshot, which has no node of its own), loses its XFS
+/// options while the restore makes entries in it, as any directory there,
+/// so that they inherit none of them, and gets them back at the end. As in
+/// BackOtter's restic (`TestRestorerXFSOptionsTarget`).
+#[rstest]
+#[cfg(target_os = "linux")]
+fn test_restore_xfs_options_destination(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    use std::process::Command;
+
+    let Some(xfs) = loop_xfs()? else { return Ok(()) };
+    let repo = xfs_snapshot(set_up_repo)?;
+    let dst = xfs.mnt.join("dst");
+    fs::create_dir(&dst)?;
+    fs::write(dst.join("keep"), "keep")?;
+    assert!(ok(Command::new("xfs_io").args(["-c", "extsize 2m", "-c", "chattr +tS"]).arg(&dst)));
+    assert_eq!(xfs_xflags(&dst), 0x5100, "the destination before");
+    restore_with(&repo, &dst, RestoreOptions::default(), with_xfs_options)?;
+    for (name, want) in [
+        ("", 0x5100),
+        ("test", 0),
+        ("test/dir", 0x5100),
+        ("test/dir/in", 0),
+        ("test/plain", 0),
+        ("test/plain/sub", 0),
+    ] {
+        assert_eq!(xfs_xflags(&dst.join(name)), want, "{name:?}");
     }
     Ok(())
 }

@@ -163,7 +163,7 @@ pub use crate::{
         repoinfo::{BlobInfo, IndexInfos, PackInfo, RepoFileInfo, RepoFileInfos},
         restore::{
             CloneSources, FileDirStats, RestoreOptions, RestoreOutcome, RestorePlan, RestoreStats,
-            SnapshotOrigin, SparseRestore, restore_target_is_fresh,
+            SnapshotOrigin, SparseRestore, put_back_xfs_options, restore_target_is_fresh,
         },
         rewrite::RewriteOptions,
     },

@@ -10,8 +10,8 @@ use std::{
     cell::Cell,
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
-    sync::Mutex,
+    path::{Path, PathBuf},
+    sync::{Mutex, PoisonError},
 };
 
 use itertools::Itertools;
@@ -542,6 +542,15 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
 
     let mut stats = RestoreStats::default();
     let mut restore_infos = RestorePlan::default();
+    // BackOtter: the destination itself loses its XFS options while the
+    // restore makes entries in it, as any directory there, so that they
+    // inherit none of them, also where it keeps its own metadata (no node
+    // of its own, "" in the snapshot): it gets them back at the end
+    // (XfsCleared).
+    if !dry_run && std::fs::symlink_metadata(&dest_path).is_ok_and(|m| m.is_dir()) {
+        restore_infos.xfs_cleared.clear(Path::new(""), &dest_path);
+    }
+
     let mut additional_existing = false;
     // BackOtter: failures restic counts as errors (RestoreStats::errors); a
     // Cell, as the closures below borrow parts of `stats` already.
@@ -696,11 +705,8 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                     // creates, which gets them last): realtime inheritance
                     // would make its new regular files realtime, on an XFS
                     // with a realtime device, for good once they have data.
-                    if !dry_run
-                        && std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir())
-                        && let Some(had) = osattrs::clear_dir_xfs_options(&target)
-                    {
-                        _ = restore_infos.xfs_cleared.insert(path.clone(), had);
+                    if !dry_run && std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir()) {
+                        restore_infos.xfs_cleared.clear(path, &target);
                     }
                     // BackOtter: an empty directory (a mount point, the
                     // destination of SNAP:subfolder) gets the flags that go
@@ -993,7 +999,7 @@ fn without_sockets(
 fn restore_metadata(
     mut node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
     hardlink_candidates: &BTreeMap<HardlinkKey, PathBuf>,
-    mut xfs_cleared: BTreeMap<PathBuf, XfsOptions>,
+    mut xfs_cleared: XfsCleared,
     opts: RestoreOptions,
     dest: &LocalDestination,
 ) -> RusticResult<u64> {
@@ -1009,8 +1015,10 @@ fn restore_metadata(
     let mut finish = |path: &PathBuf, node: &Node| {
         // BackOtter: a directory whose XFS options came off before its
         // entries went in gets those it had back, last, where its node has
-        // none, and wherever nothing else is set on it here.
-        let had_xfs = if node.is_dir() { xfs_cleared.remove(path) } else { None };
+        // none, and wherever nothing else is set on it here. It stays in
+        // xfs_cleared until the late pass sets them: a restore that stops
+        // before puts them back.
+        let had_xfs = if node.is_dir() { xfs_cleared.had(path) } else { None };
         let only_had_xfs = LateAttrs { flags: None, dos_flags: None, fat_attrs: None, xfs_options: had_xfs };
         // BackOtter: under --exact, an entry whose metadata already matches
         // is left untouched: setting it again would change its inode (the
@@ -1110,6 +1118,11 @@ fn restore_metadata(
         if let Some(opts) = &late.xfs_options {
             osattrs::restore_xfs_options(&target, &node_type, opts)
                 .unwrap_or_else(|err| tally.io(&path, &err, false));
+            // BackOtter: a directory's options, cleared before its entries
+            // went in or not, are its node's or those it had now.
+            if node_type == NodeType::Dir {
+                xfs_cleared.take(&path);
+            }
         }
         let (flags, dos_flags) = (late.flags, late.dos_flags);
         if let Some(dos_flags) = dos_flags {
@@ -1121,6 +1134,10 @@ fn restore_metadata(
                 .unwrap_or_else(|err| tally.io(&path, &err, false));
         }
     }
+    // BackOtter: the directories cleared whose options the late pass didn't
+    // set (the destination, which keeps its own metadata) get back those
+    // they had.
+    xfs_cleared.put_back(|path, err| tally.io(path, err, false));
     // BackOtter: how many files had metadata the file system doesn't
     // support, warned about once.
     osattrs::report_unsupported();
@@ -1587,6 +1604,104 @@ fn restore_contents<S: Open>(
 /// BackOtter: it also says which files are restored sparse: those the
 /// restore options and the files' `unix.sparse` marks make sparse, and only
 /// where nothing was at their path when the plan was made.
+/// BackOtter: the existing directories whose XFS options came off before the
+/// restore put entries in them ([`XfsCleared::clear`]), by path in the
+/// snapshot ("" for the destination itself), with their target and the
+/// options they had. The late pass takes each it sets the options of
+/// ([`XfsCleared::take`]); the rest get theirs back as they were: the
+/// destination, which keeps its own metadata, at the end of the late pass,
+/// and every one when the restore stops early (an error, a plan that isn't
+/// restored, as with `--dry-run-warmup`), as the snapshot may say nothing
+/// about them (a node without options), when this is dropped, or on an
+/// interrupt, which exits without dropping it ([`put_back_xfs_options`]).
+/// Best effort: what fails is a warning.
+#[derive(Debug, Default)]
+struct XfsCleared(BTreeMap<PathBuf, (PathBuf, XfsOptions)>);
+
+/// BackOtter: the targets of every [`XfsCleared`] in this process, with the
+/// options they had, for [`put_back_xfs_options`]; `None` once that ran, and
+/// no directory loses its options after.
+static XFS_PENDING: Mutex<Option<BTreeMap<PathBuf, XfsOptions>>> = Mutex::new(Some(BTreeMap::new()));
+
+impl XfsCleared {
+    /// Takes the XFS options off the directory `target`, at `path` in the
+    /// snapshot, and keeps those it had, unless it was cleared already.
+    // The lock is held throughout, so that an interrupt's put-back
+    // (put_back_xfs_options) sees each directory cleared or not, and comes
+    // before or after this.
+    #[allow(clippy::significant_drop_tightening)]
+    fn clear(&mut self, path: &Path, target: &Path) {
+        let mut pending = XFS_PENDING.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(pending) = pending.as_mut() else { return };
+        if self.0.contains_key(path) {
+            return;
+        }
+        if let Some(had) = osattrs::clear_dir_xfs_options(target) {
+            _ = pending.insert(target.to_path_buf(), had);
+            _ = self.0.insert(path.to_path_buf(), (target.to_path_buf(), had));
+        }
+    }
+
+    /// The options the directory at `path` had, if they came off.
+    fn had(&self, path: &Path) -> Option<XfsOptions> {
+        self.0.get(path).map(|(_, had)| *had)
+    }
+
+    /// The late pass sets the options of the directory at `path`.
+    fn take(&mut self, path: &Path) {
+        if let Some((target, _)) = self.0.remove(path)
+            && let Some(pending) = XFS_PENDING.lock().unwrap_or_else(PoisonError::into_inner).as_mut()
+        {
+            _ = pending.remove(&target);
+        }
+    }
+
+    /// Puts back the options of every directory left, calling `failed`
+    /// with its path in the snapshot and the error where that fails.
+    // The lock is held throughout, so that an interrupt's put-back
+    // (put_back_xfs_options) sees each directory cleared or not, and comes
+    // before or after this.
+    #[allow(clippy::significant_drop_tightening)]
+    fn put_back(&mut self, mut failed: impl FnMut(&Path, &std::io::Error)) {
+        let left = std::mem::take(&mut self.0);
+        let mut pending = XFS_PENDING.lock().unwrap_or_else(PoisonError::into_inner);
+        // An interrupt put them back already.
+        let Some(pending) = pending.as_mut() else { return };
+        for (path, (target, had)) in left {
+            _ = pending.remove(&target);
+            debug!("putting back XFS options {}: {had:?}", target.display());
+            if let Err(err) = osattrs::restore_xfs_options(&target, &NodeType::Dir, &had) {
+                failed(&path, &err);
+            }
+        }
+    }
+}
+
+impl Drop for XfsCleared {
+    fn drop(&mut self) {
+        self.put_back(|path, err| {
+            warn!("restore {}: XFS options not put back: {err}", path.display());
+        });
+    }
+}
+
+/// BackOtter: puts back the XFS options a restore in this process took off
+/// existing directories and hasn't put back yet, as they were: for a program
+/// about to exit on an interrupt, which leaves a restore stopped where it
+/// is, without its late pass. After it, no restore in this process takes a
+/// directory's options off. Best effort: what fails is a warning.
+pub fn put_back_xfs_options() {
+    let Some(pending) = XFS_PENDING.lock().unwrap_or_else(PoisonError::into_inner).take() else {
+        return;
+    };
+    for (target, had) in pending {
+        debug!("putting back XFS options {}: {had:?}", target.display());
+        if let Err(err) = osattrs::restore_xfs_options(&target, &NodeType::Dir, &had) {
+            warn!("restore {}: XFS options not put back: {err}", target.display());
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct RestorePlan {
     /// The names of the files to restore
@@ -1601,8 +1716,9 @@ pub struct RestorePlan {
     hardlink_candidates: BTreeMap<HardlinkKey, PathBuf>,
     /// BackOtter: the existing directories whose XFS options came off
     /// before the restore put entries in them, with those they had, for the
-    /// late pass to put back where their nodes have none.
-    xfs_cleared: BTreeMap<PathBuf, XfsOptions>,
+    /// late pass to put back where their nodes have none; a plan dropped
+    /// before (an error, or one not restored) puts them all back.
+    xfs_cleared: XfsCleared,
     /// The total restore size
     pub restore_size: u64,
     /// The total size of matched content, i.e. content with needs no restore.

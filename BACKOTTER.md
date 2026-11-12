@@ -657,9 +657,14 @@ that either program restores what the other backed up.
   number of files at the end.
 - So do XFS's options (`linux.xfs_options`): a directory's go on in that
   last pass, so the entries the restore makes in it inherit nothing (each
-  has its own node); one that was there (an earlier restore's) loses its
-  options before they go in, and gets back in the last pass its node's, or
-  those it had where its node has none. A regular file's go on also as
+  has its own node); one that was there (an earlier restore's), the
+  destination itself too, loses its options before they go in, and gets
+  back in the last pass its node's, or those it had where its node has none
+  (the destination, which keeps its own metadata, those it had). A restore
+  that stops before (an error, a plan that isn't restored, an interrupt,
+  for which a program calls `put_back_xfs_options` before it exits, as
+  rustic-bko does) puts back those it had, which a node without options
+  can't give. A regular file's go on also as
   soon as the restore creates it, while it is empty (with the
   no-copy-on-write flag), since XFS takes an extent size hint on no file
   with data (`EINVAL`), and again in the last pass, which leaves options
