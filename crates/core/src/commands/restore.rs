@@ -11,7 +11,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::{Mutex, PoisonError, RwLock, RwLockReadGuard},
+    sync::{Arc, Condvar, Mutex, PoisonError, RwLock, RwLockReadGuard},
 };
 
 use itertools::Itertools;
@@ -38,6 +38,16 @@ pub use exact::CloneSources;
 pub(crate) mod constants {
     /// The maximum number of reader threads to use for restoring.
     pub(crate) const MAX_READER_THREADS_NUM: usize = 20;
+    /// BackOtter: the reader threads per CPU, up to [`MAX_READER_THREADS_NUM`]:
+    /// a small machine gets fewer packs read and written at once.
+    pub(crate) const READER_THREADS_PER_CPU: usize = 4;
+    /// BackOtter: the most bytes of pack data a restore holds at once, read
+    /// and decrypted, until every write of it is done. Without it the 20
+    /// readers each held a whole coalesced read (up to 40 MiB) and its
+    /// decrypted blobs while their writes queued, and rustic-bko grew to
+    /// ~1.7 GB and was killed in the OpenBSD rescue image, which has 3 GiB
+    /// and no swap.
+    pub(crate) const MAX_RESTORE_BYTES_IN_FLIGHT: u64 = 256 * 1024 * 1024;
 }
 
 type Filenames = Vec<PathBuf>;
@@ -1362,6 +1372,66 @@ fn set_metadata(
     true
 }
 
+/// BackOtter: the bytes of pack data [`restore_contents`] may hold at once
+/// ([`constants::MAX_RESTORE_BYTES_IN_FLIGHT`]).
+struct ByteBudget {
+    total: u64,
+    free: Mutex<u64>,
+    freed: Condvar,
+}
+
+impl ByteBudget {
+    const fn new(total: u64) -> Self {
+        Self {
+            total,
+            free: Mutex::new(total),
+            freed: Condvar::new(),
+        }
+    }
+
+    /// Waits until `bytes` are free and takes them, until the guard is
+    /// dropped. More than the whole budget takes the whole budget: such a
+    /// pack goes alone rather than never.
+    ///
+    /// Only the thread that spawns the restore's tasks may wait here, never
+    /// one of the pool's: the bytes are given back by the pool's tasks, which
+    /// must be free to run.
+    fn acquire(&self, bytes: u64) -> BudgetGuard<'_> {
+        let bytes = bytes.min(self.total);
+        let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
+        while *free < bytes {
+            free = self
+                .freed
+                .wait(free)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *free -= bytes;
+        drop(free);
+        BudgetGuard {
+            budget: self,
+            bytes,
+        }
+    }
+}
+
+/// Bytes taken from a [`ByteBudget`], given back on drop (a panic or an early
+/// return too).
+struct BudgetGuard<'a> {
+    budget: &'a ByteBudget,
+    bytes: u64,
+}
+
+impl Drop for BudgetGuard<'_> {
+    fn drop(&mut self) {
+        *self
+            .budget
+            .free
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += self.bytes;
+        self.budget.freed.notify_all();
+    }
+}
+
 struct PackInfo {
     pack_id: PackId,
     from_file: Option<(usize, u64, u32)>,
@@ -1474,7 +1544,13 @@ fn restore_contents<S: Open>(
         .coalesce(PackInfo::coalesce)
         .collect();
 
-    let threads = constants::MAX_READER_THREADS_NUM;
+    // BackOtter: fewer readers on a small machine (see the constants).
+    let threads =
+        std::thread::available_parallelism().map_or(constants::MAX_READER_THREADS_NUM, |cpus| {
+            cpus.get()
+                .saturating_mul(constants::READER_THREADS_PER_CPU)
+                .min(constants::MAX_READER_THREADS_NUM)
+        });
 
     let pool = ThreadPoolBuilder::new()
         .num_threads(threads)
@@ -1487,6 +1563,8 @@ fn restore_contents<S: Open>(
             )
             .attach_context("num_threads", threads.to_string())
         })?;
+
+    let budget = &ByteBudget::new(constants::MAX_RESTORE_BYTES_IN_FLIGHT);
 
     pool.in_place_scope(|s| {
         for PackInfo {
@@ -1503,6 +1581,18 @@ fn restore_contents<S: Open>(
             let p = &p;
 
             if !blobs.is_empty() {
+                // BackOtter: a pack's bytes are taken from the budget here,
+                // on the thread that runs this closure (not the pool's,
+                // whose tasks give them back), and held by the reader task
+                // and each write task it spawns, until the last is done: the
+                // read (or the existing file's part) and its decrypted blobs.
+                let cost = match &from_file {
+                    Some((_, _, length_file)) => u64::from(*length_file),
+                    None => blobs.iter().fold(u64::from(length), |cost, (bl, _)| {
+                        cost + u64::from(bl.data_length())
+                    }),
+                };
+                let held = Arc::new(budget.acquire(cost));
                 // TODO: error handling!
                 s.spawn(move |s1| {
                     let read_data = match &from_file {
@@ -1542,7 +1632,9 @@ fn restore_contents<S: Open>(
                         for (file_idx, start) in name_dests {
                             let data = data.clone();
                             let is_sparse = sparse[file_idx];
+                            let held = Arc::clone(&held);
                             s1.spawn(move |_| {
+                                let _held = held;
                                 let path = &filenames[file_idx];
                                 // Allocate file if it is not yet allocated
                                 let mut sizes_guard = sizes.lock().unwrap();
