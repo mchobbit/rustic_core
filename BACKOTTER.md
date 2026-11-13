@@ -1048,6 +1048,16 @@ that either program restores what the other backed up.
   `RestoreOutcome`, whose `errors` counts those of setting metadata and
   making special files, by restic's rules (above, under metadata the target
   file system doesn't support).
+- A restore's memory is bounded (`commands/restore.rs`,
+  `restore_contents`): at most 256 MiB of pack data
+  (`MAX_RESTORE_BYTES_IN_FLIGHT`), counted as read plus decrypted, is held
+  at once, taken before a pack's reader task is spawned and given back when
+  the last write of it is done; a larger read goes alone. The pool has 4
+  threads per CPU, at most 20 (stock rustic: always 20). Stock rustic
+  queued every pack at once, and its 20 readers each held a coalesced read
+  of up to 40 MiB and its blobs while their writes waited: rustic-bko grew
+  to ~1.7 GB and was killed in the OpenBSD rescue image (3 GiB, no swap).
+  A 3.5 GiB restore now peaks at ~0.4 GB, in about the same time.
 - The version reads `X.Y.Z+backotter.N`.
 
 The system calls need `unsafe`, which the workspace lints now deny (not
