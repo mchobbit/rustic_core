@@ -1850,17 +1850,26 @@ impl<S: IndexedFull> Repository<S> {
     /// BackOtter: the files under `node` (a directory of a snapshot, or a
     /// file), restored at `dir`, by their contents: what `restore --exact`
     /// may clone from ([`LocalDestination::with_clone_sources`]): those that
-    /// are there, of their size.  `dir` must hold `node` as restored,
-    /// unchanged since.
+    /// are there, of their size, but none at or below `dest`, the restore's
+    /// destination, when that is inside `dir`.  `dir` must hold `node` as
+    /// restored, unchanged since; what is in the destination isn't (a
+    /// snapper snapshot inside the subvolume cloned from, which holds a
+    /// seed until restored): a file there would be cloned onto itself, or
+    /// give another file its seeded contents.
     ///
     /// # Errors
     ///
     /// * If the trees below `node` can't be read.
-    pub fn clone_sources(&self, node: &Node, dir: &Path) -> RusticResult<CloneSources> {
+    pub fn clone_sources(&self, node: &Node, dir: &Path, dest: Option<&Path>) -> RusticResult<CloneSources> {
         let mut sources = CloneSources::new();
+        // The destination's path below `dir`, if it is there.
+        let skip = dest.and_then(|dest| path_below(dir, dest));
         // Only files that are there, of their size: not what `dir` doesn't
         // hold (the paths below other subvolumes' mount points, aliases).
-        let mut add = |path: PathBuf, n: &Node| {
+        let mut add = |rel: &Path, path: PathBuf, n: &Node| {
+            if skip.as_deref().is_some_and(|skip| rel.starts_with(skip)) {
+                return;
+            }
             if n.is_file()
                 && n.meta.size > 0
                 && std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file() && m.len() == n.meta.size)
@@ -1874,10 +1883,10 @@ impl<S: IndexedFull> Repository<S> {
             let ls_opts = LsOptions::default().recursive(true);
             for item in self.ls(node, &ls_opts)? {
                 let (path, n) = item?;
-                add(dir.join(path), &n);
+                add(&path, dir.join(&path), &n);
             }
         } else {
-            add(dir.to_path_buf(), node);
+            add(Path::new(""), dir.to_path_buf(), node);
         }
         Ok(sources)
     }
@@ -1964,5 +1973,48 @@ impl<S: IndexedFull> Repository<S> {
         tree_opts: &RewriteTreesOptions,
     ) -> RusticResult<Vec<SnapshotFile>> {
         rewrite_snapshots_and_trees(self, snapshots, opts, tree_opts)
+    }
+}
+
+/// BackOtter: `path`'s path below `dir` (empty: `dir` itself), if it is
+/// there, as both resolve (symlinks, `..`, relative paths) where they can,
+/// or else as they are written.
+fn path_below(dir: &Path, path: &Path) -> Option<PathBuf> {
+    if let (Ok(d), Ok(p)) = (dir.canonicalize(), path.canonicalize())
+        && let Ok(rel) = p.strip_prefix(&d)
+    {
+        return Some(rel.to_path_buf());
+    }
+    path.strip_prefix(dir).ok().map(Path::to_path_buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_below_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("at");
+        let dest = dir.join(".snapshots/1/snapshot");
+        std::fs::create_dir_all(&dest).unwrap();
+        let rel = Path::new(".snapshots/1/snapshot");
+        assert_eq!(path_below(&dir, &dest).as_deref(), Some(rel));
+        assert_eq!(path_below(&dir, &dir).as_deref(), Some(Path::new("")));
+        // Written another way: through `..`, and through a symlink.
+        let dotdot = dir.join(".snapshots/../.snapshots/1/snapshot");
+        assert_eq!(path_below(&dir, &dotdot).as_deref(), Some(rel));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&dir, tmp.path().join("link")).unwrap();
+            assert_eq!(path_below(&tmp.path().join("link"), &dest).as_deref(), Some(rel));
+        }
+        // Elsewhere: beside it, a name it begins, and above it.
+        let other = tmp.path().join("atx");
+        std::fs::create_dir(&other).unwrap();
+        assert_eq!(path_below(&dir, &other), None);
+        assert_eq!(path_below(&dir, tmp.path()), None);
+        // Not there yet: as written.
+        assert_eq!(path_below(&dir, &dir.join("new")).as_deref(), Some(Path::new("new")));
     }
 }

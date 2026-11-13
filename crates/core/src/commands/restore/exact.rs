@@ -84,14 +84,28 @@ pub(super) enum CloneFailed {
 
 /// The file `dst` (made, or emptied) gets the whole contents of `src`,
 /// sharing its extents, if the file system can.  `size` is what `src` must
-/// hold; `dst` is touched only once `src` is open and that size.
+/// hold; `dst` is touched only once `src` is open and that size, and isn't
+/// `src` itself (by another name too): emptying it would empty `src`, and a
+/// file system that clones then clones nothing and succeeds (btrfs, XFS),
+/// leaving an empty file.
 pub(super) fn clone_file(src: &Path, dst: &Path, size: u64) -> Result<(), CloneFailed> {
     // BackOtter: waits for the exit once XFS options are put back for it.
     let _making = super::making_entries();
     let s = std::fs::File::open(src).map_err(CloneFailed::Untouched)?;
-    let len = s.metadata().map_err(CloneFailed::Untouched)?.len();
-    if len != size {
+    let m = s.metadata().map_err(CloneFailed::Untouched)?;
+    if m.len() != size {
         return Err(CloneFailed::Untouched(io::Error::other(format!("{} isn't {size} bytes", src.display()))));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::symlink_metadata(dst).is_ok_and(|d| d.dev() == m.dev() && d.ino() == m.ino()) {
+            return Err(CloneFailed::Untouched(io::Error::other(format!(
+                "{} is {} itself",
+                src.display(),
+                dst.display()
+            ))));
+        }
     }
     let d = std::fs::OpenOptions::new()
         .create(true)
@@ -267,6 +281,27 @@ mod tests {
         let mut b = node(0o644, &[("user.a", b"1")]);
         b.meta.atime = None;
         assert!(!same_metadata(&a, &b, true));
+    }
+
+    /// A file is never cloned onto itself, or onto another of its names:
+    /// opening the destination empties it, and with it the source, and a
+    /// file system that clones then clones nothing and succeeds (btrfs,
+    /// XFS), leaving an empty file.
+    #[test]
+    #[cfg(unix)]
+    fn clone_file_never_onto_its_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let (f, g) = (dir.path().join("f"), dir.path().join("g"));
+        std::fs::write(&f, b"snapshot 12345").unwrap();
+        std::fs::hard_link(&f, &g).unwrap();
+        for dst in [&f, &g] {
+            assert!(
+                matches!(clone_file(&f, dst, 14), Err(CloneFailed::Untouched(_))),
+                "{} isn't untouched",
+                dst.display()
+            );
+            assert_eq!(std::fs::read(&f).unwrap(), b"snapshot 12345", "{}", dst.display());
+        }
     }
 
     #[test]

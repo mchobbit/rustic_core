@@ -653,3 +653,75 @@ fn test_restore_xfs_options_destination(set_up_repo: Result<RepoOpen>) -> Result
     }
     Ok(())
 }
+
+/// BackOtter: `--clone-from` with the destination inside the directory
+/// cloned from, as bko-holt restores a snapper snapshot: `@/.snapshots/1/snapshot`,
+/// seeded from `@` (a btrfs snapshot), restored `--exact` with `@` to clone
+/// from. A seeded file of the snapshot's size but other contents is restored
+/// with the snapshot's contents, never cloned from itself (which emptied it
+/// where the file system clones, btrfs and XFS: a 0-byte file with the
+/// snapshot's mtime), and the destination's seed is offered to nothing: a
+/// file elsewhere in `@` with those contents is cloned instead. The clone
+/// itself needs a file system that clones (`TMPDIR` on btrfs or XFS);
+/// elsewhere the files are written and the restore is still checked.
+#[rstest]
+#[cfg(not(windows))]
+fn test_restore_clone_from_holding_the_destination(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    use rustic_core::PathList;
+
+    let (live, snap, same) = (&b"live @ content"[..], &b"snapshot 12345"[..], &b"same contents."[..]);
+    let (only_live, only_snap) = (&b"live only 1234"[..], &b"in snapshot 99"[..]);
+    let source = tempdir()?;
+    let (s, ss) = (source.path(), source.path().join(".snapshots/1/snapshot"));
+    fs::create_dir_all(&ss)?;
+    for (name, at, in_snap) in [("diff", live, snap), ("same", same, same), ("moved", only_live, only_snap)] {
+        fs::write(s.join(name), at)?;
+        fs::write(ss.join(name), in_snap)?;
+    }
+    // Elsewhere in @, the contents only the snapshot's "moved" has.
+    fs::write(s.join("other"), only_snap)?;
+    let repo = set_up_repo?.to_indexed_ids()?;
+    let opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
+    let _snapshot = repo.backup(&opts, &PathList::from_iter(Some(s.to_path_buf())), SnapshotFile::default())?;
+    let repo = repo.to_indexed()?;
+
+    // @ restored, and the snapshot seeded from it.
+    let top = tempdir()?;
+    let at = top.path().join("at");
+    restore_to(&repo, &at, RestoreOptions::default())?;
+    let at = at.join("test");
+    let dst = at.join(".snapshots/1/snapshot");
+    for name in ["diff", "same", "moved"] {
+        _ = fs::copy(at.join(name), dst.join(name))?;
+    }
+
+    let from = repo.node_from_snapshot_path("latest:test", |_| true)?;
+    let node = repo.node_from_snapshot_path("latest:test/.snapshots/1/snapshot", |_| true)?;
+    let ls = repo.ls(&node, &LsOptions::default())?;
+    let content = |name: &str| -> Result<Vec<rustic_core::DataId>> {
+        let mut found = None;
+        for item in ls.clone() {
+            let (p, n) = item?;
+            if p == Path::new(name) {
+                found = n.content;
+            }
+        }
+        Ok(found.expect("the file is in the snapshot"))
+    };
+    let sources = repo.clone_sources(&from, &at, Some(&dst))?;
+    assert_eq!(sources.get(&content("diff")?), None, "the destination's own seed is offered");
+    assert_eq!(sources.get(&content("moved")?), Some(at.join("other").as_path()));
+
+    let dest = LocalDestination::new(dst.to_str().expect("restore path is valid utf-8"), true, false)?
+        .with_clone_sources(sources);
+    let opts = RestoreOptions::default().exact(true);
+    let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false)?;
+    _ = repo.restore(plan, &opts, ls, &dest)?;
+    for (name, want) in [("diff", snap), ("same", same), ("moved", only_snap)] {
+        assert_eq!(fs::read(dst.join(name))?, want, "{name}");
+    }
+    for (name, want) in [("diff", live), ("same", same), ("moved", only_live), ("other", only_snap)] {
+        assert_eq!(fs::read(at.join(name))?, want, "@'s {name}");
+    }
+    Ok(())
+}
