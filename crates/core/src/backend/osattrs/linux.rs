@@ -16,7 +16,7 @@ use std::{
 use jiff::Timestamp;
 use log::{debug, warn};
 
-use super::{Unsupported, XattrErrors, path_error, set_flags_best_effort, unsupported};
+use super::{HeldFlags, Unsupported, XattrErrors, path_error, set_flags_best_effort, unsupported};
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType,
     generic_attributes::{
@@ -732,26 +732,61 @@ pub(super) fn restore_zfs_dos_flags(path: &Path, typ: &NodeType, flags: u64) -> 
 /// that left either set ([`clear_restricting_with`]). Symlinks and special
 /// files have no flags.
 pub(super) fn clear_restricting_flags(path: &Path) -> io::Result<()> {
+    clear_restricting_open(path).map(drop)
+}
+
+/// [`clear_restricting_flags`], returning the file, open for its flags, and
+/// the flags it cleared, if any.
+fn clear_restricting_open(path: &Path) -> io::Result<Option<(File, u32)>> {
     let m = std::fs::symlink_metadata(path)?;
     let typ = if m.is_dir() {
         NodeType::Dir
     } else if m.is_file() {
         NodeType::File
     } else {
-        return Ok(());
+        return Ok(None);
     };
     let f = open_for_flags(path, &typ, Some(&m))?;
-    clear_restricting_with(
+    let cleared = clear_restricting_with(
         path,
         || get_flags(&f),
         |flags| set_flags(&f, flags),
-        |xflags| {
-            get_fsxattr(&f).and_then(|mut attr| {
-                attr.xflags &= !xflags;
-                set_fsxattr(&f, &attr)
-            })
-        },
+        |xflags| change_xflags(&f, |x| x & !xflags),
+    )?;
+    Ok((cleared != 0).then_some((f, cleared)))
+}
+
+/// BackOtter: [`clear_restricting_flags`] for a file whose name the restore
+/// is about to remove, or rename another file over: the file stays open
+/// (`O_RDONLY|O_NOFOLLOW|O_NONBLOCK`) in the [`HeldFlags`], for the flags to
+/// go back on it, wherever its other names are ([`put_back_restricting_flags`]).
+pub(super) fn clear_restricting_flags_held(path: &Path) -> io::Result<HeldFlags> {
+    Ok(match clear_restricting_open(path)? {
+        Some((file, cleared)) => HeldFlags::Held { file, cleared, path: path.to_path_buf() },
+        None => HeldFlags::Nothing,
+    })
+}
+
+/// BackOtter: sets `cleared`, the restricting flags
+/// [`clear_restricting_flags_held`] cleared, again on the file open as `f`
+/// (at `path`, for errors).
+pub(super) fn put_back_restricting_flags(f: &File, path: &Path, cleared: u32) -> io::Result<()> {
+    put_back_restricting_with(
+        path,
+        || get_flags(f),
+        |flags| set_flags(f, flags),
+        |xflags| change_xflags(f, |x| x | xflags),
+        cleared,
     )
+}
+
+/// Gives the file open as `f` the `fsx_xflags` `change` makes of those it
+/// has (`FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`).
+fn change_xflags(f: &File, change: impl FnOnce(u32) -> u32) -> io::Result<()> {
+    get_fsxattr(f).and_then(|mut attr| {
+        attr.xflags = change(attr.xflags);
+        set_fsxattr(f, &attr)
+    })
 }
 
 /// Clears immutable and append-only of the file at `path` with `get`
@@ -764,28 +799,72 @@ pub(super) fn clear_restricting_flags(path: &Path) -> io::Result<()> {
 /// which `FS_XFLAG_APPEND` is `FS_IMMUTABLE_FL`; a restore over an
 /// append-only file couldn't change it there (ubuntu24, round 15). OpenZFS
 /// 2.3.9 clears both. As in BackOtter's restic.
+///
+/// It returns those of the two the file had, which it cleared.
 fn clear_restricting_with(
     path: &Path,
     mut get: impl FnMut() -> io::Result<u32>,
     set: impl FnOnce(u32) -> io::Result<()>,
     clear_xflags: impl FnOnce(u32) -> io::Result<()>,
-) -> io::Result<()> {
+) -> io::Result<u32> {
     let restricting = FS_IMMUTABLE_FL | FS_APPEND_FL;
     let mut current = get().map_err(|err| path_error("FS_IOC_GETFLAGS", path, &err))?;
-    if current & restricting == 0 {
-        return Ok(());
+    let had = current & restricting;
+    if had == 0 {
+        return Ok(0);
     }
     match clear_xflags(FS_XFLAG_IMMUTABLE | FS_XFLAG_APPEND) {
         Ok(()) => {
             current = get().map_err(|err| path_error("FS_IOC_GETFLAGS", path, &err))?;
             if current & restricting == 0 {
+                return Ok(had);
+            }
+        }
+        Err(err) if unsupported(&err) => {}
+        Err(err) => return Err(path_error("FS_IOC_FSSETXATTR", path, &err)),
+    }
+    set(current & !restricting).map_err(|err| path_error("FS_IOC_SETFLAGS", path, &err))?;
+    Ok(had)
+}
+
+/// BackOtter: sets `cleared`, the restricting flags
+/// [`clear_restricting_with`] cleared, again on the file at `path`, with
+/// `get`, `set` and `add_xflags` (`FS_IOC_FSSETXATTR` with the
+/// `fsx_xflags` given): by its `fsx_xflags`, which leave btrfs's
+/// compression property alone, then by its flags where the file system has
+/// no `FS_IOC_FSSETXATTR`, or where that didn't give the file exactly its
+/// flags and those (OpenZFS 2.2, which takes `fsx_xflags` for
+/// `FS_IOC_GETFLAGS`'s flags). As in BackOtter's restic
+/// (`putBackRestrictingWith`).
+fn put_back_restricting_with(
+    path: &Path,
+    mut get: impl FnMut() -> io::Result<u32>,
+    set: impl FnOnce(u32) -> io::Result<()>,
+    add_xflags: impl FnOnce(u32) -> io::Result<()>,
+    cleared: u32,
+) -> io::Result<()> {
+    let current = get().map_err(|err| path_error("FS_IOC_GETFLAGS", path, &err))?;
+    let want = current | (cleared & (FS_IMMUTABLE_FL | FS_APPEND_FL));
+    if want == current {
+        return Ok(());
+    }
+    let mut xflags = 0;
+    if cleared & FS_IMMUTABLE_FL != 0 {
+        xflags |= FS_XFLAG_IMMUTABLE;
+    }
+    if cleared & FS_APPEND_FL != 0 {
+        xflags |= FS_XFLAG_APPEND;
+    }
+    match add_xflags(xflags) {
+        Ok(()) => {
+            if get().is_ok_and(|now| now == want) {
                 return Ok(());
             }
         }
         Err(err) if unsupported(&err) => {}
         Err(err) => return Err(path_error("FS_IOC_FSSETXATTR", path, &err)),
     }
-    set(current & !restricting).map_err(|err| path_error("FS_IOC_SETFLAGS", path, &err))
+    set(want).map_err(|err| path_error("FS_IOC_SETFLAGS", path, &err))
 }
 
 /// The DOS flags a file that has `current` gets for `flags`: the
@@ -1846,7 +1925,7 @@ mod tests {
         ] {
             let flags = std::cell::Cell::new(start);
             let sets = std::cell::Cell::new(0);
-            clear_restricting_with(
+            let cleared = clear_restricting_with(
                 Path::new("f"),
                 || Ok(flags.get()),
                 |f| {
@@ -1874,7 +1953,81 @@ mod tests {
                 },
             )
             .unwrap();
+            assert_eq!(cleared, start & ia, "{name}");
             assert_eq!(flags.get(), start & !ia, "{name}");
+            assert_eq!(sets.get(), want_sets, "{name}");
+        }
+    }
+
+    /// BackOtter: the flags cleared go back on the file, wherever its other
+    /// names are, once the name they came off for is gone; a file left
+    /// without a name needs none.
+    #[test]
+    fn restricting_flags_held_go_back_on_other_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::hard_link(&a, &b).unwrap();
+        let f = open_for_flags(&a, &NodeType::File, None).unwrap();
+        let Ok(current) = get_flags(&f) else { return };
+        // Setting i takes CAP_LINUX_IMMUTABLE (root), and flags.
+        if set_flags(&f, current | FS_IMMUTABLE_FL).is_err() {
+            return;
+        }
+        let held = clear_restricting_flags_held(&a).unwrap();
+        assert!(matches!(held, HeldFlags::Held { cleared: FS_IMMUTABLE_FL, .. }), "{held:?}");
+        std::fs::remove_file(&a).unwrap();
+        held.put_back().unwrap();
+        assert_ne!(get_flags(&f).unwrap() & FS_IMMUTABLE_FL, 0, "b lost immutable");
+        assert!(OpenOptions::new().write(true).open(&b).is_err());
+        let held = clear_restricting_flags_held(&b).unwrap();
+        std::fs::remove_file(&b).unwrap();
+        held.put_back().unwrap();
+    }
+
+    #[test]
+    fn put_back_restricting_with_zfs_xflags() {
+        // OpenZFS 2.2 takes fsx_xflags for FS_IOC_GETFLAGS's flags: the
+        // flags put append-only back there.
+        let ia = FS_IMMUTABLE_FL | FS_APPEND_FL;
+        for (name, zfs, no_xattr, cleared, want_sets) in [
+            ("ext4 i+a", false, false, ia, 0),
+            ("no FSSETXATTR", false, true, FS_APPEND_FL, 1),
+            ("zfs a", true, false, FS_APPEND_FL, 1),
+            ("nothing", false, false, 0, 0),
+        ] {
+            let flags = std::cell::Cell::new(0x0008_0000);
+            let sets = std::cell::Cell::new(0);
+            put_back_restricting_with(
+                Path::new("f"),
+                || Ok(flags.get()),
+                |f| {
+                    sets.set(sets.get() + 1);
+                    flags.set(f);
+                    Ok(())
+                },
+                |xflags| {
+                    if no_xattr {
+                        return Err(io::Error::from_raw_os_error(libc::ENOTTY));
+                    }
+                    let mut f = flags.get();
+                    if zfs {
+                        f |= xflags;
+                    } else {
+                        if xflags & FS_XFLAG_IMMUTABLE != 0 {
+                            f |= FS_IMMUTABLE_FL;
+                        }
+                        if xflags & FS_XFLAG_APPEND != 0 {
+                            f |= FS_APPEND_FL;
+                        }
+                    }
+                    flags.set(f);
+                    Ok(())
+                },
+                cleared,
+            )
+            .unwrap();
+            assert_eq!(flags.get(), 0x0008_0000 | cleared, "{name}");
             assert_eq!(sets.get(), want_sets, "{name}");
         }
     }

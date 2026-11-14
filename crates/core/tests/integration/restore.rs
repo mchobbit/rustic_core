@@ -604,14 +604,18 @@ fn test_restore_xfs_options_stopped(set_up_repo: Result<RepoOpen>) -> Result<()>
     let ls = repo.ls(&node, &LsOptions::default())?.map(|item| item.map(|(p, n)| (p, with_xfs_options(n))));
     let opts = RestoreOptions::default();
 
-    // Planned, and not restored.
+    // Planned, and not restored. A directory loses its options only once
+    // the restore makes an entry in it (D8): plain gets its sub again.
+    fs::remove_dir(t.join("plain/sub"))?;
     let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false)?;
     assert_eq!(xfs_xflags(&t.join("plain")), 0, "planned: plain's cleared");
     drop(plan);
     check("plan dropped");
 
     // Restored with a node stream that fails after its first two nodes.
+    fs::remove_dir(t.join("plain/sub"))?;
     let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false)?;
+    assert_eq!(xfs_xflags(&t.join("plain")), 0, "planned again: plain's cleared");
     let failing = ls
         .take(2)
         .chain(std::iter::once(Err(RusticError::new(ErrorKind::Internal, "stopped by the test"))));
@@ -723,5 +727,324 @@ fn test_restore_clone_from_holding_the_destination(set_up_repo: Result<RepoOpen>
     for (name, want) in [("diff", live), ("same", same), ("moved", only_live), ("other", only_snap)] {
         assert_eq!(fs::read(at.join(name))?, want, "@'s {name}");
     }
+    Ok(())
+}
+
+/// BackOtter: backs up `source` (as `test`) into `repo`, for the `--exact`
+/// tests below.
+#[cfg(not(windows))]
+fn backed_up(
+    repo: RepoOpen,
+    source: &Path,
+) -> Result<rustic_core::Repository<impl rustic_core::IndexedFull>> {
+    let repo = repo.to_indexed_ids()?;
+    let opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
+    let paths = rustic_core::PathList::from_iter(Some(source.to_path_buf()));
+    let _snapshot = repo.backup(&opts, &paths, SnapshotFile::default())?;
+    Ok(repo.to_indexed()?)
+}
+
+/// BackOtter: [`restore_to`], returning the errors the plan and the restore
+/// counted (`RestoreStats::errors`, `RestoreOutcome::errors`) together.
+#[cfg(not(windows))]
+fn restore_counting(
+    repo: &rustic_core::Repository<impl rustic_core::IndexedFull>,
+    dir: &Path,
+    opts: RestoreOptions,
+) -> Result<u64> {
+    let snap = repo.get_snapshot_from_str("latest", |_| true)?;
+    let opts = opts.origin(SnapshotOrigin::of(&snap));
+    let node = repo.node_from_snapshot_path("latest", |_| true)?;
+    let dest = LocalDestination::new(dir.to_str().expect("utf-8"), true, false)?;
+    let ls = repo.ls(&node, &LsOptions::default())?;
+    let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false)?;
+    let planned = plan.stats.errors;
+    let outcome = repo.restore(plan, &opts, ls, &dest)?;
+    Ok(planned + outcome.errors)
+}
+
+/// BackOtter: the inode and change time of every regular file below `dir`,
+/// by path. Not directories or symlinks: listing one, or reading its target,
+/// moves its atime on a file system mounted `relatime` (TMPDIR's tmpfs)
+/// whatever it is, and an `--exact` restore then sets it again (exact-rt.sh
+/// mounts noatime); a regular file is read with `O_NOATIME`.
+#[cfg(not(windows))]
+fn inodes(dir: &Path) -> Result<std::collections::BTreeMap<PathBuf, (u64, i64, i64)>> {
+    let mut seen = std::collections::BTreeMap::new();
+    for entry in walkdir::WalkDir::new(dir).min_depth(1) {
+        let entry = entry?;
+        let m = fs::symlink_metadata(entry.path())?;
+        if !m.is_file() {
+            continue;
+        }
+        _ = seen.insert(entry.path().to_path_buf(), (m.ino(), m.ctime(), m.ctime_nsec()));
+    }
+    Ok(seen)
+}
+
+/// BackOtter (D4): a second `--exact` restore of the same snapshot changes
+/// no file: no inode, no change time, the hard-link group's either (it is
+/// already exactly the snapshot's, and keeps its inode). Its atimes are
+/// after the restore's change times, which `relatime` (TMPDIR's tmpfs)
+/// doesn't move on a read (there is none: `O_NOATIME`).
+#[rstest]
+#[cfg(not(windows))]
+fn test_restore_exact_twice_changes_nothing(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    let source = tempdir()?;
+    let s = source.path();
+    fs::create_dir(s.join("d"))?;
+    fs::write(s.join("d/a"), "linked")?;
+    fs::hard_link(s.join("d/a"), s.join("d/b"))?;
+    fs::write(s.join("c"), "c")?;
+    fs::write(s.join("e"), "")?;
+    std::os::unix::fs::symlink("c", s.join("s"))?;
+    let repo = backed_up(set_up_repo?, s)?;
+    let target = tempdir()?;
+    let exact = RestoreOptions::default().exact(true).numeric_id(true);
+    let late_atime = |mut node: rustic_core::repofile::Node| {
+        node.meta.atime = Some(jiff::Timestamp::from_second(4_100_000_000).expect("2099"));
+        node
+    };
+    let snap = repo.get_snapshot_from_str("latest", |_| true)?;
+    let exact = exact.origin(SnapshotOrigin::of(&snap));
+    restore_with(&repo, target.path(), exact, late_atime)?;
+    let before = inodes(target.path())?;
+    let (a, b) = (target.path().join("test/d/a"), target.path().join("test/d/b"));
+    assert_eq!(fs::metadata(&a)?.ino(), fs::metadata(&b)?.ino());
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    restore_with(&repo, target.path(), exact, late_atime)?;
+    assert_eq!(inodes(target.path())?, before);
+    assert_eq!(fs::read_to_string(&b)?, "linked");
+    Ok(())
+}
+
+/// BackOtter (D1): `--exact` breaking a hard link never opens an entry
+/// named `.bko-exact-NAME`: a symlink of the snapshot's to a file outside
+/// the destination isn't followed (the old fixed temporary name truncated
+/// what it pointed at), and a regular file of the snapshot's by that name
+/// keeps its contents.
+#[rstest]
+#[cfg(not(windows))]
+fn test_restore_exact_temp_name_is_no_entry(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    let outside = tempdir()?;
+    let victim = outside.path().join("victim");
+    fs::write(&victim, "outside the destination")?;
+    let source = tempdir()?;
+    let s = source.path();
+    fs::write(s.join("foo"), "snapshot foo")?;
+    std::os::unix::fs::symlink(&victim, s.join(".bko-exact-foo"))?;
+    fs::write(s.join("baz"), "snapshot baz")?;
+    fs::write(s.join(".bko-exact-baz"), "a file of the snapshot's")?;
+    let repo = backed_up(set_up_repo?, s)?;
+    let target = tempdir()?;
+    restore_to(&repo, target.path(), RestoreOptions::default())?;
+    let t = target.path().join("test");
+    // Each file shares its inode with a name outside the destination.
+    fs::hard_link(t.join("foo"), outside.path().join("foo"))?;
+    fs::hard_link(t.join("baz"), outside.path().join("baz"))?;
+    let errors = restore_counting(&repo, target.path(), RestoreOptions::default().exact(true))?;
+    assert_eq!(errors, 0);
+    assert_eq!(fs::read_to_string(&victim)?, "outside the destination");
+    assert_eq!(fs::read_link(t.join(".bko-exact-foo"))?, victim);
+    assert_eq!(fs::read_to_string(t.join(".bko-exact-baz"))?, "a file of the snapshot's");
+    for name in ["foo", "baz"] {
+        assert_eq!(fs::read_to_string(t.join(name))?, format!("snapshot {name}"));
+        assert_eq!(fs::read_to_string(outside.path().join(name))?, format!("snapshot {name}"));
+        assert_eq!(fs::metadata(t.join(name))?.nlink(), 1, "{name}'s link not broken");
+    }
+    let names: Vec<_> = fs::read_dir(&t)?.map(|e| e.map(|e| e.file_name())).collect::<Result<_, _>>()?;
+    assert_eq!(names.len(), 4, "{names:?}");
+    Ok(())
+}
+
+/// BackOtter (D2, E1): a file whose hard link `--exact` can't break (its
+/// directory refuses the removal, not running as root) is an error and is
+/// left exactly as it is, contents and all, which its other names, outside
+/// the destination too, share; the snapshot's other name for it isn't
+/// linked to it (an error), and the restore goes on: a file after it gets
+/// its metadata. Not as root, who may remove it.
+#[rstest]
+#[cfg(not(windows))]
+fn test_restore_exact_unbroken_link_left_alone(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if nix::unistd::geteuid().is_root() {
+        return Ok(());
+    }
+    let source = tempdir()?;
+    let s = source.path();
+    fs::create_dir(s.join("d"))?;
+    fs::write(s.join("d/foo"), "snapshot")?;
+    fs::hard_link(s.join("d/foo"), s.join("d/foo2"))?;
+    fs::write(s.join("z"), "z")?;
+    let repo = backed_up(set_up_repo?, s)?;
+    let target = tempdir()?;
+    restore_to(&repo, target.path(), RestoreOptions::default())?;
+    let t = target.path().join("test");
+    let outside = tempdir()?;
+    fs::remove_file(t.join("d/foo2"))?;
+    fs::remove_file(t.join("d/foo"))?;
+    fs::write(t.join("d/foo"), "old")?;
+    fs::hard_link(t.join("d/foo"), outside.path().join("o"))?;
+    let z_mtime = fs::metadata(s.join("z"))?.mtime();
+    filetime::set_file_mtime(t.join("z"), filetime::FileTime::from_unix_time(1, 0))?;
+    fs::set_permissions(t.join("d"), fs::Permissions::from_mode(0o555))?;
+    let result = restore_counting(&repo, target.path(), RestoreOptions::default().exact(true));
+    fs::set_permissions(t.join("d"), fs::Permissions::from_mode(0o755))?;
+    assert!(result? >= 2, "the link not broken and the name not linked are errors");
+    assert_eq!(fs::read_to_string(t.join("d/foo"))?, "old");
+    assert_eq!(fs::read_to_string(outside.path().join("o"))?, "old");
+    assert!(!t.join("d/foo2").exists());
+    assert_eq!(fs::metadata(t.join("z"))?.mtime(), z_mtime);
+    Ok(())
+}
+
+/// BackOtter (E1): a hard link the metadata pass can't make (its directory
+/// refuses it, not running as root) is an error of its own, and the
+/// restore goes on: it used to stop there, leaving every entry after it
+/// without its metadata and the late flags pass undone.
+#[rstest]
+#[cfg(not(windows))]
+fn test_restore_link_failure_goes_on(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if nix::unistd::geteuid().is_root() {
+        return Ok(());
+    }
+    let source = tempdir()?;
+    let s = source.path();
+    fs::create_dir(s.join("x"))?;
+    fs::create_dir(s.join("y"))?;
+    fs::write(s.join("x/a"), "a")?;
+    fs::hard_link(s.join("x/a"), s.join("y/b"))?;
+    fs::write(s.join("z"), "z")?;
+    let repo = backed_up(set_up_repo?, s)?;
+    let target = tempdir()?;
+    restore_to(&repo, target.path(), RestoreOptions::default())?;
+    let t = target.path().join("test");
+    fs::remove_file(t.join("y/b"))?;
+    let z_mtime = fs::metadata(s.join("z"))?.mtime();
+    filetime::set_file_mtime(t.join("z"), filetime::FileTime::from_unix_time(1, 0))?;
+    fs::set_permissions(t.join("y"), fs::Permissions::from_mode(0o555))?;
+    let result = restore_counting(&repo, target.path(), RestoreOptions::default());
+    fs::set_permissions(t.join("y"), fs::Permissions::from_mode(0o755))?;
+    assert!(result? >= 1);
+    assert_eq!(fs::metadata(t.join("z"))?.mtime(), z_mtime);
+    Ok(())
+}
+
+/// BackOtter: whether `chattr ATTRS path` worked: setting `i` or `a` takes
+/// root and a file system with them.
+#[cfg(target_os = "linux")]
+fn chattr(attrs: &str, path: &Path) -> bool {
+    std::process::Command::new("chattr")
+        .arg(attrs)
+        .arg(path)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// BackOtter: whether the file at `path` is immutable (`lsattr`).
+#[cfg(target_os = "linux")]
+fn immutable(path: &Path) -> bool {
+    has_attr(path, 'i')
+}
+
+/// BackOtter: whether the file at `path` has the flag `attr` (`lsattr`).
+#[cfg(target_os = "linux")]
+fn has_attr(path: &Path, attr: char) -> bool {
+    std::process::Command::new("lsattr")
+        .arg("-d")
+        .arg(path)
+        .output()
+        .is_ok_and(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .next()
+                .is_some_and(|flags| flags.contains(attr))
+        })
+}
+
+/// BackOtter (D8): an immutable file and an append-only directory whose
+/// contents and metadata already match keep their flags, and the file its
+/// inode's change time, through a second `--exact` restore: flags come off
+/// only for what the restore changes. Root only, on a file system with
+/// flags (TMPDIR).
+#[rstest]
+#[cfg(target_os = "linux")]
+fn test_restore_exact_flags_left_where_nothing_changes(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    let source = tempdir()?;
+    let s = source.path();
+    fs::create_dir(s.join("d"))?;
+    fs::write(s.join("d/f"), "f")?;
+    if !chattr("+i", &s.join("d/f")) {
+        eprintln!("no immutable flag in {}", s.display());
+        return Ok(());
+    }
+    _ = chattr("+a", &s.join("d"));
+    let repo = backed_up(set_up_repo?, s);
+    _ = chattr("-i", &s.join("d/f"));
+    _ = chattr("-a", &s.join("d"));
+    let repo = repo?;
+    let target = tempdir()?;
+    let t = target.path().join("test");
+    let exact = RestoreOptions::default().exact(true).numeric_id(true);
+    let result = (|| -> Result<_> {
+        assert_eq!(restore_counting(&repo, target.path(), exact)?, 0);
+        assert!(immutable(&t.join("d/f")));
+        let before = inodes(target.path())?;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(restore_counting(&repo, target.path(), exact)?, 0);
+        Ok((before, inodes(target.path())?))
+    })();
+    let flagged = immutable(&t.join("d/f"));
+    let appended = has_attr(&t.join("d"), 'a');
+    _ = chattr("-i", &t.join("d/f"));
+    _ = chattr("-a", &t.join("d"));
+    let (before, after) = result?;
+    assert!(flagged, "the second restore lost immutable");
+    assert!(appended, "the second restore lost append-only");
+    assert_eq!(after, before);
+    Ok(())
+}
+
+/// BackOtter (D6, D7): `--exact` over an immutable file with other names:
+/// the snapshot's name gets a file of its own, the unexpected name in the
+/// destination, which sorts before it, is removed all the same (--delete:
+/// it is a name of a file the restore replaced a name of), and the name
+/// outside the destination keeps the file's flags, which came off held and
+/// went back on it. Root only, on a file system with flags (TMPDIR).
+#[rstest]
+#[cfg(target_os = "linux")]
+fn test_restore_exact_flags_back_on_other_names(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    let source = tempdir()?;
+    let s = source.path();
+    fs::create_dir(s.join("d"))?;
+    fs::write(s.join("d/b"), "snapshot")?;
+    let repo = backed_up(set_up_repo?, s)?;
+    let target = tempdir()?;
+    let t = target.path().join("test");
+    restore_to(&repo, target.path(), RestoreOptions::default())?;
+    let outside = tempdir()?;
+    let o = outside.path().join("o");
+    fs::remove_file(t.join("d/b"))?;
+    fs::write(t.join("d/b"), "old")?;
+    fs::hard_link(t.join("d/b"), t.join("d/a"))?;
+    fs::hard_link(t.join("d/b"), &o)?;
+    if !chattr("+i", &o) {
+        eprintln!("no immutable flag in {}", outside.path().display());
+        return Ok(());
+    }
+    let result = restore_counting(&repo, target.path(), RestoreOptions::default().exact(true));
+    let flagged = immutable(&o);
+    _ = chattr("-i", &o);
+    _ = chattr("-i", &t.join("d/a"));
+    assert_eq!(result?, 0);
+    assert!(flagged, "the name outside lost immutable");
+    assert_eq!(fs::read_to_string(&o)?, "old");
+    assert_eq!(fs::read_to_string(t.join("d/b"))?, "snapshot");
+    assert!(!t.join("d/a").exists(), "the unexpected name is still there");
+    assert_eq!(fs::metadata(&o)?.nlink(), 1);
     Ok(())
 }

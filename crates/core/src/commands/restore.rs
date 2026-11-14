@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -23,7 +23,7 @@ use crate::{
         FileType, ReadBackend,
         decrypt::DecryptReadBackend,
         local_destination::{self, LocalDestination},
-        node::{Node, NodeType, generic_attributes::XfsOptions},
+        node::{ExtendedAttribute, Node, NodeType, generic_attributes::XfsOptions},
         osattrs,
     },
     blob::{BlobLocation, BlobLocations},
@@ -496,7 +496,8 @@ pub(crate) fn restore_repository<S: IndexedTree>(
     let errors = restore_metadata(
         without_sockets(node_streamer),
         &file_infos.hardlink_candidates,
-        file_infos.xfs_cleared,
+        &file_infos.unbroken,
+        file_infos.dirs,
         opts,
         dest,
     )?;
@@ -554,14 +555,25 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
 
     let mut stats = RestoreStats::default();
     let mut restore_infos = RestorePlan::default();
-    // BackOtter: the destination itself loses its XFS options while the
-    // restore makes entries in it, as any directory there, so that they
-    // inherit none of them, also where it keeps its own metadata (no node
-    // of its own, "" in the snapshot): it gets them back at the end
-    // (XfsCleared).
+    // BackOtter: the existing directories the restore hasn't changed yet,
+    // which keep their restricting flags and XFS options until it does
+    // (DirChanges); the destination itself too, also where it keeps its own
+    // metadata (no node of its own, "" in the snapshot). The files with
+    // other names a name of which the restore removed (Replaced), the files
+    // left shared whose hard link --exact couldn't break (unbroken), and the
+    // first name of each hard-linked file. RefCells, as the closures below
+    // share them.
+    let dirs = RefCell::new(DirChanges::default());
+    let replaced = RefCell::new(Replaced::default());
+    let unbroken = RefCell::new(BTreeSet::new());
+    let mut hardlink_candidates = BTreeMap::new();
     if !dry_run && std::fs::symlink_metadata(&dest_path).is_ok_and(|m| m.is_dir()) {
-        restore_infos.xfs_cleared.clear(Path::new(""), &dest_path);
+        dirs.borrow_mut().note(&dest_path, Path::new(""), false);
     }
+    let numeric = ownership(opts) == Ownership::Numeric;
+    // BackOtter: --exact compares owners only as root, who sets them (as
+    // BackOtter's restic): not root, the restore leaves them as they are.
+    let owned = ownership(opts) != Ownership::None && osattrs::is_root();
 
     let mut additional_existing = false;
     // BackOtter: failures restic counts as errors (RestoreStats::errors); a
@@ -576,6 +588,15 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
         if osattrs::restore_error_counts(err, false, root) {
             count();
         }
+    };
+    // BackOtter: restricting flags that couldn't be put back on the other
+    // names of a file whose name the restore removed (remove_held).
+    let put_back_failed = |path: &Path, err: &std::io::Error| {
+        error!(
+            "restore {}: restricting flags not put back on its other names: {err}",
+            path.display()
+        );
+        count();
     };
 
     let next_entry = |walker: &mut walkdir::IntoIter| -> Option<DirEntry> {
@@ -598,6 +619,10 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
             .find_map(Result::ok)
     };
 
+    // BackOtter: what --delete removes, removed once the walk is done
+    // (remove_extra), so that every file the restore replaces a name of is
+    // known by then (Replaced), whatever order the names come in.
+    let mut extra = Vec::new();
     let mut process_existing =
         |walker: &mut walkdir::IntoIter, entry: &DirEntry| -> RusticResult<Option<DirEntry>> {
             if entry.depth() == 0 {
@@ -625,21 +650,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         entry.path().display()
                     );
                 }
-                // BackOtter: flags that refuse removal (immutable, ...) stay
-                // as they are, as in stock rustic: such a file isn't
-                // removed, and the error says why.
-                (true, false, true) => {
-                    if let Err(err) = dest.remove_dir(entry.path()) {
-                        error!("error removing {}: {err}", entry.path().display());
-                        count();
-                    }
-                }
-                (true, false, false) => {
-                    if let Err(err) = dest.remove_file(entry.path()) {
-                        error!("error removing {}: {err}", entry.path().display());
-                        count();
-                    }
-                }
+                (true, false, _) => extra.push((entry.path().to_path_buf(), is_dir)),
                 (false, _, _) => {
                     additional_existing = true;
                 }
@@ -656,38 +667,47 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
     // file, is removed first, with or without --delete, as BackOtter's restic
     // does: a directory is restored as a directory, not through a symlink to
     // wherever that points, and a file or special file is made anew. Without
-    // --delete a directory only goes if it is empty. Returns the next entry
-    // and whether the old one is gone.
-    let replace_existing =
-        |walker: &mut walkdir::IntoIter, entry: &DirEntry| -> (Option<DirEntry>, bool) {
-            if entry.depth() == 0 {
-                return (next_entry(walker), false);
+    // --delete a directory only goes if it is empty. It loses the
+    // restricting flags that would refuse that first, where its node says
+    // what they are (`sets`), and a file with other names gets them back
+    // once this name is gone (remove_held). Returns the next entry and
+    // whether the old one is gone.
+    let replace_existing = |walker: &mut walkdir::IntoIter,
+                            entry: &DirEntry,
+                            sets: bool|
+     -> (Option<DirEntry>, bool) {
+        if entry.depth() == 0 {
+            return (next_entry(walker), false);
+        }
+        let is_dir = entry.file_type().is_dir();
+        let removed = if dry_run {
+            info!("would have replaced {}", entry.path().display());
+            true
+        } else {
+            dirs.borrow_mut().change_parent(entry.path());
+            // BackOtter: nothing below a directory loses its flags: what
+            // refuses removal stays, as with --delete.
+            let (removed, put_back) =
+                remove_held(entry.path(), sets, &replaced, |path| match (is_dir, opts.delete) {
+                    (false, _) => std::fs::remove_file(path),
+                    (true, true) => remove_tree(path, &replaced),
+                    (true, false) => std::fs::remove_dir(path),
+                });
+            if let Err(err) = put_back {
+                put_back_failed(entry.path(), &err);
             }
-            let is_dir = entry.file_type().is_dir();
-            let removed = if dry_run {
-                info!("would have replaced {}", entry.path().display());
-                true
-            } else {
-                // BackOtter: nothing below a directory loses its flags:
-                // what refuses removal stays, as with --delete.
-                match (is_dir, opts.delete) {
-                    (false, _) => dest.remove_file(entry.path()).map_err(|err| err.to_string()),
-                    (true, true) => dest.remove_dir(entry.path()).map_err(|err| err.to_string()),
-                    (true, false) => {
-                        std::fs::remove_dir(entry.path()).map_err(|err| err.to_string())
-                    }
-                }
+            removed
                 .map_err(|err| {
                     error!("error removing {}: {err}", entry.path().display());
                     count();
                 })
                 .is_ok()
-            };
-            if is_dir {
-                walker.skip_current_dir();
-            }
-            (next_entry(walker), removed)
         };
+        if is_dir {
+            walker.skip_current_dir();
+        }
+        (next_entry(walker), removed)
+    };
 
     // A node's path in the destination; one that would leave it ("..", an
     // absolute path) is an error. BackOtter: every path this restore
@@ -704,6 +724,184 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
         })
     };
 
+    // BackOtter: under --exact, the existing file `target`, which has other
+    // names, gets a name of its own before the restore writes to it or sets
+    // its metadata, so that nothing reaches them (exact::break_link). Its
+    // restricting flags come off first, where its node says what they are,
+    // for the rename or removal, and go back on the file it was, which its
+    // other names still are, through a descriptor held open (remove_held).
+    // One whose link can't be broken is an error, and is left exactly as it
+    // is (unbroken): no contents, no holes filled, no metadata, nor any of
+    // the snapshot's other names for it linked to it. True if it was
+    // broken.
+    let break_shared = |path: &PathBuf, node: &Node, target: &Path| -> bool {
+        dirs.borrow_mut().change_parent(target);
+        let sets = osattrs::node_sets_flags(node, known_bko);
+        let (broken, put_back) = remove_held(target, sets, &replaced, |target| {
+            exact::break_link(target).map(|cloned| {
+                debug!("hard link of {} broken, cloned: {cloned}", target.display());
+            })
+        });
+        match broken {
+            Ok(()) => {
+                if let Err(err) = put_back {
+                    put_back_failed(target, &err);
+                }
+                true
+            }
+            Err(err) => {
+                let err = match put_back {
+                    Ok(()) => err.to_string(),
+                    Err(perr) => format!("{err}; its restricting flags not set back: {perr}"),
+                };
+                error!("restore {}: left as it is, its hard link not broken: {err}", path.display());
+                count();
+                _ = unbroken.borrow_mut().insert(path.clone());
+                false
+            }
+        }
+    };
+
+    // BackOtter: plans the contents of the file `node` at `target`, which
+    // was there (`exists`) or not: what is there, of its size, is matched
+    // blob by blob, and what differs is written, or cloned whole from a
+    // file restored elsewhere (--clone-from). A file there loses the
+    // restricting flags that would refuse its being rewritten (immutable,
+    // append-only), where its node says what they are, only as the restore
+    // changes it: before it is written, cloned over, or its holes filled;
+    // one whose contents are right keeps them, and its inode its change
+    // time. The late flags pass sets the node's.
+    let mut plan_file = |path: &PathBuf, node: &Node, target: &Path, exists: bool| -> RusticResult<()> {
+        let sets = osattrs::node_sets_flags(node, known_bko);
+        // BackOtter: whether the file goes into a new, empty file,
+        // which can be restored sparse (write_sparse): nothing is
+        // there now, seen by the walk of the destination or not (a
+        // file below a symlinked directory), or left there by
+        // a hard link broken, or a file in the way removed.
+        let fresh = if dry_run {
+            !exists
+        } else {
+            matches!(std::fs::symlink_metadata(target),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound)
+        };
+        if fresh && !dry_run {
+            dirs.borrow_mut().change_parent(target);
+        }
+        let sparse = write_sparse(opts.sparse, node, fresh);
+        // BackOtter: a file left as it is, which had no holes at
+        // backup, gets its holes allocated (a swap file left with
+        // holes by an interrupted restore): only where the snapshot
+        // says so (fills_holes). Whether it did (with --dry-run:
+        // would), which makes it a file modified, as in BackOtter's
+        // restic. One to fill loses the flags that would refuse that
+        // first.
+        let fill_holes = || {
+            if !fills_holes(opts, node) {
+                return false;
+            }
+            if dry_run {
+                return osattrs::holes_to_fill(target, node.meta.size);
+            }
+            if sets && osattrs::holes_to_fill(target, node.meta.size) {
+                osattrs::clear_restricting_flags(target);
+            }
+            let filled = osattrs::fill_holes(target, node.meta.size);
+            if let Some(err) = &filled.error {
+                warn!("restore {}: holes not filled: {err}", path.display());
+            }
+            filled.changed
+        };
+        // collect blobs needed for restoring
+        let matched =
+            match restore_infos.match_file(dest, node, path.clone(), repo, opts.verify_existing)? {
+                FileMatch::Existing => {
+                    // Note that exists = false and Existing can happen if the file is changed between scanning the dir
+                    // and calling match_file. So we don't care about exists but trust match_file here.
+                    trace!("identical file: {}", path.display());
+                    if fill_holes() {
+                        stats.files.modify += 1;
+                    } else {
+                        stats.files.unchanged += 1;
+                    }
+                    return Ok(());
+                }
+                FileMatch::Blobs(matched) => matched,
+            };
+        if matched.changes() && !dry_run {
+            if !fresh && sets {
+                osattrs::clear_restricting_flags(target);
+            }
+            // BackOtter: under --exact, a file restored elsewhere with
+            // the same contents (--clone-from) is cloned, not written; a
+            // clone that fails leaves the file as it was, for the restore
+            // to write only what differs.
+            let clone = (opts.exact && exact::clone_ok(node))
+                .then(|| node.content.as_deref().and_then(|c| dest.clone_source(c)))
+                .flatten();
+            if let Some(src) = clone {
+                dirs.borrow_mut().change_parent(target);
+                match exact::clone_file(&src, target, node.meta.size) {
+                    Ok(()) => {
+                        restore_infos.cloned_size += node.meta.size;
+                        if exists {
+                            stats.files.modify += 1;
+                        } else {
+                            stats.files.restore += 1;
+                        }
+                        debug!("cloned: {}", path.display());
+                        return Ok(());
+                    }
+                    Err(err @ exact::CloneFailed::TempLeft { .. }) => {
+                        warn!("restore {}: not cloned from {}: {err}", path.display(), src.display());
+                    }
+                    Err(err) => debug!("not cloned from {}: {err}", src.display()),
+                }
+            }
+        }
+        match restore_infos.push_file(matched, sparse) {
+            AddFileResult::Verified => {
+                trace!("verified identical file: {}", path.display());
+                if fill_holes() {
+                    stats.files.modify += 1;
+                } else {
+                    stats.files.verified += 1;
+                }
+            }
+            // TODO: The differentiation between files to modify and files to create could be done only by add_file
+            // Currently, add_file never returns Modify, but always New, so we differentiate based on exists
+            AddFileResult::Modify if exists && !fresh => {
+                stats.files.modify += 1;
+                debug!("to modify: {}", path.display());
+            }
+            AddFileResult::Modify => {
+                if exists {
+                    stats.files.modify += 1;
+                } else {
+                    stats.files.restore += 1;
+                }
+                debug!("to restore: {}", path.display());
+                // BackOtter: flags a file system only takes on an
+                // empty file (btrfs's no-copy-on-write) go on before
+                // the contents.
+                if !dry_run
+                    && let Err(err) = osattrs::prepare_file(target, node)
+                {
+                    prepare_failed(path, &err);
+                }
+            }
+        }
+        Ok(())
+    };
+
+    // BackOtter: under --exact, the hard-linked files whose first name is a
+    // file with other names, decided once the walk has seen all their names
+    // (LinkGroup), by the device and inode in the snapshot; and under
+    // --delete, the later names of hard-linked files in the way of the link
+    // the metadata pass makes, with other names themselves (removed early).
+    let mut groups: Vec<LinkGroup> = Vec::new();
+    let mut group_of: BTreeMap<HardlinkKey, usize> = BTreeMap::new();
+    let mut in_the_way = Vec::new();
+
     let mut process_node = |path: &PathBuf, node: &Node, exists: bool| -> RusticResult<_> {
         let target = target_of(path)?;
         match node.node_type {
@@ -711,29 +909,40 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                 if exists {
                     stats.dirs.modify += 1;
                     trace!("existing dir {}", path.display());
-                    // BackOtter: a directory there loses its XFS options
-                    // until the late pass, so that the entries the restore
-                    // makes in it inherit none of them (as in one it
-                    // creates, which gets them last): realtime inheritance
-                    // would make its new regular files realtime, on an XFS
-                    // with a realtime device, for good once they have data.
-                    if !dry_run && std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir()) {
-                        restore_infos.xfs_cleared.clear(path, &target);
+                    // BackOtter: a directory there keeps its restricting
+                    // flags and XFS options until the restore makes,
+                    // removes or renames an entry in it (DirChanges), so
+                    // that one it leaves as it is keeps its inode's change
+                    // time. Then the XFS options come off until the late
+                    // pass, so that the entries the restore makes in it
+                    // inherit none of them (as in one it creates, which
+                    // gets them last): realtime inheritance would make its
+                    // new regular files realtime, on an XFS with a realtime
+                    // device, for good once they have data.
+                    let is_dir = std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir());
+                    if !dry_run && is_dir {
+                        dirs.borrow_mut().note(&target, path, osattrs::node_sets_flags(node, known_bko));
                     }
                     // BackOtter: an empty directory (a mount point, the
                     // destination of SNAP:subfolder) gets the flags that go
-                    // on before entries as one the restore creates.
+                    // on before entries as one the restore creates, unless
+                    // its metadata already match (--exact).
                     if !dry_run
-                        && std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir())
+                        && is_dir
                         && std::fs::read_dir(&target).is_ok_and(|mut dir| dir.next().is_none())
-                        && let Err(err) = osattrs::prepare_dir(&target, node, known_bko)
+                        && !(opts.exact
+                            && exact::already_matches(&target, node, numeric, owned, known_bko))
                     {
-                        prepare_failed(path, &err);
+                        dirs.borrow_mut().change(&target);
+                        if let Err(err) = osattrs::prepare_dir(&target, node, known_bko) {
+                            prepare_failed(path, &err);
+                        }
                     }
                 } else {
                     stats.dirs.restore += 1;
                     debug!("to restore: {}", path.display());
                     if !dry_run {
+                        dirs.borrow_mut().change_parent(&target);
                         dest.create_dir(path)
                             .map_err(|err| {
                                 RusticError::with_source(
@@ -757,13 +966,27 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                 }
             }
             NodeType::File => {
-                if let Some(key) = hardlink_key(node) {
-                    match restore_infos.hardlink_candidates.entry(key) {
+                let key = hardlink_key(node);
+                if let Some(key) = key {
+                    match hardlink_candidates.entry(key) {
                         std::collections::btree_map::Entry::Vacant(entry) => {
                             trace!("Adding hardlink candidate {}", path.display());
                             _ = entry.insert(path.clone());
                         }
-                        std::collections::btree_map::Entry::Occupied(_) => return Ok(()), // this is a hardlink to an existing candidate, will be processed later while setting metadata
+                        // this is a hardlink to an existing candidate, will be processed later while setting metadata
+                        std::collections::btree_map::Entry::Occupied(_) => {
+                            if let Some(&g) = group_of.get(&key) {
+                                groups[g].others.push(target);
+                            } else if opts.delete
+                                && !dry_run
+                                && exists
+                                && osattrs::node_sets_flags(node, known_bko)
+                                && file_id(&target).is_some_and(|(_, linked)| linked)
+                            {
+                                in_the_way.push((target, key));
+                            }
+                            return Ok(());
+                        }
                     }
                 }
                 // BackOtter: a file whose contents weren't backed up (one
@@ -779,119 +1002,41 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                     // restic: a file there may be quarantined, which keeps
                     // its contents and extended attributes closed to the
                     // restore too.
-                    if !dry_run
-                        && std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_file())
-                        && let Err(err) = std::fs::remove_file(&target)
-                    {
-                        warn!("restore {}: {err}", path.display());
-                        count();
+                    if !dry_run && std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_file()) {
+                        dirs.borrow_mut().change_parent(&target);
+                        let sets = osattrs::node_sets_flags(node, known_bko);
+                        let (removed, put_back) =
+                            remove_held(&target, sets, &replaced, |t| std::fs::remove_file(t));
+                        if let Err(err) = removed {
+                            warn!("restore {}: {err}", path.display());
+                            count();
+                        }
+                        if let Err(err) = put_back {
+                            put_back_failed(&target, &err);
+                        }
                     }
                 }
                 // BackOtter: under --exact, a file there with other names
-                // gets one of its own first, so that no write reaches them.
-                if opts.exact
-                    && exists
-                    && !dry_run
-                    && exact::has_other_names(&target)
-                    && let Err(err) = exact::break_link(&target)
-                {
-                    error!("restore {}: its hard link not broken: {err}", path.display());
-                    count();
-                }
-                // BackOtter: whether the file goes into a new, empty file,
-                // which can be restored sparse (write_sparse): nothing is
-                // there now, seen by the walk of the destination or not (a
-                // file below a symlinked directory), or left there by
-                // --delete.
-                let fresh = if dry_run {
-                    !exists
-                } else {
-                    matches!(std::fs::symlink_metadata(&target),
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound)
-                };
-                let sparse = write_sparse(opts.sparse, node, fresh);
-                // BackOtter: a file left as it is, which had no holes at
-                // backup, gets its holes allocated (a swap file left with
-                // holes by an interrupted restore): only where the snapshot
-                // says so (fills_holes). Whether it did (with --dry-run:
-                // would), which makes it a file modified, as in BackOtter's
-                // restic.
-                let fill_holes = || {
-                    if !fills_holes(opts, node) {
-                        return false;
+                // gets one of its own before the restore writes to it, so
+                // that nothing reaches them, unless its names are already
+                // exactly the snapshot's (LinkGroup): that is known once
+                // the walk has seen them all.
+                if opts.exact && exists && !dry_run && exact::has_other_names(&target) {
+                    if let Some(key) = key {
+                        _ = group_of.insert(key, groups.len());
+                        groups.push(LinkGroup {
+                            path: path.clone(),
+                            node: node.clone(),
+                            target,
+                            others: Vec::new(),
+                        });
+                        return Ok(());
                     }
-                    if dry_run {
-                        return osattrs::holes_to_fill(&target, node.meta.size);
-                    }
-                    let filled = osattrs::fill_holes(&target, node.meta.size);
-                    if let Some(err) = &filled.error {
-                        warn!("restore {}: holes not filled: {err}", path.display());
-                    }
-                    filled.changed
-                };
-                // BackOtter: under --exact, a file restored elsewhere with
-                // the same contents (--clone-from) is cloned, not written.
-                let clone = (opts.exact && !dry_run && exact::clone_ok(node))
-                    .then(|| node.content.as_deref().and_then(|c| dest.clone_source(c)))
-                    .flatten();
-                // collect blobs needed for restoring
-                match (
-                    exists,
-                    restore_infos.add_file(
-                        dest,
-                        node,
-                        path.clone(),
-                        repo,
-                        opts.verify_existing,
-                        sparse,
-                        clone.as_deref(),
-                    )?,
-                ) {
-                    (true, AddFileResult::Cloned) => {
-                        stats.files.modify += 1;
-                        debug!("cloned: {}", path.display());
-                    }
-                    (false, AddFileResult::Cloned) => {
-                        stats.files.restore += 1;
-                        debug!("cloned: {}", path.display());
-                    }
-                    // Note that exists = false and Existing or Verified can happen if the file is changed between scanning the dir
-                    // and calling add_file. So we don't care about exists but trust add_file here.
-                    (_, AddFileResult::Existing) => {
-                        trace!("identical file: {}", path.display());
-                        if fill_holes() {
-                            stats.files.modify += 1;
-                        } else {
-                            stats.files.unchanged += 1;
-                        }
-                    }
-                    (_, AddFileResult::Verified) => {
-                        trace!("verified identical file: {}", path.display());
-                        if fill_holes() {
-                            stats.files.modify += 1;
-                        } else {
-                            stats.files.verified += 1;
-                        }
-                    }
-                    // TODO: The differentiation between files to modify and files to create could be done only by add_file
-                    // Currently, add_file never returns Modify, but always New, so we differentiate based on exists
-                    (true, AddFileResult::Modify) => {
-                        stats.files.modify += 1;
-                        debug!("to modify: {}", path.display());
-                    }
-                    (false, AddFileResult::Modify) => {
-                        stats.files.restore += 1;
-                        debug!("to restore: {}", path.display());
-                        // BackOtter: flags a file system only takes on an
-                        // empty file (btrfs's no-copy-on-write) go on before
-                        // the contents.
-                        if !dry_run
-                            && let Err(err) = osattrs::prepare_file(&target, node)
-                        {
-                            prepare_failed(path, &err);
-                        }
+                    if !break_shared(path, node, &target) {
+                        return Ok(());
                     }
                 }
+                plan_file(path, node, &target, exists)?;
             }
             _ => {} // nothing to do for symlink, device, etc.
         }
@@ -925,13 +1070,12 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         // the flags that would refuse its being rewritten,
                         // replaced or given its metadata (immutable,
                         // append-only, undeletable), as in BackOtter's
-                        // restic, where its node says which flags it had:
-                        // the late flags pass sets those. Elsewhere they
-                        // stay, as in stock rustic, and what they refuse
-                        // fails with its error.
-                        if !dry_run && osattrs::node_sets_flags(node, known_bko) {
-                            osattrs::clear_restricting_flags(destination.path());
-                        }
+                        // restic, where its node says which flags it had,
+                        // and only as the restore changes it (DirChanges,
+                        // remove_held, plan_file, the metadata pass): the
+                        // late flags pass sets those. Elsewhere they stay,
+                        // as in stock rustic, and what they refuse fails
+                        // with its error.
                         // process existing node
                         // BackOtter: under --exact, a special file that is
                         // already the same (a symlink to the same target)
@@ -945,7 +1089,11 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         {
                             // if types do not match, first remove the existing file
                             let removed;
-                            (next_dst, removed) = replace_existing(&mut walker, destination);
+                            (next_dst, removed) = replace_existing(
+                                &mut walker,
+                                destination,
+                                osattrs::node_sets_flags(node, known_bko),
+                            );
                             process_node(path, node, !removed)?;
                         } else {
                             next_dst = next_entry(&mut walker);
@@ -966,10 +1114,62 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
         }
     }
 
+    // BackOtter: under --exact, each hard-linked file whose names in the
+    // destination, all seen now, are exactly the snapshot's keeps its
+    // inode; any other gets a name of its own, to be linked to in the
+    // metadata pass.
+    for group in &groups {
+        if !group.kept() && !break_shared(&group.path, &group.node, &group.target) {
+            continue;
+        }
+        plan_file(&group.path, &group.node, &group.target, true)?;
+    }
+
+    // BackOtter: what the metadata pass links over that has other names
+    // goes now, so that --delete knows them (Replaced). What can't be
+    // removed is left for the metadata pass, which tries again and reports
+    // it.
+    for (target, key) in in_the_way {
+        let Some(canonical) = hardlink_candidates.get(&key) else {
+            continue;
+        };
+        if unbroken.borrow().contains(canonical)
+            || dest.path(canonical).is_ok_and(|c| exact::same_file(&c, &target))
+        {
+            continue;
+        }
+        dirs.borrow_mut().change_parent(&target);
+        match remove_held(&target, true, &replaced, |t| std::fs::remove_file(t)) {
+            (Ok(()), Err(err)) => put_back_failed(&target, &err),
+            (Ok(()), Ok(())) => {}
+            (Err(err), _) => debug!("{} not removed early: {err}", target.display()),
+        }
+    }
+
+    // BackOtter: --delete, past what it can't remove, each an error: a
+    // name of a file the restore replaced another name of loses its
+    // restricting flags first, held, which the file's other names get back
+    // (remove_extra).
+    for (path, is_dir) in extra {
+        dirs.borrow_mut().change_parent(&path);
+        let removed = if is_dir {
+            remove_tree(&path, &replaced)
+        } else {
+            remove_extra(&path, &replaced)
+        };
+        if let Err(err) = removed {
+            error!("error removing {}: {err}", path.display());
+            count();
+        }
+    }
+
     if additional_existing {
         warn!("Note: additional entries exist in destination");
     }
 
+    restore_infos.hardlink_candidates = hardlink_candidates;
+    restore_infos.unbroken = unbroken.into_inner();
+    restore_infos.dirs = dirs.into_inner();
     stats.errors = errors.get();
     restore_infos.stats = stats;
     p.finish();
@@ -1008,10 +1208,12 @@ fn without_sockets(
 ///
 /// BackOtter: how many failures it warned about that BackOtter's restic
 /// counts as errors (exit 1).
+#[allow(clippy::too_many_lines)]
 fn restore_metadata(
     mut node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
     hardlink_candidates: &BTreeMap<HardlinkKey, PathBuf>,
-    mut xfs_cleared: XfsCleared,
+    unbroken: &BTreeSet<PathBuf>,
+    mut dirs: DirChanges,
     opts: RestoreOptions,
     dest: &LocalDestination,
 ) -> RusticResult<u64> {
@@ -1020,25 +1222,32 @@ fn restore_metadata(
     // they belong to the file, not each of its names, and an immutable file
     // (on illumos) refuses having them set again. ZFS's DOS flags (Linux)
     // just before them.
-    let mut file_flags = Vec::new();
-    let mut flags_linked = BTreeSet::new();
+    let mut late = LatePass::default();
     let numeric = ownership(opts) == Ownership::Numeric;
-    let owned = ownership(opts) != Ownership::None;
-    let mut finish = |path: &PathBuf, node: &Node| {
+    // BackOtter: --exact compares owners only as root, who sets them (as
+    // BackOtter's restic): not root, the restore leaves them as they are.
+    let owned = ownership(opts) != Ownership::None && osattrs::is_root();
+    let known_bko = opts.origin.known_bko();
+    let finish = |late: &mut LatePass,
+                  dirs: &mut DirChanges,
+                  tally: &mut RestoreTally,
+                  path: &PathBuf,
+                  node: &Node| {
         // BackOtter: a directory whose XFS options came off before its
         // entries went in gets those it had back, last, where its node has
         // none, and wherever nothing else is set on it here. It stays in
         // xfs_cleared until the late pass sets them: a restore that stops
         // before puts them back.
-        let had_xfs = if node.is_dir() { xfs_cleared.had(path) } else { None };
+        let had_xfs = if node.is_dir() { dirs.xfs.had(path) } else { None };
         let only_had_xfs = LateAttrs { flags: None, dos_flags: None, fat_attrs: None, xfs_options: had_xfs };
         // BackOtter: under --exact, an entry whose metadata already matches
-        // is left untouched: setting it again would change its inode (the
-        // change time), which a btrfs snapshot then no longer shares.
-        let late = if opts.exact
+        // is left untouched, its restricting flags too: setting it again
+        // would change its inode (the change time), which a btrfs snapshot
+        // then no longer shares.
+        let attrs = if opts.exact
             && dest
                 .path(path)
-                .is_ok_and(|t| exact::already_matches(&t, node, numeric, owned))
+                .is_ok_and(|t| exact::already_matches(&t, node, numeric, owned, known_bko))
         {
             trace!("metadata already matches: {}", path.display());
             only_had_xfs
@@ -1046,7 +1255,18 @@ fn restore_metadata(
             let create = !(opts.exact
                 && node.is_special()
                 && dest.path(path).is_ok_and(|t| exact::same_type(&t, node)));
-            if set_metadata(dest, opts, path, node, create, &mut tally) {
+            // BackOtter: a special file made anew is an entry made in its
+            // directory (DirChanges); anything else there loses the flags
+            // that would refuse its metadata, where its node says what they
+            // are. The late flags pass sets the node's.
+            if let Ok(target) = dest.path(path) {
+                if create && node.is_special() {
+                    dirs.change_parent(&target);
+                } else if osattrs::node_sets_flags(node, known_bko) {
+                    osattrs::clear_restricting_flags(&target);
+                }
+            }
+            if set_metadata(dest, opts, path, node, create, tally) {
                 LateAttrs {
                     flags: osattrs::file_flags(node),
                     dos_flags: osattrs::zfs_dos_flags(node),
@@ -1057,41 +1277,73 @@ fn restore_metadata(
                 only_had_xfs
             }
         };
-        if late.any() && hardlink_key(node).is_none_or(|key| flags_linked.insert(key)) {
-            file_flags.push((
+        if attrs.any() && hardlink_key(node).is_none_or(|key| late.flags_linked.insert(key)) {
+            late.file_flags.push((
                 path.clone(),
                 node.node_type.clone(),
-                late,
+                attrs,
                 osattrs::flags_xattrs(node),
             ));
         }
     };
 
     let mut dir_stack = Vec::new();
-    while let Some((path, node)) = node_streamer.next().transpose()? {
+    // BackOtter: a failure to read the snapshot's nodes stops the pass, but
+    // not the late flags pass, which puts back what came off (E1).
+    let mut stream_err = None;
+    loop {
+        let (path, node) = match node_streamer.next() {
+            None => break,
+            Some(Ok(item)) => item,
+            Some(Err(err)) => {
+                stream_err = Some(err);
+                break;
+            }
+        };
+        // BackOtter: a file whose hard link --exact couldn't break is left
+        // exactly as it is, and the snapshot's other names for it aren't
+        // linked to it: an error each.
+        if unbroken.contains(&path) {
+            continue;
+        }
         // Create hardlink directly, if this is one.
         if let Some(key) = hardlink_key(&node)
             && let Some(canonical) = hardlink_candidates.get(&key)
             && canonical != &path
-            // BackOtter: under --exact, a name already of that file stays.
-            && !(opts.exact
-                && matches!((dest.path(canonical), dest.path(&path)),
-                    (Ok(a), Ok(b)) if exact::same_file(&a, &b)))
         {
-            debug!(
-                "restoring hardlink {} -> {}",
-                path.display(),
-                canonical.display()
-            );
-            dest.hard_link(canonical, &path).map_err(|err| {
-                RusticError::with_source(
-                    ErrorKind::InputOutput,
-                    "Failed to recreate the hardlink `{path}` from `{canonical}`.",
-                    err,
-                )
-                .attach_context("path", path.display().to_string())
-                .attach_context("canonical", canonical.display().to_string())
-            })?;
+            if unbroken.contains(canonical) {
+                error!(
+                    "restore {}: not linked to {}, left as it is: its hard link not broken",
+                    path.display(),
+                    canonical.display()
+                );
+                tally.always();
+                continue;
+            }
+            // BackOtter: a name already of that file stays.
+            if !matches!((dest.path(canonical), dest.path(&path)),
+                    (Ok(a), Ok(b)) if exact::same_file(&a, &b))
+            {
+                debug!(
+                    "restoring hardlink {} -> {}",
+                    path.display(),
+                    canonical.display()
+                );
+                // BackOtter: one that can't be made is an error of its own,
+                // and the restore goes on: the rest gets its metadata, and
+                // the late flags pass puts back what came off (E1).
+                let sets = osattrs::node_sets_flags(&node, known_bko);
+                let linked = link_name(dest, canonical, &path, &node, key, sets, &mut dirs, &mut late, &mut tally);
+                if let Err(err) = linked {
+                    error!(
+                        "restore {}: hard link to {} not made: {err}",
+                        path.display(),
+                        canonical.display()
+                    );
+                    tally.always();
+                    continue;
+                }
+            }
         }
 
         match node.node_type {
@@ -1102,21 +1354,21 @@ fn restore_metadata(
                         break;
                     }
                     let (path, node) = dir_stack.pop().unwrap();
-                    finish(&path, &node);
+                    finish(&mut late, &mut dirs, &mut tally, &path, &node);
                 }
                 // push current path to the stack
                 dir_stack.push((path, node));
             }
-            _ => finish(&path, &node),
+            _ => finish(&mut late, &mut dirs, &mut tally, &path, &node),
         }
     }
 
     // empty dir stack and set metadata
     for (path, node) in dir_stack.into_iter().rev() {
-        finish(&path, &node);
+        finish(&mut late, &mut dirs, &mut tally, &path, &node);
     }
 
-    for (path, node_type, late, xattrs) in file_flags {
+    for (path, node_type, late, xattrs) in late.file_flags {
         // set_metadata made it, so its path is in the destination.
         let Ok(target) = dest.path(&path) else {
             continue;
@@ -1133,7 +1385,7 @@ fn restore_metadata(
             // BackOtter: a directory's options, cleared before its entries
             // went in or not, are its node's or those it had now.
             if node_type == NodeType::Dir {
-                xfs_cleared.take(&path);
+                dirs.xfs.take(&path);
             }
         }
         let (flags, dos_flags) = (late.flags, late.dos_flags);
@@ -1149,12 +1401,88 @@ fn restore_metadata(
     // BackOtter: the directories cleared whose options the late pass didn't
     // set (the destination, which keeps its own metadata) get back those
     // they had.
-    xfs_cleared.put_back(|path, err| tally.io(path, err, false));
+    dirs.xfs.put_back(|path, err| tally.io(path, err, false));
     // BackOtter: how many files had metadata the file system doesn't
-    // support, warned about once.
+    // support, warned about once; the SELinux labels an active SELinux
+    // kept (--exact), one error for them all.
     osattrs::report_unsupported();
+    if osattrs::report_labels_kept() {
+        tally.always();
+    }
+    if let Some(err) = stream_err {
+        return Err(err);
+    }
 
     Ok(tally.errors)
+}
+
+/// BackOtter: what the metadata pass leaves for the late flags pass: each
+/// file's late attributes, once per file (`flags_linked`, by its hard-link
+/// key).
+#[derive(Default)]
+struct LatePass {
+    file_flags: Vec<(PathBuf, NodeType, LateAttrs, Vec<ExtendedAttribute>)>,
+    flags_linked: BTreeSet<HardlinkKey>,
+}
+
+/// BackOtter: links the name `path` of the hard-linked file `node` (`key`)
+/// to its first name, `canonical`, as the metadata pass does
+/// (`LocalDestination::hard_link`): an entry made in its directory
+/// (DirChanges). Where its node says which flags it had, the file loses
+/// those that would refuse a link to it (immutable, append-only), which the
+/// late flags pass puts back on it, and what is in the way loses those that
+/// would refuse its removal, held: its other names get them back once this
+/// name is gone (remove_held).
+///
+/// # Errors
+///
+/// * If the link couldn't be made.
+#[allow(clippy::too_many_arguments)]
+fn link_name(
+    dest: &LocalDestination,
+    canonical: &Path,
+    path: &Path,
+    node: &Node,
+    key: HardlinkKey,
+    sets: bool,
+    dirs: &mut DirChanges,
+    late: &mut LatePass,
+    tally: &mut RestoreTally,
+) -> Result<(), String> {
+    let (Ok(first), Ok(target)) = (dest.path(canonical), dest.path(path)) else {
+        return dest.hard_link(canonical, path).map_err(|err| err.to_string());
+    };
+    dirs.change_parent(&target);
+    if sets {
+        osattrs::clear_restricting_flags(&first);
+        if osattrs::file_flags(node).is_some() && late.flags_linked.insert(key) {
+            late.file_flags.push((
+                canonical.to_path_buf(),
+                node.node_type.clone(),
+                LateAttrs {
+                    flags: osattrs::file_flags(node),
+                    dos_flags: None,
+                    fat_attrs: None,
+                    xfs_options: None,
+                },
+                osattrs::flags_xattrs(node),
+            ));
+        }
+    }
+    let in_the_way = std::fs::symlink_metadata(&target).is_ok();
+    let replaced = RefCell::new(Replaced::default());
+    let (linked, put_back) = remove_held(&target, sets && in_the_way, &replaced, |_| {
+        dest.hard_link(canonical, path)
+            .map_err(|err| std::io::Error::other(err.to_string()))
+    });
+    if let Err(err) = put_back {
+        error!(
+            "restore {}: restricting flags not put back on its other names: {err}",
+            target.display()
+        );
+        tally.always();
+    }
+    linked.map_err(|err| err.to_string())
 }
 
 /// BackOtter: the metadata the restore sets last, once every file has
@@ -1747,6 +2075,225 @@ impl Drop for XfsCleared {
     }
 }
 
+/// BackOtter: the existing directories, by target, that the restore hasn't
+/// changed yet: each keeps its restricting flags and XFS options until the
+/// restore is about to make, remove or rename an entry in it
+/// ([`Self::change`]), so that one it leaves as it is, and whose metadata
+/// already match under `--exact`, keeps its inode's change time, which a
+/// btrfs snapshot then still shares. As in BackOtter's restic
+/// (`changeDir`). Then the XFS options come off until the late pass
+/// ([`XfsCleared`]).
+#[derive(Debug, Default)]
+struct DirChanges {
+    /// The directories not changed yet, by target: their path in the
+    /// snapshot, and whether their nodes say which flags they had
+    /// (`osattrs::node_sets_flags`).
+    untouched: BTreeMap<PathBuf, (PathBuf, bool)>,
+    /// The XFS options taken off the directories changed.
+    xfs: XfsCleared,
+}
+
+impl DirChanges {
+    /// The directory `target`, at `path` in the snapshot, was there
+    /// already; `sets_flags` as [`osattrs::node_sets_flags`] says for its
+    /// node.
+    fn note(&mut self, target: &Path, path: &Path, sets_flags: bool) {
+        _ = self
+            .untouched
+            .insert(target.to_path_buf(), (path.to_path_buf(), sets_flags));
+    }
+
+    /// Readies the directory `dir` (a target), which the restore is about to
+    /// make, remove or rename an entry in, if it was there and hasn't been
+    /// changed yet: it loses the restricting flags that would refuse that,
+    /// where its node says what they are, and its XFS options, so that the
+    /// entries the restore makes in it inherit none of them; the late pass
+    /// gives it its node's.
+    fn change(&mut self, dir: &Path) {
+        if let Some((path, sets_flags)) = self.untouched.remove(dir) {
+            if sets_flags {
+                osattrs::clear_restricting_flags(dir);
+            }
+            self.xfs.clear(&path, dir);
+        }
+    }
+
+    /// [`Self::change`] for the directory of `target`.
+    fn change_parent(&mut self, target: &Path) {
+        if let Some(dir) = target.parent() {
+            self.change(dir);
+        }
+    }
+}
+
+/// BackOtter: under `--exact`, a hard-linked file of the snapshot whose
+/// first name in the destination is a file with other names: it is left
+/// alone, inode and all, when its names there are already exactly the
+/// snapshot's ([`Self::kept`]), and otherwise gets a name of its own, once
+/// the walk has seen them all. As in BackOtter's restic (`linkGroup`).
+#[derive(Debug)]
+struct LinkGroup {
+    /// The first name, in the snapshot.
+    path: PathBuf,
+    /// Its node.
+    node: Node,
+    /// The first name, in the destination.
+    target: PathBuf,
+    /// The targets of the snapshot's other names for it.
+    others: Vec<PathBuf>,
+}
+
+impl LinkGroup {
+    /// Whether the names the destination has for the file are exactly the
+    /// snapshot's, as one file: the file at the first name has a link for
+    /// each of them and no more (none outside the destination), and every
+    /// other name is that file. Then nothing of the restore can reach a
+    /// name the snapshot hasn't got: its contents, if they differ, are
+    /// written into it, as into one file of its own.
+    fn kept(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::symlink_metadata(&self.target).is_ok_and(|m| {
+                m.is_file() && m.nlink() == 1 + self.others.len() as u64
+            }) && self
+                .others
+                .iter()
+                .all(|other| exact::same_file(&self.target, other))
+        }
+        #[cfg(not(unix))]
+        false
+    }
+}
+
+/// BackOtter: the files with other names, by device and inode, a name of
+/// which the restore removed or renamed another file over, clearing their
+/// restricting flags for that ([`remove_held`]): they were the restore's to
+/// manage, and `--delete` clears them again for an unexpected name of such
+/// a file ([`remove_extra`]). A bcachefs snapshot can share the device and
+/// inode numbers of its origin's files, so a name there of another file
+/// may count too: `--delete` removes it all the same, only past its
+/// restricting flags. As in BackOtter's restic (`replacedLinks`).
+#[derive(Debug, Default)]
+struct Replaced(BTreeSet<(u64, u64)>);
+
+/// BackOtter: the device and inode of what is at `path`, and whether it has
+/// other names; `None` for a directory, or nothing there.
+fn file_id(path: &Path) -> Option<((u64, u64), bool)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path)
+            .ok()
+            .filter(|m| !m.is_dir())
+            .map(|m| ((m.dev(), m.ino()), m.nlink() > 1))
+    }
+    #[cfg(not(unix))]
+    {
+        _ = path;
+        None
+    }
+}
+
+/// BackOtter: removes the name `target` with `remove` (or renames another
+/// file over it: a hard link broken), past the restricting flags that would
+/// refuse that, where its node says what they are (`sets_flags`): they come
+/// off held ([`osattrs::clear_restricting_flags_held`]) and go back on the
+/// file it was, through the descriptor held since, whether the name is
+/// gone or not, so that its other names, outside the destination too, keep
+/// them. A file with other names whose name is gone is noted in
+/// `replaced`, for `--delete`. Returns what `remove` returned, and whether
+/// the flags went back.
+fn remove_held(
+    target: &Path,
+    sets_flags: bool,
+    replaced: &RefCell<Replaced>,
+    remove: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> (std::io::Result<()>, std::io::Result<()>) {
+    if !sets_flags {
+        return (remove(target), Ok(()));
+    }
+    let id = file_id(target);
+    let held = osattrs::clear_restricting_flags_held(target);
+    let removed = remove(target);
+    let gone = removed
+        .as_ref()
+        .map_or_else(|err| err.kind() == std::io::ErrorKind::NotFound, |()| true);
+    if gone && let Some((id, true)) = id {
+        _ = replaced.borrow_mut().0.insert(id);
+    }
+    (removed, held.put_back())
+}
+
+/// BackOtter: removes the file `path`, which `--delete` removes: a name of a
+/// file the restore replaced another name of ([`Replaced`]) loses its
+/// restricting flags first, held, and the file's other names get them back
+/// once it is gone; any other keeps its flags, as in stock rustic, and
+/// what they refuse fails with its error.
+///
+/// # Errors
+///
+/// * If it couldn't be removed, or the flags couldn't be put back.
+fn remove_extra(path: &Path, replaced: &RefCell<Replaced>) -> std::io::Result<()> {
+    if !file_id(path).is_some_and(|(id, _)| replaced.borrow().0.contains(&id)) {
+        return std::fs::remove_file(path);
+    }
+    let held = osattrs::clear_restricting_flags_held(path);
+    let removed = std::fs::remove_file(path);
+    let put_back = held.put_back();
+    removed?;
+    put_back.map_err(|err| {
+        std::io::Error::new(
+            err.kind(),
+            format!("removed, but restricting flags not put back on its other names: {err}"),
+        )
+    })
+}
+
+/// BackOtter: removes the directory `dir` and all below it, which `--delete`
+/// removes, each file as [`remove_extra`] does, one at a time, and past
+/// what it can't remove: the error then says what failed first, and how
+/// much was and wasn't removed. As in BackOtter's restic, which reports what
+/// a partial removal deleted.
+///
+/// # Errors
+///
+/// * If some of it couldn't be removed.
+fn remove_tree(dir: &Path, replaced: &RefCell<Replaced>) -> std::io::Result<()> {
+    let (mut removed, mut failed) = (0_u64, 0_u64);
+    let mut first = None;
+    for entry in WalkDir::new(dir).follow_links(false).contents_first(true) {
+        let result = match &entry {
+            Err(err) => Err(std::io::Error::other(err.to_string())),
+            Ok(entry) if entry.file_type().is_dir() => std::fs::remove_dir(entry.path()),
+            Ok(entry) => remove_extra(entry.path(), replaced),
+        };
+        match result {
+            Ok(()) => removed += 1,
+            Err(err) => {
+                failed += 1;
+                if first.is_none() {
+                    let path = entry.as_ref().map_or_else(
+                        |err| err.path().unwrap_or(dir).to_path_buf(),
+                        |entry| entry.path().to_path_buf(),
+                    );
+                    first = Some((path, err));
+                }
+            }
+        }
+    }
+    match first {
+        None => Ok(()),
+        Some((path, err)) => Err(std::io::Error::new(
+            err.kind(),
+            format!(
+                "{failed} entries not removed, the first {}: {err}; {removed} removed",
+                path.display()
+            ),
+        )),
+    }
+}
+
 /// BackOtter: held (shared) by a restore while it makes an entry in the
 /// destination, or writes to one ([`making_entries`]); [`put_back_xfs_options`]
 /// takes it for good, so that nothing is made after it in a directory whose
@@ -1807,11 +2354,17 @@ pub struct RestorePlan {
     r: RestoreInfo,
     /// candidates for hardlinks
     hardlink_candidates: BTreeMap<HardlinkKey, PathBuf>,
-    /// BackOtter: the existing directories whose XFS options came off
-    /// before the restore put entries in them, with those they had, for the
-    /// late pass to put back where their nodes have none; a plan dropped
-    /// before (an error, or one not restored) puts them all back.
-    xfs_cleared: XfsCleared,
+    /// BackOtter: the existing directories the restore hasn't changed, and
+    /// those whose XFS options came off before the restore put entries in
+    /// them, with those they had, for the late pass to put back where their
+    /// nodes have none; a plan dropped before (an error, or one not
+    /// restored) puts them all back.
+    dirs: DirChanges,
+    /// BackOtter: the files, by their paths in the snapshot, whose hard
+    /// link `--exact` couldn't break, left exactly as they are: no
+    /// contents, no metadata, and the snapshot's other names for them not
+    /// linked to them.
+    unbroken: BTreeSet<PathBuf>,
     /// The total restore size
     pub restore_size: u64,
     /// The total size of matched content, i.e. content with needs no restore.
@@ -1835,46 +2388,65 @@ struct FileLocation {
     matches: bool,
 }
 
+/// BackOtter: what [`RestorePlan::match_file`] found for a file.
+enum FileMatch {
+    /// It is there, of the right size (and mtime): left as it is.
+    Existing,
+    /// Its blobs, to restore those that don't match.
+    Blobs(MatchedFile),
+}
+
+/// BackOtter: a file matched blob by blob ([`RestorePlan::match_file`]), for
+/// [`RestorePlan::push_file`].
+struct MatchedFile {
+    /// Its name.
+    name: PathBuf,
+    /// Its blobs: pack, location, offset in the file, length, whether it
+    /// matches what is there.
+    blobs: Vec<(PackId, BlobLocation, u64, u64, bool)>,
+    /// Its length.
+    length: u64,
+    /// Whether some blob doesn't match.
+    has_unmatched: bool,
+    /// Whether it was there, of its size, to match.
+    open: bool,
+}
+
+impl MatchedFile {
+    /// Whether the restore writes to it: some blob doesn't match, or it
+    /// wasn't there to match.
+    const fn changes(&self) -> bool {
+        self.has_unmatched || !self.open
+    }
+}
+
 /// [`AddFileResult`] indicates the result of adding a file to [`FileLocation`]
 // TODO: Add documentation!
 enum AddFileResult {
-    Existing,
     Verified,
     Modify,
-    /// BackOtter: cloned whole from a file restored elsewhere
-    Cloned,
 }
 
 impl RestorePlan {
-    /// Add the file to [`FileLocation`] using `index` to get blob information.
-    ///
-    /// # Type Parameters
-    ///
-    /// * `P` - The progress bar type.
-    /// * `S` - The type of the indexed tree.
-    ///
-    /// # Arguments
-    ///
-    /// * `dest` - The destination to restore to.
-    /// * `file` - The file to add.
-    /// * `name` - The name of the file.
-    /// * `repo` - The repository to restore.
-    /// * `ignore_mtime` - If true, ignore the modification time of the file.
-    /// * `sparse` - If true, restore zero chunks as holes.
+    /// Matches the file `file`, at `name`, against what is there, using
+    /// `index` to get blob information: [`FileMatch::Existing`] when it is
+    /// there with the right size (and mtime, unless `ignore_mtime`), else its
+    /// blobs, each matched or not, for [`Self::push_file`]. BackOtter: stock
+    /// rustic's `add_file`, split so that the restore can clone the file or
+    /// ready it (its restricting flags) between the two, once it knows the
+    /// file changes.
     ///
     /// # Errors
     ///
-    /// * If the file could not be added.
-    fn add_file<S: IndexedFull>(
+    /// * If the file could not be matched.
+    fn match_file<S: IndexedFull>(
         &mut self,
         dest: &LocalDestination,
         file: &Node,
         name: PathBuf,
         repo: &Repository<S>,
         ignore_mtime: bool,
-        sparse: bool,
-        clone: Option<&Path>,
-    ) -> RusticResult<AddFileResult> {
+    ) -> RusticResult<FileMatch> {
         let mut open_file = dest.get_matching_file(&name, file.meta.size);
 
         // Empty files which exists with correct size should always return Ok(Existing)!
@@ -1893,7 +2465,7 @@ impl RestorePlan {
                 )?
                 && meta.len() == 0 {
                     // Empty file exists
-                    return Ok(AddFileResult::Existing);
+                    return Ok(FileMatch::Existing);
                 }
 
         if !ignore_mtime
@@ -1919,11 +2491,10 @@ impl RestorePlan {
                     // File exists with fitting mtime => we suspect this file is ok!
                     debug!("file {} exists with suitable size and mtime, accepting it!",name.display());
                     self.matched_size += file.meta.size;
-                    return Ok(AddFileResult::Existing);
+                    return Ok(FileMatch::Existing);
                 }
             }
 
-        let file_idx = self.names.len();
         let mut file_pos = 0;
         let mut has_unmatched = false;
         let mut blobs = Vec::new();
@@ -1940,39 +2511,21 @@ impl RestorePlan {
             file_pos += length;
         }
 
-        // BackOtter: a file that doesn't match, whose contents a file
-        // restored elsewhere has (--clone-from), is cloned whole; if the
-        // clone fails, it is written, all of it (the clone may have emptied
-        // it).
-        let mut emptied = false;
-        if has_unmatched && let Some(src) = clone {
-            drop(open_file.take());
-            let target = dest.path(&name).map_err(|err| {
-                RusticError::with_source(
-                    ErrorKind::InputOutput,
-                    "Invalid path in snapshot for restore destination: `{path}`.",
-                    err,
-                )
-                .attach_context("path", name.display().to_string())
-            })?;
-            match exact::clone_file(src, &target, file.meta.size) {
-                Ok(()) => {
-                    self.cloned_size += file.meta.size;
-                    return Ok(AddFileResult::Cloned);
-                }
-                Err(exact::CloneFailed::Untouched(err)) => {
-                    debug!("not cloned from {}: {err}", src.display());
-                }
-                Err(exact::CloneFailed::Emptied(err)) => {
-                    debug!("not cloned from {}: {err}", src.display());
-                    emptied = true;
-                }
-            }
-        }
+        Ok(FileMatch::Blobs(MatchedFile {
+            name,
+            blobs,
+            length: file_pos,
+            has_unmatched,
+            open: open_file.is_some(),
+        }))
+    }
 
-        self.names.push(name);
-        for (pack, bl, file_start, length, matches) in blobs {
-            let matches = matches && !emptied;
+    /// Adds the file `file`, matched by [`Self::match_file`], to
+    /// [`FileLocation`], restored sparse if `sparse`.
+    fn push_file(&mut self, file: MatchedFile, sparse: bool) -> AddFileResult {
+        let file_idx = self.names.len();
+        self.names.push(file.name);
+        for (pack, bl, file_start, length, matches) in file.blobs {
             self.r.entry((pack, bl)).or_default().push(FileLocation {
                 file_idx,
                 file_start,
@@ -1985,13 +2538,13 @@ impl RestorePlan {
             }
         }
 
-        self.file_lengths.push(file_pos);
+        self.file_lengths.push(file.length);
         self.sparse.push(sparse);
 
-        if !has_unmatched && open_file.is_some() {
-            Ok(AddFileResult::Verified)
+        if !file.has_unmatched && file.open {
+            AddFileResult::Verified
         } else {
-            Ok(AddFileResult::Modify)
+            AddFileResult::Modify
         }
     }
 
@@ -2158,7 +2711,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().join("d");
-        let mounts = std::cell::RefCell::new(Vec::<PathBuf>::new());
+        let mounts = RefCell::new(Vec::<PathBuf>::new());
         let device = |path: &Path, _: &std::fs::Metadata| {
             let mounts = mounts.borrow();
             let i = mounts.iter().position(|m| path.starts_with(m));
@@ -2301,7 +2854,7 @@ mod tests {
     fn target_fresh_with_nilfs_entry() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().join("d");
-        let mounts = std::cell::RefCell::new(Vec::<PathBuf>::new());
+        let mounts = RefCell::new(Vec::<PathBuf>::new());
         let device = |path: &Path, _: &std::fs::Metadata| {
             let mounts = mounts.borrow();
             let i = mounts.iter().position(|m| path.starts_with(m));
