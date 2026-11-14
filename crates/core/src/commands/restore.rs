@@ -34,6 +34,8 @@ use crate::{
 
 mod exact;
 pub use exact::CloneSources;
+// BackOtter: one handle per file while it has blobs to come.
+mod files_writer;
 
 pub(crate) mod constants {
     /// The maximum number of reader threads to use for restoring.
@@ -1494,28 +1496,45 @@ fn restore_contents<S: Open>(
 ) -> RusticResult<usize> {
     let be = repo.dbe();
 
-    // BackOtter: the files that couldn't be written, each reported once.
-    let failed = &Mutex::new(BTreeSet::new());
-    let fail = &|file_idx: usize, err: &dyn std::fmt::Display| {
-        if failed.lock().unwrap().insert(file_idx) {
-            error!(
-                "restore {}: contents not restored: {err}",
-                filenames[file_idx].display()
-            );
-        }
-    };
+    // BackOtter: fewer readers on a small machine (see the constants).
+    let threads =
+        std::thread::available_parallelism().map_or(constants::MAX_READER_THREADS_NUM, |cpus| {
+            cpus.get()
+                .saturating_mul(constants::READER_THREADS_PER_CPU)
+                .min(constants::MAX_READER_THREADS_NUM)
+        });
+
+    // BackOtter: each file is written through one handle while it has
+    // writes under way, kept open (a bounded number of them) while it has
+    // writes to come, and closed after its last, as in BackOtter's restic:
+    // opened and closed for each blob, a file on ext4 lost its block
+    // preallocation at each close and came out in scattered extents
+    // (files_writer). Its writes, one per blob it gets that isn't there
+    // already, are counted first. The files that couldn't be written are
+    // reported there, each once.
+    let mut file_writes = vec![0; file_lengths.len()];
+    for fl in restore_info.values().flatten().filter(|fl| !fl.matches) {
+        file_writes[fl.file_idx] += 1;
+    }
+    let writer = files_writer::FilesWriter::new(
+        dest,
+        filenames,
+        sparse,
+        &file_lengths,
+        file_writes,
+        files_writer::max_idle(threads),
+    );
 
     // first create needed empty files, as they are not created later.
     for (i, size) in file_lengths.iter().enumerate() {
         if *size == 0 {
             let path = &filenames[i];
             if let Err(err) = dest.set_length(path, *size, sparse[i]) {
-                fail(i, &err);
+                writer.fail(i, &err);
             }
         }
     }
-
-    let sizes = &Mutex::new(file_lengths);
+    drop(file_lengths);
 
     let p = repo.progress_bytes("restoring file contents...");
     p.set_length(restore_size);
@@ -1544,14 +1563,6 @@ fn restore_contents<S: Open>(
         .coalesce(PackInfo::coalesce)
         .collect();
 
-    // BackOtter: fewer readers on a small machine (see the constants).
-    let threads =
-        std::thread::available_parallelism().map_or(constants::MAX_READER_THREADS_NUM, |cpus| {
-            cpus.get()
-                .saturating_mul(constants::READER_THREADS_PER_CPU)
-                .min(constants::MAX_READER_THREADS_NUM)
-        });
-
     let pool = ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
@@ -1579,6 +1590,7 @@ fn restore_contents<S: Open>(
         } in packs
         {
             let p = &p;
+            let writer = &writer;
 
             if !blobs.is_empty() {
                 // BackOtter: a pack's bytes are taken from the budget here,
@@ -1631,46 +1643,14 @@ fn restore_contents<S: Open>(
                             && local_destination::is_zero(&data);
                         for (file_idx, start) in name_dests {
                             let data = data.clone();
-                            let is_sparse = sparse[file_idx];
                             let held = Arc::clone(&held);
                             s1.spawn(move |_| {
                                 let _held = held;
-                                let path = &filenames[file_idx];
-                                // Allocate file if it is not yet allocated
-                                let mut sizes_guard = sizes.lock().unwrap();
-                                let filesize = sizes_guard[file_idx];
-                                if filesize > 0 {
-                                    // BackOtter: a file that can't be
-                                    // sized (opened for writing) is
-                                    // reported and left, not a panic.
-                                    if let Err(err) = dest.set_length(path, filesize, is_sparse) {
-                                        fail(file_idx, &err);
-                                    }
-                                    sizes_guard[file_idx] = 0;
-                                }
-                                drop(sizes_guard);
-                                if failed.lock().unwrap().contains(&file_idx) {
-                                    p.inc(size);
-                                    return;
-                                }
-                                // BackOtter: in a file restored sparse
-                                // (write_sparse), the blob's all-zero parts
-                                // of the file system's blocks stay holes, as
-                                // BackOtter's restic leaves them; any other
-                                // file gets every byte, so that it is
-                                // allocated.
-                                let written = if is_sparse {
-                                    if zeros {
-                                        Ok(())
-                                    } else {
-                                        dest.write_sparse_at(path, start, &data)
-                                    }
-                                } else {
-                                    dest.write_at(path, start, &data)
-                                };
-                                if let Err(err) = written {
-                                    fail(file_idx, &err);
-                                }
+                                // BackOtter: through the file's handle,
+                                // which its first write sizes; a file that
+                                // can't be sized or written is reported
+                                // and left, not a panic.
+                                writer.write(file_idx, start, &data, zeros);
                                 p.inc(size);
                             });
                         }
@@ -1682,7 +1662,8 @@ fn restore_contents<S: Open>(
 
     p.finish();
 
-    Ok(failed.lock().unwrap().len())
+    // BackOtter: closes what is left open (nothing, once every write ran).
+    Ok(writer.finish())
 }
 
 /// BackOtter: the existing directories whose XFS options came off before the

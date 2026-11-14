@@ -3,7 +3,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom},
     num::TryFromIntError,
     path::{Path, PathBuf},
 };
@@ -685,12 +685,18 @@ impl LocalDestination {
     /// BackOtter: a file restored sparse is emptied first, so that no hole
     /// it gets keeps old contents (it should be new, but may not be: a race);
     /// any other is allocated in full, where the system can.
+    ///
+    /// # Returns
+    ///
+    /// BackOtter: the file, open for writing, which the restore writes its
+    /// contents through ([`Self::write_at`], [`Self::write_sparse_at`]), so
+    /// that it isn't opened again for each blob.
     pub(crate) fn set_length(
         &self,
         item: impl AsRef<Path>,
         size: u64,
         sparse: bool,
-    ) -> LocalDestinationResult<()> {
+    ) -> LocalDestinationResult<File> {
         // BackOtter: waits for the exit once XFS options are put back for it.
         let _making = crate::commands::restore::making_entries();
         let filename = self.path(item)?;
@@ -710,7 +716,27 @@ impl LocalDestination {
         if !sparse {
             osattrs::preallocate(&file, size);
         }
-        Ok(())
+        Ok(file)
+    }
+
+    /// BackOtter: opens `item` (relative to the base path), a file the
+    /// restore sized already ([`Self::set_length`]) and closed while it had
+    /// writes to come, for writing again: neither emptied nor resized. It is
+    /// created if it doesn't exist, as stock rustic's writes did.
+    ///
+    /// # Errors
+    ///
+    /// * If the file could not be opened.
+    pub(crate) fn open_for_write(&self, item: impl AsRef<Path>) -> LocalDestinationResult<File> {
+        // BackOtter: waits for the exit once XFS options are put back for it.
+        let _making = crate::commands::restore::making_entries();
+        let filename = self.path(item)?;
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(filename)
+            .map_err(LocalDestinationErrorKind::OpeningFileFailed)
     }
 
     #[cfg(windows)]
@@ -916,78 +942,50 @@ impl LocalDestination {
         )
     }
 
-    /// Write `data` to given item (relative to the base path) at `offset`
+    /// Write `data` to the given file at `offset`
     ///
     /// # Arguments
     ///
-    /// * `item` - The item to write to
+    /// * `file` - The file to write to, open for writing
     /// * `offset` - The offset to write at
     /// * `data` - The data to write
     ///
     /// # Errors
     ///
-    /// * If the file could not be opened.
-    /// * If the file could not be sought to the given position.
     /// * If the bytes could not be written to the file.
     ///
     /// # Notes
     ///
-    /// This will create the file if it doesn't exist.
-    pub(crate) fn write_at(
-        &self,
-        item: impl AsRef<Path>,
-        offset: u64,
-        data: &[u8],
-    ) -> LocalDestinationResult<()> {
+    /// BackOtter: the restore keeps a file open while it has blobs to come
+    /// (`commands::restore::files_writer`), which its threads write at once:
+    /// a positioned write, which leaves the handle's position alone. Stock
+    /// rustic opened the file by its path for each blob, sought and wrote.
+    pub(crate) fn write_at(file: &File, offset: u64, data: &[u8]) -> LocalDestinationResult<()> {
         // BackOtter: waits for the exit once XFS options are put back for it.
         let _making = crate::commands::restore::making_entries();
-        let filename = self.path(item)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(filename)
-            .map_err(LocalDestinationErrorKind::OpeningFileFailed)?;
-        _ = file
-            .seek(SeekFrom::Start(offset))
-            .map_err(LocalDestinationErrorKind::CouldNotSeekToPositionInFile)?;
-        file.write_all(data)
-            .map_err(LocalDestinationErrorKind::CouldNotWriteToBuffer)?;
-        Ok(())
+        write_all_at(file, data, offset).map_err(LocalDestinationErrorKind::CouldNotWriteToBuffer)
     }
 
-    /// BackOtter: write `data` to the given item (relative to the base
-    /// path), a file restored sparse, at `offset`, leaving holes: of each
-    /// block of the file system ([`osattrs::hole_block_size`]) that `data`
-    /// reaches into, the part inside `data` isn't written if it is all
-    /// zeros ([`sparse_writes`]). The file must be new, sized without being
-    /// allocated: what isn't written reads as zeros.
+    /// BackOtter: write `data` to `file`, a file restored sparse, at
+    /// `offset`, leaving holes: of each block of the file system
+    /// ([`osattrs::hole_block_size`]) that `data` reaches into, the part
+    /// inside `data` isn't written if it is all zeros ([`sparse_writes`]).
+    /// The file must be new, sized without being allocated: what isn't
+    /// written reads as zeros. Positioned writes, as in [`Self::write_at`].
     ///
     /// # Errors
     ///
-    /// * If the file could not be opened.
-    /// * If the file could not be sought to the given position.
     /// * If the bytes could not be written to the file.
     pub(crate) fn write_sparse_at(
-        &self,
-        item: impl AsRef<Path>,
+        file: &File,
         offset: u64,
         data: &[u8],
     ) -> LocalDestinationResult<()> {
         // BackOtter: waits for the exit once XFS options are put back for it.
         let _making = crate::commands::restore::making_entries();
-        let filename = self.path(item)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(filename)
-            .map_err(LocalDestinationErrorKind::OpeningFileFailed)?;
-        for range in sparse_writes(offset, data, osattrs::hole_block_size(&file)) {
-            _ = file
-                .seek(SeekFrom::Start(offset + range.start as u64))
-                .map_err(LocalDestinationErrorKind::CouldNotSeekToPositionInFile)?;
-            file.write_all(&data[range])
+        for range in sparse_writes(offset, data, osattrs::hole_block_size(file)) {
+            let at = offset + range.start as u64;
+            write_all_at(file, &data[range], at)
                 .map_err(LocalDestinationErrorKind::CouldNotWriteToBuffer)?;
         }
         Ok(())
@@ -1258,6 +1256,37 @@ fn sparse_writes(offset: u64, data: &[u8], block: u64) -> Vec<std::ops::Range<us
         pos = next;
     }
     writes
+}
+
+/// BackOtter: writes all of `data` at `offset` of `file`, without moving
+/// its position, which threads writing other parts of the file through the
+/// same handle share.
+#[cfg(not(windows))]
+fn write_all_at(file: &File, data: &[u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, data, offset)
+}
+
+/// BackOtter: writes all of `data` at `offset` of `file`, without the
+/// handle's position mattering, which threads writing other parts of the
+/// file through the same handle share (`seek_write` moves it, but no write
+/// here goes by it). As std's `write_all_at` on Unix: again after a short
+/// write or an interrupt, an error for a write of nothing.
+#[cfg(windows)]
+fn write_all_at(file: &File, mut data: &[u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+
+    while !data.is_empty() {
+        match file.seek_write(data, offset) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                data = &data[n..];
+                offset += n as u64;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 /// Whether `data` is all zeros: by pieces the compiler vectorizes, which
@@ -1710,8 +1739,8 @@ mod tests {
         blobs.push(b);
         blobs.push(vec![0; 2 << 20]);
         let size: usize = blobs.iter().map(Vec::len).sum();
-        dest.set_length("f", size as u64, true).unwrap();
-        let block = osattrs::hole_block_size(&File::open(dir.path().join("f")).unwrap());
+        let file = dest.set_length("f", size as u64, true).unwrap();
+        let block = osattrs::hole_block_size(&file);
         // In reverse, as the restore writes blobs in any order.
         let mut offsets = Vec::new();
         let mut off = 0;
@@ -1720,7 +1749,7 @@ mod tests {
             off += blob.len() as u64;
         }
         for (blob, off) in blobs.iter().zip(&offsets).rev() {
-            dest.write_sparse_at("f", *off, blob).unwrap();
+            LocalDestination::write_sparse_at(&file, *off, blob).unwrap();
         }
         let want: Vec<u8> = blobs.concat();
         assert_eq!(fs::read(dir.path().join("f")).unwrap(), want);
@@ -1816,7 +1845,8 @@ mod path_tests {
         let dest = LocalDestination::new(temp.path().to_str().unwrap(), false, false)?;
 
         assert!(dest.create_dir("../escaped_dir").is_err());
-        assert!(dest.write_at("../escaped_file", 0, b"data").is_err());
+        assert!(dest.set_length("../escaped_file", 4, false).is_err());
+        assert!(dest.open_for_write("../escaped_file").is_err());
         assert!(dest.read_at("../escaped_file", 0, 4).is_err());
         assert!(dest.get_matching_file("../escaped_file", 4).is_none());
 
