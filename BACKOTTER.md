@@ -410,18 +410,37 @@ that either program restores what the other backed up.
   system extended attributes, before the flags, as each node's own ID and
   inheritance, as on illumos; on UFS (`ENOTTY`) they get one warning per
   restore, as other unsupported metadata.
-- Before the restore touches a file or directory it finds at a node's path
-  (to rewrite it, give it its metadata, replace it, link over it, put
-  entries in it), it clears the flags that would refuse that, keeping the
+- Before the restore changes a file or directory it finds at a node's path
+  (rewrites it, fills its holes, gives it its metadata, replaces it, links
+  over it or to it, breaks its hard link, makes, removes or renames an
+  entry in it), it clears the flags that would refuse that, keeping the
   others, where the node says which flags the file had, so that the late
   flag pass puts those back (`osattrs::node_sets_flags`): a node with file
   flags, or any node of a snapshot of BackOtter's, which records the flags
   of every file that has any, so that one without them had none. In a
   snapshot of stock restic or rustic, which record none, what the restore
   finds keeps its flags, as in stock rustic, and what they refuse fails
-  with its error. What `--delete` removes, and what lies below a directory
-  replaced by a node of another type, never loses its flags: an immutable
-  file isn't removed, and the error says so, as in stock rustic. The flags
+  with its error. They come off only for what the restore changes
+  (0.13.0+backotter.13; before, every entry found lost them as the walk
+  reached it): a directory that was there keeps them, and on XFS its
+  options, until an entry is made, removed or renamed in it
+  (`commands/restore.rs`, `DirChanges`) or its metadata set; a file until
+  it is written, cloned over, its holes filled or its metadata set. So an
+  immutable file or directory whose contents and metadata match keeps
+  them, and its inode its change time, under `--exact`. A file whose name
+  the restore removes or renames another file over (replacing it by
+  another type, linking over it, `--exact` breaking its hard link, one
+  whose contents weren't backed up) is held open
+  (`O_RDONLY|O_NOFOLLOW|O_NONBLOCK`) from before its flags come off
+  (`osattrs::clear_restricting_flags_held`), and they go back on it
+  through that descriptor once the name is gone, or wasn't
+  (`HeldFlags::put_back`: `fchflags(2)` on the BSDs, `osattrs/bsd_held.rs`;
+  `FS_IOC_FSSETXATTR` or `FS_IOC_SETFLAGS` on Linux): its other names,
+  outside the destination too, keep them; that they can't be put back is
+  an error. What `--delete` removes, and what lies below a directory
+  replaced by a node of another type, never loses its flags, as in stock
+  rustic (an immutable file isn't removed, and the error says so), but for
+  a name of a file the restore replaced another name of (below). The flags
   cleared (`osattrs::clear_restricting_flags`):
   on FreeBSD immutable, append-only and undeletable, the owner's and the
   system's (`uchg`, `uappnd`, `uunlnk`, `schg`, `sappnd`, `sunlnk`), and
@@ -437,6 +456,22 @@ that either program restores what the other backed up.
   rescue system's is -1); where it is refused (only logged), what the
   restore does next fails, with its error. illumos' immutable, appendonly
   and nounlink system attributes are not cleared yet, in either tool.
+- `--delete` (plain or under `--exact`) removes what the snapshot hasn't
+  got once the walk of the destination is done (0.13.0+backotter.13;
+  before, as the walk met it), so that every file the restore replaced a
+  name of is known by then, whatever order the names come in: the files
+  with other names whose name the restore removed or renamed another file
+  over, by device and inode (`Replaced`), and the later names of
+  hard-linked files in the way of the links the metadata pass makes,
+  which go first, held. An unexpected name of such a file loses the
+  restricting flags that came off for the restore once more, held, and
+  the file's other names get them back (`remove_extra`); every other
+  entry keeps its flags. It goes on past what it can't remove, an error
+  each; a directory is removed entry by entry, one name held at a time,
+  past what fails, and the error says what failed first and how many
+  entries were and weren't removed (`remove_tree`). The directory still
+  gets its metadata, and its flags in the late pass. As BackOtter's
+  restic 0.19.1+backotter.11 and .12.
 - A file whose contents can't be written (one the restore can't open for
   writing) is reported once (`restore PATH: contents not restored: ...`)
   and left as it is; the restore goes on with every other file and all the
@@ -1071,6 +1106,121 @@ that either program restores what the other backed up.
   Eight copies of it written in restic's blob ranges, with a sync every
   3-20 ms: per blob, 43 of 320 files past their size and up to 8 extents;
   through one handle, none, and at most 2.
+- `restore --exact` and `--clone-from` (`commands/restore/exact.rs`; the
+  options are rustic's, its BACKOTTER.md), for bko-holt load's shared btrfs
+  snapshots (backotter `docs/design/btrfs-snapshots.md`), as in BackOtter's
+  restic 0.19.1+backotter.12. `--exact` makes a destination that is there
+  already exactly the snapshot, writing only what differs:
+  - it implies `--delete` and `--verify-existing`;
+  - an existing regular file with more than one link gets a file of its
+    own first: a reflink clone of itself (`FICLONE` into a new temporary
+    file in its directory, `.bko-exact-` and random digits, made `O_EXCL`
+    and `O_NOFOLLOW`, renamed over it), or, where the file system can't
+    clone, nothing, the name removed, so no write or metadata change
+    reaches its other names; the metadata pass then makes the snapshot's
+    links. Not a hard-link group whose names in the destination are
+    already exactly the snapshot's: one file, with a link for each name
+    the restore has for it and no more (none outside the destination),
+    known once the walk has seen them all (`LinkGroup::kept`). It stays,
+    inode and all; contents that differ are written into it, as into a
+    file of its own (BackOtter's restic breaks such a group, to write a
+    new file: either way nothing reaches a name the snapshot hasn't got).
+    A file whose link can't be broken is an error and is left exactly as
+    it is, contents, holes, metadata and flags (those that came off for
+    the break go back on), and the snapshot's other names for it aren't
+    linked to it (an error each). A clone that fails and can't remove its
+    temporary file leaves the file as it is too, with an error naming the
+    temporary file;
+  - an entry whose metadata already matches is left untouched: what a
+    backup with real atimes would record for it now is its node, but for
+    what a restore doesn't set (change time, inode, device, link count,
+    owner names, contents, holes: `unix.sparse`), and the owner's IDs
+    only as root (with ownership by name, the default, as root nothing
+    matches: use `--numeric-id`). The mtime stands for an atime the node
+    hasn't got, as the restore sets it. A generic attribute the node lacks
+    counts only in a snapshot of BackOtter's (where it was none); in
+    another it is unknown, and left as the file has it. A birth time
+    counts only where both have one: FreeBSD and NetBSD record one for
+    every file, which a node from elsewhere lacks, and since they can only
+    lower a birth time, one at or before both the node's and its mtime is
+    what a restore would leave. So an exact restore over a matching tree
+    moves no ctime, hard-linked files' included, nor its restricting
+    flags;
+  - but on a mount with atimes the restore's own reads move atimes where
+    there is no `O_NOATIME`: each directory's when it is listed, a
+    symlink's when it is read, and off Linux each file's when its contents
+    are compared. The restore sets them back, which moves their ctimes.
+    Mount such a destination `noatime` to keep them. On Linux a file is
+    read (compared, or a blob taken from it) with `O_NOATIME`, which root
+    and its owner have, and `O_NOFOLLOW` (0.13.0+backotter.13);
+  - a symlink to the same target, a FIFO and the same device stay;
+  - an SELinux label the node lacks is removed; a removal that fails but
+    for a file system without extended attributes (`ENOTSUP`) or a file
+    without the label (`ENODATA`) is the file's error. Wherever SELinux is
+    active, permissive too, the kernel refuses to remove a label
+    (`EACCES`), root's too, so a snapshot without labels would give one
+    error per file: those refusals are one error for the whole restore,
+    as root or not, with their count (`SELinux labels the snapshot hasn't
+    got not removed: N files in all, the first ...`); any other failure,
+    `EPERM` too, is the file's.
+
+  `--clone-from`: a file the restore would write whose contents a file
+  restored elsewhere on the file system has, and that takes no flag or
+  XFS option before its data (no-copy-on-write), is cloned whole and given
+  its metadata after. The clone goes into a new temporary file in the
+  file's directory, as above, renamed over it, so a clone that fails
+  leaves the file as it was, for the restore to write what differs
+  (sparse only if it is new); one whose temporary file can't be removed
+  is a warning naming it. The source is opened
+  `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` and checked with `fstat` (a regular
+  file of its size, not the file cloned onto by any name: S11). Only
+  Linux clones; elsewhere nothing is tried, the file is written, and a
+  hard link is broken by removing the name.
+
+  In a restore, plain or `--exact`, a hard link the metadata pass can't
+  make is an error of its own, and the restore goes on: every entry after
+  it gets its metadata, and the late flag pass puts back what came off
+  (stock rustic stopped there). So does a node stream that fails: the
+  restore stops, but the late flags go on first.
+
+  Known limits, as in BackOtter's restic: a kept special file with more
+  than one link (a FIFO, a device) gets its metadata in place, which its
+  other names see; a clone source is trusted on its size (it must be
+  unchanged since it was restored), and the guard against cloning from the
+  destination goes by path. Restricting flags that came off stay off when
+  the restore stops before the late pass sets them (an interrupt, a fatal
+  error, contents that couldn't be read from the repository); a re-run
+  sets them. On Linux a clear that fails after `FS_IOC_FSSETXATTR`, at the
+  second `FS_IOC_GETFLAGS` or the `FS_IOC_SETFLAGS`, reports nothing
+  cleared, so nothing is put back on a file left shared or the other names
+  of one replaced. A hard-linked symlink's flags on the BSDs (it can't be
+  held open) are put back by path, which its other names don't get once
+  that name is gone (an error then). A file with other names that a
+  restore without `--exact` rewrites is written in place, as in stock
+  rustic, and its other names see it (BackOtter's restic writes a new
+  file).
+
+  0.13.0+backotter.13 fixed, after the review of restic-bko .8-.12: a
+  fixed temporary name (`.bko-exact-NAME`, opened create+truncate,
+  following symlinks) that truncated what a symlink of that name pointed
+  at, outside the destination too, and truncated, renamed over or removed
+  a snapshot entry of that name, with no error; a restore that went on
+  writing into a file whose link it couldn't break, and gave it holes,
+  metadata and the snapshot's other names; a clone that emptied an
+  existing file before failing (every one, off Linux or without reflinks),
+  losing the blobs that matched; hard-link groups broken and made again on
+  every run; the clone source opened following symlinks and blocking on a
+  FIFO; the other names of a replaced file losing its restricting flags
+  for good; `--delete` failing or not on an unexpected name of such a file
+  by the order of the names; restricting flags (and XFS options) cleared
+  on every entry found, moving the ctime of every immutable or append-only
+  entry on every `--exact` run; `--exact` never matching on FreeBSD and
+  NetBSD (birth times), on a generic attribute a stock node lacks, on
+  `unix.sparse`, on a node without an atime, or, not root, by owner; an
+  SELinux label refused per file; a failed hard link aborting the restore
+  before the late flags; a failed clone dropping the file and leaving its
+  temporary file without a word; and a verified file's atime moved by the
+  restore's own read.
 - The version reads `X.Y.Z+backotter.N`.
 
 The system calls need `unsafe`, which the workspace lints now deny (not
