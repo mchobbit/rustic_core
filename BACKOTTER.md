@@ -1058,6 +1058,19 @@ that either program restores what the other backed up.
   of up to 40 MiB and its blobs while their writes waited: rustic-bko grew
   to ~1.7 GB and was killed in the OpenBSD rescue image (3 GiB, no swap).
   A 3.5 GiB restore now peaks at ~0.4 GB, in about the same time.
+- A restore writes each file through one handle (`commands/restore.rs`,
+  `restore/files_writer.rs`, `FilesWriter`, the design of BackOtter's
+  restic's `internal/restorer/fileswriter.go`): it is opened once, kept
+  open while it has writes to come, at most threads + 50 idle handles at
+  once, and closed after its last write. Stock rustic opened and closed the
+  file for each blob, and ext4 drops an inode's preallocation when its last
+  writer closes it, so a big parallel restore left files in 5 extents or
+  more; past 4 ext4 takes a block for the extent tree, which pushed
+  `st_blocks` past the size of a file with a sub-block tail hole, and
+  BackOtter's checks saw its holes lost (Kali's vmlinuz, restic->rustic).
+  Eight copies of it written in restic's blob ranges, with a sync every
+  3-20 ms: per blob, 43 of 320 files past their size and up to 8 extents;
+  through one handle, none, and at most 2.
 - The version reads `X.Y.Z+backotter.N`.
 
 The system calls need `unsafe`, which the workspace lints now deny (not
