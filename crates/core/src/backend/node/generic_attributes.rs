@@ -168,6 +168,13 @@ impl GenericAttributes {
         self.0.keys().map(String::as_str)
     }
 
+    /// BackOtter: the value of the attribute `name`, as it is, if there is
+    /// one.
+    #[must_use]
+    pub fn value(&self, name: &str) -> Option<&serde_json::Value> {
+        self.0.get(name)
+    }
+
     /// Decodes the attribute `name`, if there is one.
     pub fn get<T: DeserializeOwned>(&self, name: &str) -> Option<serde_json::Result<T>> {
         self.0

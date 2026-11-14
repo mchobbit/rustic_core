@@ -106,8 +106,11 @@ pub enum LocalDestinationErrorKind {
     #[cfg(not(any(windows, target_os = "openbsd")))]
     XattrsNotSet(osattrs::XattrErrors),
     /// removing directories failed: `{0:?}`
+    // BackOtter: unused, as remove_dir and remove_file.
+    #[allow(dead_code)]
     DirectoryRemovalFailed(std::io::Error),
     /// removing file failed: `{0:?}`
+    #[allow(dead_code)]
     FileRemovalFailed(std::io::Error),
     /// setting time metadata failed: `{0:?}`
     SettingTimeMetadataFailed(std::io::Error),
@@ -264,7 +267,9 @@ impl LocalDestination {
     /// # Notes
     ///
     /// This will remove the directory recursively.
-    #[allow(clippy::unused_self)]
+    // BackOtter: unused: the restore removes through its own remove_held,
+    // remove_extra and remove_tree, past restricting flags and failures.
+    #[allow(clippy::unused_self, dead_code)]
     pub(crate) fn remove_dir(&self, dirname: impl AsRef<Path>) -> LocalDestinationResult<()> {
         fs::remove_dir_all(dirname).map_err(LocalDestinationErrorKind::DirectoryRemovalFailed)
     }
@@ -285,7 +290,9 @@ impl LocalDestination {
     ///
     /// * If the file is a symlink, the symlink will be removed, not the file it points to.
     /// * If the file is a directory or device, this will fail.
-    #[allow(clippy::unused_self)]
+    // BackOtter: unused: the restore removes through its own remove_held,
+    // remove_extra and remove_tree, past restricting flags and failures.
+    #[allow(clippy::unused_self, dead_code)]
     pub(crate) fn remove_file(&self, filename: impl AsRef<Path>) -> LocalDestinationResult<()> {
         fs::remove_file(filename).map_err(LocalDestinationErrorKind::FileRemovalFailed)
     }
@@ -910,8 +917,9 @@ impl LocalDestination {
         length: u64,
     ) -> LocalDestinationResult<Bytes> {
         let filename = self.path(item)?;
+        // BackOtter: reading leaves the file's atime alone (open_reading).
         let mut file =
-            File::open(filename).map_err(LocalDestinationErrorKind::OpeningFileFailed)?;
+            open_reading(&filename).map_err(LocalDestinationErrorKind::OpeningFileFailed)?;
         _ = file
             .seek(SeekFrom::Start(offset))
             .map_err(LocalDestinationErrorKind::CouldNotSeekToPositionInFile)?;
@@ -947,7 +955,7 @@ impl LocalDestination {
             |_| None,
             |meta| {
                 if meta.is_file() && meta.len() == size {
-                    File::open(&filename).ok()
+                    open_to_verify(&filename, size)
                 } else {
                     None
                 }
@@ -1198,10 +1206,14 @@ fn set_xattrs_all(
             None => {
                 if let Err(err) = calls.remove(filename, &curr_name) {
                     // BackOtter: bcachefs refusing to clear casefolding
-                    // on a directory with entries is a warning.
+                    // on a directory with entries is a warning. An SELinux
+                    // label an active SELinux keeps is one error for the
+                    // whole restore (osattrs::label_refused).
                     if osattrs::casefold_not_empty(&curr_node_name, &err) {
                         calls.warn_casefold(&curr_node_name, filename);
-                    } else {
+                    } else if !(remove_label
+                        && osattrs::label_refused(&curr_node_name, filename, &err))
+                    {
                         errors.push(format!("removing {curr_node_name}"), err);
                     }
                 }
@@ -1300,6 +1312,48 @@ fn write_all_at(file: &File, mut data: &[u8], mut offset: u64) -> std::io::Resul
         }
     }
     Ok(())
+}
+
+/// BackOtter: opens the regular file `filename`, of `size` bytes, to read
+/// its contents for a restore that verifies them: following no symlink
+/// (checked with `fstat`, which must find a regular file of that size), and,
+/// on Linux, with `O_NOATIME` where the restore may set it (the file's
+/// owner, or root), so that reading it leaves its atime alone; otherwise an
+/// `--exact` restore would find every file it verified with an atime moved
+/// (`relatime` moves one no later than the mtime), and set its metadata,
+/// and with it its change time, again on every run. As in BackOtter's
+/// restic (`verifyFile`, `fs.SetNoatime`).
+fn open_to_verify(filename: &Path, size: u64) -> Option<File> {
+    let f = open_reading(filename).ok()?;
+    let m = f.metadata().ok()?;
+    (m.is_file() && m.len() == size).then_some(f)
+}
+
+/// BackOtter: opens the file `filename` in the destination for reading its
+/// contents, following no symlink, and on Linux with `O_NOATIME` where the
+/// restore may set it, so that reading leaves its atime alone
+/// ([`open_to_verify`]; a blob a restore takes from a file there).
+///
+/// # Errors
+///
+/// * If it couldn't be opened.
+fn open_reading(filename: &Path) -> std::io::Result<File> {
+    let mut how = OpenOptions::new();
+    _ = how.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        _ = how.custom_flags(libc::O_NOFOLLOW);
+    }
+    let f = how.open(filename)?;
+    #[cfg(target_os = "linux")]
+    {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        if let Ok(flags) = fcntl(&f, FcntlArg::F_GETFL) {
+            _ = fcntl(&f, FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NOATIME));
+        }
+    }
+    Ok(f)
 }
 
 /// Whether `data` is all zeros: by pieces the compiler vectorizes, which
@@ -1665,6 +1719,54 @@ mod tests {
         assert!(err.starts_with("removing user.notempty: "), "{err}");
         assert_eq!(calls.names(), ["user.new", "user.notempty"]);
         assert!(calls.warned.borrow().is_empty());
+    }
+
+    /// BackOtter: a file read to verify its contents keeps its atime (Linux's
+    /// `O_NOATIME`, which its owner may ask for), however `relatime` would
+    /// move it; a symlink to a file isn't followed.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn verify_read_keeps_atime() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        fs::write(&file, b"contents").unwrap();
+        let old = FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_file_atime(&file, old).unwrap();
+        let mut f = open_to_verify(&file, 8).unwrap();
+        let mut buf = Vec::new();
+        _ = f.read_to_end(&mut buf).unwrap();
+        drop(f);
+        let atime = FileTime::from_last_access_time(&fs::metadata(&file).unwrap());
+        assert_eq!(atime, old);
+        symlink(&file, dir.path().join("l")).unwrap();
+        assert!(open_to_verify(&dir.path().join("l"), 8).is_none());
+        assert!(open_to_verify(&file, 9).is_none());
+    }
+
+    /// BackOtter: under `--exact`, an SELinux label an active SELinux refuses
+    /// to remove (`EACCES`, as for every file of such a snapshot) is no
+    /// error of the file's, but one for the whole restore, with a count
+    /// (`osattrs::report_labels_kept`); any other refusal (`EPERM`) is the
+    /// file's.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn selinux_label_refusals_folded() {
+        _ = osattrs::report_labels_kept();
+        for _ in 0..3 {
+            let mut calls = FakeXattrs::with(&[("security.selinux", b"l")], &["security.selinux"]);
+            calls.errno = Some(libc::EACCES);
+            set_xattrs_all(&calls, Path::new("/r/f"), &[], false, true).unwrap();
+        }
+        assert!(osattrs::report_labels_kept());
+        assert!(!osattrs::report_labels_kept());
+        let mut calls = FakeXattrs::with(&[("security.selinux", b"l")], &["security.selinux"]);
+        calls.errno = Some(libc::EPERM);
+        let err = set_xattrs_all(&calls, Path::new("/r/f"), &[], false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("removing security.selinux: "), "{err}");
+        assert!(!osattrs::report_labels_kept());
     }
 
     /// BackOtter: stock rustic's names on FreeBSD and NetBSD (`user.NAME`,

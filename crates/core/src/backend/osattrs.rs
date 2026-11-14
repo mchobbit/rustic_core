@@ -48,6 +48,13 @@ use crate::backend::node::{
 };
 
 mod bsd_flags;
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+mod bsd_held;
 mod freebsd_acl;
 #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
 mod freebsd_netbsd;
@@ -425,6 +432,150 @@ pub(crate) fn clear_restricting_flags(path: &Path) {
             debug!("restricting flags of {} not cleared: {err}", path.display());
         }
         _ => {}
+    }
+}
+
+/// BackOtter: the restricting flags [`clear_restricting_flags_held`] took off
+/// a file, held for [`HeldFlags::put_back`].
+#[derive(Debug)]
+pub(crate) enum HeldFlags {
+    /// None came off: nothing there, none set, or not cleared.
+    Nothing,
+    /// The flags `cleared` came off the file open as `file`, at `path`.
+    #[cfg_attr(
+        not(any(
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "linux",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        )),
+        allow(dead_code)
+    )]
+    Held {
+        file: File,
+        cleared: u32,
+        path: PathBuf,
+    },
+    /// They came off by path, from the file `dev` and `ino` (a symlink on
+    /// the BSDs, which can't be opened), which had other names (`linked`).
+    #[cfg_attr(
+        not(any(
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        )),
+        allow(dead_code)
+    )]
+    ByPath {
+        path: PathBuf,
+        dev: u64,
+        ino: u64,
+        linked: bool,
+        cleared: u32,
+    },
+}
+
+impl HeldFlags {
+    /// Sets the flags that came off again on the file they came off, through
+    /// the descriptor held open since, wherever its names are by then, so
+    /// that its other names, outside the destination too, keep them; a file
+    /// left without a name needs none. One cleared by path gets them back
+    /// where it still is; once that name is gone, one that had other names
+    /// may have lost them, and the error says so.
+    ///
+    /// # Errors
+    ///
+    /// * If they couldn't be set again.
+    pub(crate) fn put_back(self) -> io::Result<()> {
+        match self {
+            Self::Nothing => Ok(()),
+            #[cfg(unix)]
+            Self::Held { file, cleared, path } => {
+                use std::os::unix::fs::MetadataExt;
+                if file.metadata()?.nlink() == 0 {
+                    return Ok(());
+                }
+                #[cfg(target_os = "linux")]
+                return os::put_back_restricting_flags(&file, &path, cleared);
+                #[cfg(any(
+                    target_os = "dragonfly",
+                    target_os = "freebsd",
+                    target_os = "netbsd",
+                    target_os = "openbsd"
+                ))]
+                return bsd_held::put_back_restricting_flags(&file, &path, cleared);
+                #[allow(unreachable_code)]
+                {
+                    _ = (cleared, path);
+                    Ok(())
+                }
+            }
+            #[cfg(unix)]
+            Self::ByPath { path, dev, ino, linked, cleared } => {
+                use std::os::unix::fs::MetadataExt;
+                match std::fs::symlink_metadata(&path) {
+                    Ok(m) if (m.dev(), m.ino()) == (dev, ino) => {
+                        #[cfg(any(
+                            target_os = "dragonfly",
+                            target_os = "freebsd",
+                            target_os = "netbsd",
+                            target_os = "openbsd"
+                        ))]
+                        return bsd_held::put_back_restricting_flags_path(&path, cleared);
+                        #[allow(unreachable_code)]
+                        {
+                            _ = cleared;
+                            Ok(())
+                        }
+                    }
+                    _ if linked => Err(io::Error::other(format!(
+                        "{} cleared by path and gone: its other names keep none of them",
+                        path.display()
+                    ))),
+                    _ => Ok(()),
+                }
+            }
+            #[cfg(not(unix))]
+            _ => Ok(()),
+        }
+    }
+}
+
+/// BackOtter: [`clear_restricting_flags`] for a file whose name the restore
+/// is about to remove, or rename another file over (a hard link broken, a
+/// file replaced, linked over, or removed by `--delete`): the file is held
+/// open (`O_RDONLY|O_NOFOLLOW|O_NONBLOCK`) from before its flags come off,
+/// and [`HeldFlags::put_back`], which must follow, once the name is gone or
+/// wasn't, sets them again through that descriptor (`fchflags`, Linux's
+/// ioctls). As in BackOtter's restic (`ClearRestrictingFlagsHeld`).
+pub(crate) fn clear_restricting_flags_held(path: &Path) -> HeldFlags {
+    #[cfg(target_os = "linux")]
+    let held = os::clear_restricting_flags_held(path);
+    #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    let held = bsd_held::clear_restricting_flags_held(path);
+    #[cfg(not(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    let held = os::clear_restricting_flags(path).map(|()| HeldFlags::Nothing);
+    match held {
+        Ok(held) => held,
+        Err(err) => {
+            if err.kind() != io::ErrorKind::NotFound {
+                debug!("restricting flags of {} not cleared: {err}", path.display());
+            }
+            HeldFlags::Nothing
+        }
     }
 }
 
@@ -1305,6 +1456,52 @@ pub(crate) const SELINUX_LABEL: &str = "security.selinux";
 )]
 pub(crate) fn xattr_never_removed(name: &str) -> bool {
     name == SELINUX_LABEL
+}
+
+/// BackOtter: the SELinux labels `restore --exact` was refused to remove
+/// with `EACCES` ([`label_refused`]): the first file, its error, and how
+/// many in all.
+static LABELS_KEPT: Mutex<Option<(PathBuf, io::Error, u64)>> = Mutex::new(None);
+
+/// BackOtter: whether `err`, removing the SELinux label `name` of `path`
+/// (`restore --exact`, where the node has none), is the refusal of a host
+/// where SELinux is active, enforcing or permissive (`EACCES`, root too),
+/// which would come for every file of such a snapshot: then it is noted
+/// for [`report_labels_kept`], one error for the whole restore, and not the
+/// file's. Any other failure (`EPERM` too) is the file's. As in BackOtter's
+/// restic (`removeLabel`).
+#[cfg_attr(
+    any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku"),
+    allow(dead_code)
+)]
+pub(crate) fn label_refused(name: &str, path: &Path, err: &io::Error) -> bool {
+    #[cfg(unix)]
+    let refused = name == SELINUX_LABEL && err.raw_os_error() == Some(libc::EACCES);
+    #[cfg(not(unix))]
+    let refused = false;
+    if refused {
+        let mut kept = LABELS_KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match kept.as_mut() {
+            Some((_, _, n)) => *n += 1,
+            None => *kept = Some((path.to_path_buf(), same_error(err), 1)),
+        }
+    }
+    refused
+}
+
+/// BackOtter: reports the SELinux labels [`label_refused`] noted, if any, as
+/// one warning naming the first file and how many there were, and whether
+/// there were: one error for the whole restore, as root or not.
+pub(crate) fn report_labels_kept() -> bool {
+    let kept = LABELS_KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    let Some((first, err, n)) = kept else {
+        return false;
+    };
+    warn!(
+        "SELinux labels the snapshot hasn't got not removed: {n} files in all, the first {}: {err}",
+        first.display()
+    );
+    true
 }
 
 /// The prefix of bcachefs' extended attributes that show a file's options as
