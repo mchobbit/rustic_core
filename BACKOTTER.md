@@ -1172,9 +1172,10 @@ that either program restores what the other backed up.
     there is no `O_NOATIME`: each directory's when it is listed, a
     symlink's when it is read, and off Linux each file's when its contents
     are compared. The restore sets them back, which moves their ctimes.
-    Mount such a destination `noatime` to keep them. On Linux a file is
-    read (compared, or a blob taken from it) with `O_NOATIME`, which root
-    and its owner have, and `O_NOFOLLOW` (0.13.0+backotter.13). On NetBSD
+    Mount such a destination `noatime` to keep them (not on NetBSD:
+    below). On Linux a file is read (compared, or a blob taken from it)
+    with `O_NOATIME`, which root and its owner have, and `O_NOFOLLOW`
+    (0.13.0+backotter.13). On NetBSD
     an entry whose metadata match but for the atime gets that back alone
     (`utimensat(2)` with the mtime `UTIME_OMIT`), which NetBSD's FFS does
     without moving the ctime (every other setting of times moves it); one
@@ -1183,9 +1184,21 @@ that either program restores what the other backed up.
     installed (`log`, with atimes), moves a file's atime on any read, one
     that doesn't reach the end too, so .13 and .14 set the metadata of
     every file `--exact` compared (`chown`, `chmod`, `utimensat`) on every
-    run; FreeBSD's UFS doesn't move it for those reads (BackOtter's restic
-    sets it back on NetBSD, moving the ctime, and its test allows for it:
-    `readsKeepAtimes`);
+    run (BackOtter's restic sets it back on NetBSD, moving the ctime, and
+    its test allows for it: `readsKeepAtimes`). An entry that doesn't
+    match is looked at twice there (`lstat` and its attributes listed, by
+    `already_matches`, then by `atime_put_back`): cost only. A NetBSD FFS
+    mounted `noatime` takes no atime from `utimensat(2)`, alone or with
+    the mtime: the call returns 0 and leaves it. So every atime restored
+    there is lost without an error, and `atime_put_back`, which takes the
+    call's success for the atime put back and doesn't read it again, logs
+    such an entry as matching: don't mount a NetBSD destination `noatime`.
+    FreeBSD 15's UFS moves atimes on reads too (`cat`'s, `head -c 1`'s, a
+    past or a 2099 one alike), but not on a read of exactly the file's
+    size from pages in memory, the one each of the test's files gets: only
+    that lets `test_restore_exact_twice_changes_nothing` pass there. An
+    atime-only `utimensat(2)` moves the ctime on FreeBSD, so the NetBSD
+    put-back couldn't help there;
   - a symlink to the same target, a FIFO and the same device stay;
   - an SELinux label the node lacks is removed; a removal that fails but
     for a file system without extended attributes (`ENOTSUP`) or a file
@@ -1256,7 +1269,10 @@ that either program restores what the other backed up.
   `test_restore_delete_leaves_a_case_variant`) pass without testing
   anything when not run as root (they say so on stderr): run them as root
   too. `test_restore_exact_twice_changes_nothing` checks regular files
-  only, so the claim for directories and symlinks has no test of its own.
+  only, so the claim for directories and symlinks has no test of its own,
+  and of those only the inode and the ctime after the second restore, not
+  that the atimes are the snapshot's (2099) again: NetBSD's put-back is
+  tested by the ctime it leaves, not by the atime it sets.
 
   0.13.0+backotter.13 fixed, after the review of restic-bko .8-.12: a
   fixed temporary name (`.bko-exact-NAME`, opened create+truncate,
