@@ -136,9 +136,50 @@ fn allocated(path: &Path) -> Result<bool> {
     Ok(m.blocks() * 512 >= m.len())
 }
 
+/// BackOtter: whether the file at `path` has no hole before its end
+/// (`SEEK_HOLE` finds none): every byte written or allocated.
+#[cfg(target_os = "linux")]
+fn no_hole(path: &Path) -> Result<bool> {
+    use nix::unistd::{Whence, lseek};
+
+    let f = File::open(path)?;
+    let len = f.metadata()?.len();
+    Ok(u64::try_from(lseek(&f, 0, Whence::SeekHole)?)? >= len)
+}
+
+/// BackOtter: whether the restore allocates the file at `path` (it
+/// preallocates what it writes into, and fills the holes of a file left as
+/// it is), as the restore decides it (`osattrs::sparse::allocates_on`,
+/// `fills_holes_on`): not on btrfs but for a no-copy-on-write file, nor on
+/// bcachefs, nor on ZFS. There a file the restore writes into keeps the
+/// holes that blobs of zeros matched, and one left as it is its holes.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn restore_allocates(path: &Path) -> Result<bool> {
+    use nix::sys::statfs::{BTRFS_SUPER_MAGIC, fstatfs};
+    use std::os::fd::AsRawFd;
+
+    const BCACHEFS_SUPER_MAGIC: u32 = 0xca45_1a4e;
+    const ZFS_SUPER_MAGIC: u32 = 0x2fc1_2fc1;
+    const FS_NOCOW_FL: u32 = 0x0080_0000;
+    let f = File::open(path)?;
+    let f_type = fstatfs(&f)?.filesystem_type();
+    if f_type == BTRFS_SUPER_MAGIC {
+        let mut flags: libc::c_int = 0;
+        // SAFETY: FS_IOC_GETFLAGS writes an int to the pointer.
+        let got = unsafe { libc::ioctl(f.as_raw_fd(), libc::FS_IOC_GETFLAGS, &raw mut flags) };
+        return Ok(got == 0 && u32::from_ne_bytes(flags.to_ne_bytes()) & FS_NOCOW_FL != 0);
+    }
+    // The low 32 bits, as the restore takes them.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let f_type = f_type.0 as u32;
+    Ok(f_type != BCACHEFS_SUPER_MAGIC && f_type != ZFS_SUPER_MAGIC)
+}
+
 /// BackOtter: a file with holes is marked (`unix.sparse`) and comes back
 /// with holes into a new file; any other file, or one restored over an
-/// existing file, comes back allocated, zeros and all.
+/// existing file, comes back allocated, zeros and all (over an existing
+/// file, only where the restore allocates: `restore_allocates`).
 #[rstest]
 #[cfg(not(windows))]
 #[allow(clippy::too_many_lines)]
@@ -234,9 +275,20 @@ fn test_restore_sparse(set_up_repo: Result<RepoOpen>) -> Result<()> {
         }
         Ok(())
     };
+    // The files written in full, zeros and all, preallocated or not (btrfs,
+    // bcachefs): no hole before the end (`SEEK_HOLE`). Not those that are
+    // only preallocated in part: an unwritten extent can count as a hole.
+    let written = |dir: &Path, files: &[&str]| -> Result<()> {
+        #[cfg(target_os = "linux")]
+        for name in files {
+            assert!(no_hole(&dir.join("test").join(name))?, "{name}: has a hole");
+        }
+        _ = (dir, files);
+        Ok(())
+    };
 
     // Into new files: those that had holes get them back, the hard links
-    // too, and the rest are allocated.
+    // too, and the rest are allocated and written in full.
     let restore_dir = tempdir()?;
     restore_to(&repo, restore_dir.path(), RestoreOptions::default())?;
     check(
@@ -244,6 +296,7 @@ fn test_restore_sparse(set_up_repo: Result<RepoOpen>) -> Result<()> {
         &["sparse", "linked/a", "linked/b"],
         &["full", "zeros", "trailing"],
     )?;
+    written(restore_dir.path(), &["full", "zeros", "trailing"])?;
     let a = fs::metadata(restore_dir.path().join("test/linked/a"))?;
     let b = fs::metadata(restore_dir.path().join("test/linked/b"))?;
     assert_eq!((a.dev(), a.ino()), (b.dev(), b.ino()));
@@ -263,19 +316,35 @@ fn test_restore_sparse(set_up_repo: Result<RepoOpen>) -> Result<()> {
     // Over existing files: a marked file over one of another content of the
     // same size comes back whole and allocated, and so does an unmarked one
     // over a file of holes, of the same size, and one of the same contents
-    // (zeros) left as it is.
+    // (zeros) left as it is. Where the restore allocates nothing (btrfs but
+    // for a no-copy-on-write file, bcachefs, ZFS), those two keep the holes
+    // that its zeros matched, as in BackOtter's restic: only what differs
+    // is written.
     let restore_dir = tempdir()?;
     let test = restore_dir.path().join("test");
     fs::create_dir(&test)?;
     fs::write(test.join("sparse"), vec![0xaa_u8; sparse_data.len()])?;
     File::create(test.join("full"))?.set_len(u64::try_from(sparse_data.len())?)?;
     File::create(test.join("zeros"))?.set_len(u64::try_from(zeros.len())?)?;
+    #[cfg(target_os = "linux")]
+    let allocates = restore_allocates(&test.join("full"))?;
+    #[cfg(not(target_os = "linux"))]
+    let allocates = true;
     restore_to(&repo, restore_dir.path(), RestoreOptions::default())?;
-    check(
-        restore_dir.path(),
-        &["linked/a", "linked/b"],
-        &["sparse", "full", "zeros", "trailing"],
-    )?;
+    if allocates {
+        check(
+            restore_dir.path(),
+            &["linked/a", "linked/b"],
+            &["sparse", "full", "zeros", "trailing"],
+        )?;
+    } else {
+        check(
+            restore_dir.path(),
+            &["full", "zeros", "linked/a", "linked/b"],
+            &["sparse", "trailing"],
+        )?;
+    }
+    written(restore_dir.path(), &["sparse", "trailing"])?;
 
     // --dry-run over the same file of holes: BackOtter's snapshot would
     // fill them, so it counts as a file to modify (as in BackOtter's
@@ -297,8 +366,8 @@ fn test_restore_sparse(set_up_repo: Result<RepoOpen>) -> Result<()> {
     };
     let snap = repo.get_snapshot_from_str("latest", |_| true)?;
     let bko = RestoreOptions::default().origin(SnapshotOrigin::of(&snap));
-    // Holes are filled on Linux only.
-    let fills = u64::from(cfg!(any(target_os = "linux", target_os = "android")));
+    // Holes are filled on Linux only, where the restore allocates.
+    let fills = u64::from(cfg!(any(target_os = "linux", target_os = "android")) && allocates);
     assert_eq!(dry_run_modify(bko)?, fills, "BackOtter's snapshot");
     assert_eq!(dry_run_modify(RestoreOptions::default())?, 0, "stock snapshot");
     assert!(!allocated(&test.join("zeros"))?, "zeros: allocated by --dry-run");
@@ -333,6 +402,7 @@ fn test_restore_sparse(set_up_repo: Result<RepoOpen>) -> Result<()> {
         &["sparse", "linked/a", "linked/b"],
         &["full", "zeros", "trailing"],
     )?;
+    written(restore_dir.path(), &["full", "zeros", "trailing"])?;
 
     Ok(())
 }
