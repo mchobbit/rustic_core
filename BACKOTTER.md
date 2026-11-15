@@ -471,7 +471,29 @@ that either program restores what the other backed up.
   past what fails, and the error says what failed first and how many
   entries were and weren't removed (`remove_tree`). The directory still
   gets its metadata, and its flags in the late pass. As BackOtter's
-  restic 0.19.1+backotter.11 and .12.
+  restic 0.19.1+backotter.11 and .12. The later names of a hard-link
+  group `--exact` breaks (`LinkGroup`) are in the way too, as in
+  restic-bko (`linkedInTheWay`): 0.13.0+backotter.13 only counted them for
+  the group, so an unexpected name of the file such a name was kept its
+  restricting flags and stayed, an error (0.13.0+backotter.14).
+  In a case-insensitive directory (ext4 or tmpfs casefolding, APFS, ZFS
+  `casesensitivity=insensitive`) a name the walk sees, `SAME`, can be the
+  entry of a snapshot name it doesn't, `same`: a target that isn't seen
+  but is there, with nothing between it and the destination a symlink, is
+  taken as there (a file or directory of another type is replaced first),
+  and `--delete` leaves that entry, and of a directory so found removes
+  only what is unexpected below it (`Aliases`, by paths folded to lower
+  case and the same device and inode). 0.13.0+backotter.13 removed it
+  once the walk was done, after planning the snapshot's file there, and
+  then panicked reading the file's contents (exit 134: no metadata pass,
+  the files not yet written missing too); .12 and before removed it as
+  the walk met it, which lost the file when the snapshot's name sorted
+  first (0.13.0+backotter.14). A directory so found that the snapshot's
+  file of that name replaced stays as that file. A name that is the same
+  only by its Unicode normal form is still removed. A file the restore planned to
+  take blobs from that can't be read when it does (gone since the plan)
+  is an error for each file that was to get them, and the restore goes
+  on (stock rustic panicked: `unwrap`).
 - A file whose contents can't be written (one the restore can't open for
   writing) is reported once (`restore PATH: contents not restored: ...`)
   and left as it is; the restore goes on with every other file and all the
@@ -1199,6 +1221,39 @@ that either program restores what the other backed up.
   restore without `--exact` rewrites is written in place, as in stock
   rustic, and its other names see it (BackOtter's restic writes a new
   file).
+
+  Known limits found by the review of 0.13.0+backotter.13, not fixed: a
+  directory in the way of a snapshot file or special file is removed
+  during the walk, under `--delete` entry by entry (`remove_tree`), when
+  `Replaced` holds only what the walk has passed, so whether a hard-link
+  name inside it of a file the restore replaces another name of loses its
+  flags (and goes) still depends on the order of the names (restic-bko .12
+  defers that for directories its second pass leaves before the
+  replacement); `remove_tree` removes by path (`WalkDir`), where std's
+  `remove_dir_all` works through `openat`/`unlinkat` and doesn't follow a
+  parent swapped for a symlink during the removal (CVE-2022-21658), a
+  little less protection on every `--delete`; a kept hard-link group
+  whose contents differ is, under `--clone-from` when a source is found,
+  cloned into a temporary file renamed over its first name, not written
+  in place as above, after its restricting flags came off its shared
+  inode without being held: the group is split until the metadata pass
+  links its other names again, and if that pass doesn't run, or a link
+  fails (an error, the restore goes on), those names keep the old
+  contents without their flags. The tests of restricting flags
+  (`restricting_flags_held_go_back_on_other_names`,
+  `test_restore_exact_flags_*`, `test_restore_exact_delete_link_group_*`,
+  `test_restore_delete_leaves_a_case_variant`) pass without testing
+  anything when not run as root (they say so on stderr): run them as root
+  too. `test_restore_exact_twice_changes_nothing` checks regular files
+  only, so the claim for directories and symlinks has no test of its own.
+  On NetBSD 11's FFS it fails (0.13.0+backotter.13 and .14): a second
+  `--exact` restore moves the change time of every regular file, the
+  empty one too, which the restore never reads (its size matches), while
+  FreeBSD's UFS, with atimes, and ZFS pass; so not the restore's reads of
+  contents moving atimes, as restic-bko's `readsKeepAtimes` allows for.
+  Not yet traced (`ktrace` in a netbsd11 guest); a birth time NetBSD
+  doesn't lower to an earlier mtime would make `same_birth_time` differ on
+  every run, and the metadata pass set the times again.
 
   0.13.0+backotter.13 fixed, after the review of restic-bko .8-.12: a
   fixed temporary name (`.bko-exact-NAME`, opened create+truncate,
