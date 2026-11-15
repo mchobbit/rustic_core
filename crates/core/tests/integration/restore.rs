@@ -856,7 +856,9 @@ fn inodes(dir: &Path) -> Result<std::collections::BTreeMap<PathBuf, (u64, i64, i
 /// no file: no inode, no change time, the hard-link group's either (it is
 /// already exactly the snapshot's, and keeps its inode). Its atimes are
 /// after the restore's change times, which `relatime` (TMPDIR's tmpfs)
-/// doesn't move on a read (there is none: `O_NOATIME`).
+/// doesn't move on a read (there is none: `O_NOATIME`). On NetBSD, whose
+/// FFS moves them on the reads that verify the contents, they are put back
+/// alone, which leaves the change times.
 #[rstest]
 #[cfg(not(windows))]
 fn test_restore_exact_twice_changes_nothing(set_up_repo: Result<RepoOpen>) -> Result<()> {

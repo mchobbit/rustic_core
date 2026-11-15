@@ -15,6 +15,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use jiff::Timestamp;
+
 use crate::{
     backend::{
         ignore::{Incomplete, mapper::LocalSourceSaveOptions},
@@ -347,6 +349,66 @@ pub(super) fn already_matches(
     node_now(target).is_some_and(|now| same_metadata(&now, node, ownership, known_bko))
 }
 
+/// Whether what is at `target` has `node`'s metadata ([`already_matches`])
+/// but for its atime ([`atime_alone_differs`]), which is then put back
+/// alone ([`osattrs::set_atime`]), leaving the change time as it is: on
+/// NetBSD, whose FFS moves no change time for an atime set with the mtime
+/// omitted, and which has no `O_NOATIME`, so that on a mount that keeps
+/// atimes (as installed) the restore's own reads move them (verifying a
+/// file's contents, listing a directory). Not where it can't be set (a
+/// restricting flag), nor elsewhere, where setting any time moves the
+/// change time (and Linux reads with `O_NOATIME`): the restore then sets
+/// the metadata whole.
+pub(super) fn atime_put_back(
+    target: &Path,
+    node: &Node,
+    numeric: bool,
+    ownership: bool,
+    known_bko: bool,
+) -> bool {
+    #[cfg(target_os = "netbsd")]
+    {
+        if ownership && !numeric {
+            return false;
+        }
+        let Some(atime) =
+            node_now(target).and_then(|now| atime_alone_differs(&now, node, ownership, known_bko))
+        else {
+            return false;
+        };
+        osattrs::set_atime(target, atime)
+            .inspect_err(|err| log::debug!("{err}: its metadata set whole"))
+            .is_ok()
+    }
+    #[cfg(not(target_os = "netbsd"))]
+    {
+        _ = (target, node, numeric, ownership, known_bko);
+        false
+    }
+}
+
+/// The atime a restore gives a file for `node` (its own, else its mtime),
+/// if `now`, what a backup would record for the file, has another and
+/// everything else of `node`'s, as [`same_metadata`] compares it: an atime
+/// a read moved. None when it matches, when more differs, or when `node`
+/// has no mtime (no times compared).
+#[cfg_attr(not(any(test, target_os = "netbsd")), allow(dead_code))]
+fn atime_alone_differs(
+    now: &Node,
+    node: &Node,
+    ownership: bool,
+    known_bko: bool,
+) -> Option<Timestamp> {
+    let mtime = node.meta.mtime?;
+    let atime = node.meta.atime.unwrap_or(mtime);
+    if now.meta.atime == Some(atime) {
+        return None;
+    }
+    let mut put_back = now.clone();
+    put_back.meta.atime = Some(atime);
+    same_metadata(&put_back, node, ownership, known_bko).then_some(atime)
+}
+
 /// The comparison [`already_matches`] makes: the type (a symlink's target,
 /// a device), mode, times (the mtime in place of a missing atime, as the
 /// restore sets it; none when `node` has no mtime), the owner's IDs with
@@ -425,7 +487,6 @@ fn same_birth_time(now: &Node, node: &Node, lowered: bool) -> bool {
 mod tests {
     use super::*;
     use crate::backend::node::{Metadata, NodeType};
-    use jiff::Timestamp;
 
     fn node(mode: u32, xattrs: &[(&str, &[u8])]) -> Node {
         Node::new_node(
@@ -489,6 +550,38 @@ mod tests {
         assert!(!same_metadata(&now, &node_, true, true));
         node_.meta.mtime = None;
         assert!(same_metadata(&now, &node_, true, true));
+    }
+
+    /// An atime a read moved (NetBSD) is put back alone: only where the
+    /// rest matches, as the restore would set it.
+    #[test]
+    fn atime_alone_differs_when_the_rest_matches() {
+        let ts = |s| Timestamp::from_second(s).unwrap();
+        let node_ = node(0o644, &[("user.a", b"1")]);
+        let mut now = node(0o644, &[("user.a", b"1")]);
+        assert_eq!(atime_alone_differs(&now, &node_, true, true), None);
+        now.meta.atime = Some(ts(1_800_000_000));
+        assert_eq!(atime_alone_differs(&now, &node_, true, true), Some(ts(1_700_000_100)));
+        // The mtime in place of a missing atime; no mtime, no times compared.
+        let mut no_atime = node_.clone();
+        no_atime.meta.atime = None;
+        assert_eq!(atime_alone_differs(&now, &no_atime, true, true), Some(ts(1_700_000_000)));
+        no_atime.meta.mtime = None;
+        assert_eq!(atime_alone_differs(&now, &no_atime, true, true), None);
+        // Anything else that differs: the metadata are set whole.
+        let mut more = now.clone();
+        more.meta.mtime = Some(ts(1_700_000_001));
+        assert_eq!(atime_alone_differs(&more, &node_, true, true), None);
+        let mut more = now.clone();
+        more.meta.mode = Some(0o600);
+        assert_eq!(atime_alone_differs(&more, &node_, true, true), None);
+        let mut more = now.clone();
+        more.meta.uid = Some(1);
+        assert_eq!(atime_alone_differs(&more, &node_, true, true), None);
+        assert_eq!(atime_alone_differs(&more, &node_, false, true), Some(ts(1_700_000_100)));
+        let mut more = node(0o644, &[("user.a", b"2")]);
+        more.meta.atime = now.meta.atime;
+        assert_eq!(atime_alone_differs(&more, &node_, true, true), None);
     }
 
     /// D9: `unix.sparse` and the birth time aren't compared as other

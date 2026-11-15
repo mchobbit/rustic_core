@@ -1174,7 +1174,18 @@ that either program restores what the other backed up.
     are compared. The restore sets them back, which moves their ctimes.
     Mount such a destination `noatime` to keep them. On Linux a file is
     read (compared, or a blob taken from it) with `O_NOATIME`, which root
-    and its owner have, and `O_NOFOLLOW` (0.13.0+backotter.13);
+    and its owner have, and `O_NOFOLLOW` (0.13.0+backotter.13). On NetBSD
+    an entry whose metadata match but for the atime gets that back alone
+    (`utimensat(2)` with the mtime `UTIME_OMIT`), which NetBSD's FFS does
+    without moving the ctime (every other setting of times moves it); one
+    where that fails (a restricting flag) gets its metadata whole
+    (`exact::atime_put_back`, 0.13.0+backotter.15). NetBSD's FFS, as
+    installed (`log`, with atimes), moves a file's atime on any read, one
+    that doesn't reach the end too, so .13 and .14 set the metadata of
+    every file `--exact` compared (`chown`, `chmod`, `utimensat`) on every
+    run; FreeBSD's UFS doesn't move it for those reads (BackOtter's restic
+    sets it back on NetBSD, moving the ctime, and its test allows for it:
+    `readsKeepAtimes`);
   - a symlink to the same target, a FIFO and the same device stay;
   - an SELinux label the node lacks is removed; a removal that fails but
     for a file system without extended attributes (`ENOTSUP`) or a file
@@ -1246,14 +1257,6 @@ that either program restores what the other backed up.
   anything when not run as root (they say so on stderr): run them as root
   too. `test_restore_exact_twice_changes_nothing` checks regular files
   only, so the claim for directories and symlinks has no test of its own.
-  On NetBSD 11's FFS it fails (0.13.0+backotter.13 and .14): a second
-  `--exact` restore moves the change time of every regular file, the
-  empty one too, which the restore never reads (its size matches), while
-  FreeBSD's UFS, with atimes, and ZFS pass; so not the restore's reads of
-  contents moving atimes, as restic-bko's `readsKeepAtimes` allows for.
-  Not yet traced (`ktrace` in a netbsd11 guest); a birth time NetBSD
-  doesn't lower to an earlier mtime would make `same_birth_time` differ on
-  every run, and the metadata pass set the times again.
 
   0.13.0+backotter.13 fixed, after the review of restic-bko .8-.12: a
   fixed temporary name (`.bko-exact-NAME`, opened create+truncate,
