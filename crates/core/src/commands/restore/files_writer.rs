@@ -131,6 +131,14 @@ impl<'a> FilesWriter<'a> {
         }
     }
 
+    /// Reports that the contents of the file `file_idx` couldn't be
+    /// restored ([`Self::fail`]), and counts one of its writes done, not
+    /// made: its data couldn't be had.
+    pub(super) fn skip(&self, file_idx: usize, err: &dyn Display) {
+        self.fail(file_idx, err);
+        self.release(file_idx, None);
+    }
+
     fn is_failed(&self, file_idx: usize) -> bool {
         lock(&self.failed).contains(&file_idx)
     }

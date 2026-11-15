@@ -670,8 +670,29 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
     // --delete a directory only goes if it is empty. It loses the
     // restricting flags that would refuse that first, where its node says
     // what they are (`sets`), and a file with other names gets them back
-    // once this name is gone (remove_held). Returns the next entry and
-    // whether the old one is gone.
+    // once this name is gone (remove_held). Whether the old one is gone.
+    let remove_in_the_way = |path: &Path, is_dir: bool, sets: bool| -> bool {
+        dirs.borrow_mut().change_parent(path);
+        // BackOtter: nothing below a directory loses its flags: what
+        // refuses removal stays, as with --delete.
+        let (removed, put_back) =
+            remove_held(path, sets, &replaced, |path| match (is_dir, opts.delete) {
+                (false, _) => std::fs::remove_file(path),
+                (true, true) => remove_tree(path, &replaced),
+                (true, false) => std::fs::remove_dir(path),
+            });
+        if let Err(err) = put_back {
+            put_back_failed(path, &err);
+        }
+        removed
+            .map_err(|err| {
+                error!("error removing {}: {err}", path.display());
+                count();
+            })
+            .is_ok()
+    };
+    // The same for an entry of the walk: returns the next entry and whether
+    // the old one is gone.
     let replace_existing = |walker: &mut walkdir::IntoIter,
                             entry: &DirEntry,
                             sets: bool|
@@ -684,24 +705,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
             info!("would have replaced {}", entry.path().display());
             true
         } else {
-            dirs.borrow_mut().change_parent(entry.path());
-            // BackOtter: nothing below a directory loses its flags: what
-            // refuses removal stays, as with --delete.
-            let (removed, put_back) =
-                remove_held(entry.path(), sets, &replaced, |path| match (is_dir, opts.delete) {
-                    (false, _) => std::fs::remove_file(path),
-                    (true, true) => remove_tree(path, &replaced),
-                    (true, false) => std::fs::remove_dir(path),
-                });
-            if let Err(err) = put_back {
-                put_back_failed(entry.path(), &err);
-            }
-            removed
-                .map_err(|err| {
-                    error!("error removing {}: {err}", entry.path().display());
-                    count();
-                })
-                .is_ok()
+            remove_in_the_way(entry.path(), is_dir, sets)
         };
         if is_dir {
             walker.skip_current_dir();
@@ -902,8 +906,49 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
     let mut group_of: BTreeMap<HardlinkKey, usize> = BTreeMap::new();
     let mut in_the_way = Vec::new();
 
+    // BackOtter: a destination that held something may have a node's
+    // entry under another name the walk saw: in a case-insensitive
+    // directory (ext4 or tmpfs casefolding, APFS, ZFS casesensitivity=
+    // insensitive) `SAME` is the snapshot's `same`. It is the snapshot's
+    // file or directory (restored as one there, or replaced by one, as for
+    // any type that differs), so --delete, which sees the name `SAME` as
+    // unexpected, leaves it: the snapshot targets found under another name,
+    // and those below a directory so found, by their names folded
+    // (Aliases). Only where nothing between the destination and the entry
+    // is a symlink: what is reached through one isn't the destination's.
+    let may_alias = !dry_run && std::fs::read_dir(&dest_path).is_ok_and(|mut d| d.next().is_some());
+    let canonical_dest = may_alias.then(|| dest_path.canonicalize().ok()).flatten();
+    let no_symlink_to = |target: &Path| -> bool {
+        let (Some(canonical), Some(parent)) = (&canonical_dest, target.parent()) else {
+            return false;
+        };
+        parent
+            .strip_prefix(&dest_path)
+            .is_ok_and(|rel| parent.canonicalize().is_ok_and(|c| c == canonical.join(rel)))
+    };
+    let mut aliases = Aliases::default();
+
     let mut process_node = |path: &PathBuf, node: &Node, exists: bool| -> RusticResult<_> {
         let target = target_of(path)?;
+        let mut exists = exists;
+        if may_alias && !exists && matches!(node.node_type, NodeType::Dir | NodeType::File) {
+            let below = aliases.below_alias(&target);
+            if let Ok(meta) = std::fs::symlink_metadata(&target)
+                && (below || no_symlink_to(&target))
+            {
+                debug!("{} is there under another name", target.display());
+                let right_type = if node.is_dir() { meta.is_dir() } else { meta.is_file() };
+                exists = right_type
+                    || !remove_in_the_way(
+                        &target,
+                        meta.is_dir(),
+                        osattrs::node_sets_flags(node, known_bko),
+                    );
+                aliases.add(&target);
+            } else if below {
+                aliases.add(&target);
+            }
+        }
         match node.node_type {
             NodeType::Dir => {
                 if exists {
@@ -974,10 +1019,14 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                             _ = entry.insert(path.clone());
                         }
                         // this is a hardlink to an existing candidate, will be processed later while setting metadata
+                        // BackOtter: a name of a LinkGroup's is in the way
+                        // too, when the group gets a file of its own, as in
+                        // BackOtter's restic (linkedInTheWay).
                         std::collections::btree_map::Entry::Occupied(_) => {
                             if let Some(&g) = group_of.get(&key) {
-                                groups[g].others.push(target);
-                            } else if opts.delete
+                                groups[g].others.push(target.clone());
+                            }
+                            if opts.delete
                                 && !dry_run
                                 && exists
                                 && osattrs::node_sets_flags(node, known_bko)
@@ -1149,15 +1198,11 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
     // BackOtter: --delete, past what it can't remove, each an error: a
     // name of a file the restore replaced another name of loses its
     // restricting flags first, held, which the file's other names get back
-    // (remove_extra).
+    // (remove_extra). What is a snapshot target under another name stays,
+    // and only what is unexpected below it goes (Aliases); what is gone
+    // already (replaced as such a target) is no error.
     for (path, is_dir) in extra {
-        dirs.borrow_mut().change_parent(&path);
-        let removed = if is_dir {
-            remove_tree(&path, &replaced)
-        } else {
-            remove_extra(&path, &replaced)
-        };
-        if let Err(err) = removed {
+        if let Err(err) = remove_unexpected(&path, is_dir, &aliases, &dirs, &replaced) {
             error!("error removing {}: {err}", path.display());
             count();
         }
@@ -1937,9 +1982,24 @@ fn restore_contents<S: Open>(
                 s.spawn(move |s1| {
                     let read_data = match &from_file {
                         Some((file_idx, offset_file, length_file)) => {
-                            // read from existing file
-                            dest.read_at(&filenames[*file_idx], *offset_file, (*length_file).into())
-                                .unwrap()
+                            // read from existing file. BackOtter: one that
+                            // can't be read (gone since the plan) leaves the
+                            // files that were to get its part without their
+                            // contents, each reported, not a panic.
+                            let name = &filenames[*file_idx];
+                            match dest.read_at(name, *offset_file, (*length_file).into()) {
+                                Ok(data) => data,
+                                Err(err) => {
+                                    let err = format!("{} not read: {err}", name.display());
+                                    for (bl, name_dests) in blobs {
+                                        for (file_idx, _) in name_dests {
+                                            writer.skip(file_idx, &err);
+                                            p.inc(bl.data_length().into());
+                                        }
+                                    }
+                                    return;
+                                }
+                            }
                         }
                         None => {
                             // read needed part of the pack
@@ -2248,6 +2308,118 @@ fn remove_extra(path: &Path, replaced: &RefCell<Replaced>) -> std::io::Result<()
             format!("removed, but restricting flags not put back on its other names: {err}"),
         )
     })
+}
+
+/// BackOtter: the snapshot targets (files and directories) a restore found
+/// under another name than the walk of the destination saw, as in a
+/// case-insensitive directory, where `SAME` is the snapshot's `same`, and
+/// every target below a directory so found, by their paths with letters
+/// folded to lower case ([`Self::key`]): `--delete` leaves such an entry,
+/// which is the snapshot's ([`remove_unexpected`]). Removing it once the
+/// walk was done removed a file the restore had planned, which it then
+/// failed to read: a panic, the rest of the restore not done
+/// (rustic-bko 0.11.4+backotter.14). Folding letters, not Unicode
+/// normalization: a name the file system takes as another only by its
+/// normal form is still removed.
+#[derive(Debug, Default)]
+struct Aliases(BTreeMap<String, PathBuf>);
+
+impl Aliases {
+    fn key(path: &Path) -> String {
+        path.to_string_lossy().to_lowercase()
+    }
+
+    fn add(&mut self, target: &Path) {
+        _ = self.0.insert(Self::key(target), target.to_path_buf());
+    }
+
+    /// Whether the directory of `target` is one of them.
+    fn below_alias(&self, target: &Path) -> bool {
+        !self.0.is_empty()
+            && target
+                .parent()
+                .is_some_and(|dir| self.0.contains_key(&Self::key(dir)))
+    }
+
+    /// The target that the entry at `path` is, if it is one of them: the
+    /// same entry (device and inode).
+    fn target_of(&self, path: &Path) -> Option<&Path> {
+        self.0
+            .get(&Self::key(path))
+            .map(PathBuf::as_path)
+            .filter(|target| same_entry(path, target))
+    }
+}
+
+/// BackOtter: whether `a` and `b` are the same entry, the same device and
+/// inode, not following a symlink; a directory too.
+fn same_entry(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+            (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        a == b
+    }
+}
+
+/// BackOtter: removes what `--delete` removes at `path` (a directory if
+/// `is_dir`), unless it is a snapshot target under another name
+/// ([`Aliases`]): a file then stays, and a directory loses only what is
+/// unexpected below it, each entry in it as `path` is, its name taken as
+/// the target's. Nothing there is no error: it went as such a target of
+/// another type. Past what fails: the error is the first.
+///
+/// # Errors
+///
+/// * If some of it couldn't be removed.
+fn remove_unexpected(
+    path: &Path,
+    is_dir: bool,
+    aliases: &Aliases,
+    dirs: &RefCell<DirChanges>,
+    replaced: &RefCell<Replaced>,
+) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path)
+        .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(());
+    }
+    let Some(target) = aliases.target_of(path) else {
+        // Only a directory an entry goes from changes: one left as it is
+        // keeps its flags and change time (DirChanges).
+        dirs.borrow_mut().change_parent(path);
+        return if is_dir {
+            remove_tree(path, replaced)
+        } else {
+            remove_extra(path, replaced)
+        };
+    };
+    debug!("{} left: it is {}", path.display(), target.display());
+    // A directory the walk saw there may since have been replaced by the
+    // snapshot's file of that name: that stays, as a whole.
+    if !is_dir || !std::fs::symlink_metadata(target).is_ok_and(|m| m.is_dir()) {
+        return Ok(());
+    }
+    let mut first = None;
+    for entry in std::fs::read_dir(target)? {
+        let removed = entry.and_then(|entry| {
+            let child = target.join(entry.file_name());
+            let child_dir = entry.file_type()?.is_dir();
+            remove_unexpected(&child, child_dir, aliases, dirs, replaced).map_err(|err| {
+                std::io::Error::new(err.kind(), format!("{}: {err}", child.display()))
+            })
+        });
+        if let Err(err) = removed {
+            _ = first.get_or_insert(err);
+        }
+    }
+    first.map_or(Ok(()), Err)
 }
 
 /// BackOtter: removes the directory `dir` and all below it, which `--delete`

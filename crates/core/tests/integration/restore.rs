@@ -459,15 +459,15 @@ fn xfs_xflags(path: &Path) -> u64 {
     x & 0x1_7d01
 }
 
-/// BackOtter: a loop XFS, mounted until dropped.
+/// BackOtter: a loop file system, mounted until dropped.
 #[cfg(target_os = "linux")]
-struct LoopXfs {
+struct LoopFs {
     _scratch: tempfile::TempDir,
     mnt: PathBuf,
 }
 
 #[cfg(target_os = "linux")]
-impl Drop for LoopXfs {
+impl Drop for LoopFs {
     fn drop(&mut self) {
         _ = std::process::Command::new("umount").arg(&self.mnt).status();
     }
@@ -482,7 +482,7 @@ fn ok(cmd: &mut std::process::Command) -> bool {
 /// BackOtter: with root, a new loop XFS of 320 MiB; None, with why, where
 /// it can't be had.
 #[cfg(target_os = "linux")]
-fn loop_xfs() -> Result<Option<LoopXfs>> {
+fn loop_xfs() -> Result<Option<LoopFs>> {
     use std::process::Command;
 
     if !nix::unistd::geteuid().is_root() {
@@ -501,7 +501,7 @@ fn loop_xfs() -> Result<Option<LoopXfs>> {
         eprintln!("skipped: mount failed");
         return Ok(None);
     }
-    Ok(Some(LoopXfs { _scratch: scratch, mnt }))
+    Ok(Some(LoopFs { _scratch: scratch, mnt }))
 }
 
 /// BackOtter: a snapshot ("test") of dir, holding in and sub/f, and plain,
@@ -1046,5 +1046,201 @@ fn test_restore_exact_flags_back_on_other_names(set_up_repo: Result<RepoOpen>) -
     assert_eq!(fs::read_to_string(t.join("d/b"))?, "snapshot");
     assert!(!t.join("d/a").exists(), "the unexpected name is still there");
     assert_eq!(fs::metadata(&o)?.nlink(), 1);
+    Ok(())
+}
+
+/// BackOtter: with root, a new loop ext4 of 64 MiB that can fold case
+/// (`-O casefold`); None, with why, where it can't be had.
+#[cfg(target_os = "linux")]
+fn loop_ext4_casefold() -> Result<Option<LoopFs>> {
+    use std::process::Command;
+
+    if !nix::unistd::geteuid().is_root() {
+        eprintln!("skipped: needs root, to mount a file system");
+        return Ok(None);
+    }
+    let scratch = tempdir()?;
+    let (img, mnt) = (scratch.path().join("fs.img"), scratch.path().join("mnt"));
+    File::create(&img)?.set_len(64 << 20)?;
+    fs::create_dir(&mnt)?;
+    if !ok(Command::new("mkfs.ext4").args(["-q", "-F", "-O", "casefold"]).arg(&img)) {
+        eprintln!("skipped: no mkfs.ext4 with casefold");
+        return Ok(None);
+    }
+    if !ok(Command::new("mount").args(["-o", "loop"]).arg(&img).arg(&mnt)) {
+        eprintln!("skipped: mount failed");
+        return Ok(None);
+    }
+    Ok(Some(LoopFs { _scratch: scratch, mnt }))
+}
+
+/// BackOtter: `size` bytes that don't repeat, the same every time.
+#[cfg(not(windows))]
+fn noise(size: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..size)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x.to_le_bytes()[3]
+        })
+        .collect()
+}
+
+/// BackOtter: `--delete` in a case-insensitive directory (ext4 casefolding)
+/// leaves what is the snapshot's entry under another name: `SAME` is the
+/// snapshot's `same`, and gets its contents, whichever name sorts first
+/// (`snapupper` and `SNAPUPPER` too); in `docs`, the snapshot's `Docs`, only
+/// what the snapshot hasn't got goes; a file `KIND` where the snapshot has
+/// a directory `kind` is replaced by it, a directory `FLAT` where it has a
+/// file `flat` too; and every other file is restored.
+/// rustic-bko 0.11.4+backotter.14 removed `SAME` once it had planned
+/// `same`, then panicked reading it (exit 134, the rest of the restore not
+/// done). The same with `--exact`, over what the first restore left. Root
+/// only (a loop ext4).
+#[rstest]
+#[cfg(target_os = "linux")]
+fn test_restore_delete_leaves_a_case_variant(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    let Some(loop_fs) = loop_ext4_casefold()? else {
+        return Ok(());
+    };
+    let source = tempdir()?;
+    let s = source.path();
+    fs::write(s.join("same"), "same")?;
+    fs::write(s.join("SNAPUPPER"), "snapshot")?;
+    fs::create_dir_all(s.join("Docs/new"))?;
+    fs::write(s.join("Docs/x"), "snapshot x")?;
+    fs::write(s.join("Docs/new/n"), "n")?;
+    fs::create_dir(s.join("kind"))?;
+    fs::write(s.join("kind/f"), "f")?;
+    fs::write(s.join("flat"), "flat")?;
+    let other = noise(3 << 20, 7);
+    fs::write(s.join("other"), &other)?;
+    let repo = backed_up(set_up_repo?, s)?;
+    let dst = loop_fs.mnt.join("dst");
+    let t = dst.join("test");
+    fs::create_dir_all(&t)?;
+    assert!(chattr("+F", &t), "no casefolding on {}", t.display());
+    fs::write(t.join("SAME"), "same")?;
+    fs::write(t.join("snapupper"), "old")?;
+    fs::create_dir(t.join("docs"))?;
+    fs::write(t.join("docs/x"), "old x")?;
+    fs::write(t.join("docs/y"), "unexpected")?;
+    fs::write(t.join("KIND"), "a file where the snapshot has a directory")?;
+    fs::create_dir(t.join("FLAT"))?;
+    fs::write(t.join("FLAT/junk"), "a directory where the snapshot has a file")?;
+    fs::write(t.join("extra"), "unexpected")?;
+    for opts in [
+        RestoreOptions::default().delete(true),
+        RestoreOptions::default().delete(true).exact(true).numeric_id(true),
+    ] {
+        assert_eq!(restore_counting(&repo, &dst, opts)?, 0, "{opts:?}");
+        assert_eq!(fs::read_to_string(t.join("same"))?, "same");
+        assert_eq!(fs::read_to_string(t.join("SNAPUPPER"))?, "snapshot");
+        assert_eq!(fs::read_to_string(t.join("Docs/x"))?, "snapshot x");
+        assert_eq!(fs::read_to_string(t.join("Docs/new/n"))?, "n");
+        assert_eq!(fs::read_to_string(t.join("kind/f"))?, "f");
+        assert_eq!(fs::read_to_string(t.join("flat"))?, "flat");
+        assert!(fs::read(t.join("other"))? == other, "other's contents");
+        assert!(!t.join("docs/y").exists(), "the unexpected docs/y is still there");
+        assert!(!t.join("extra").exists(), "the unexpected extra is still there");
+        let mut names: Vec<_> = fs::read_dir(&t)?
+            .map(|e| e.map(|e| e.file_name().to_string_lossy().to_lowercase()))
+            .collect::<Result<_, _>>()?;
+        names.sort();
+        assert_eq!(names, ["docs", "flat", "kind", "other", "same", "snapupper"]);
+    }
+    Ok(())
+}
+
+/// BackOtter: a file the restore planned to take a part of its contents
+/// from, gone before the restore read it (a directory there now), leaves the files that were to
+/// get that part without their contents, each an error (the restore's
+/// error names how many), and the restore goes on: it used to panic (exit
+/// 134), the rest of the restore not done.
+#[rstest]
+#[cfg(not(windows))]
+fn test_restore_existing_file_gone_is_no_panic(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    let source = tempdir()?;
+    let s = source.path();
+    let data = noise(8 << 20, 11);
+    fs::write(s.join("f"), &data)?;
+    fs::write(s.join("g"), &data)?;
+    fs::write(s.join("h"), "h")?;
+    let repo = backed_up(set_up_repo?, s)?;
+    let target = tempdir()?;
+    restore_to(&repo, target.path(), RestoreOptions::default())?;
+    let t = target.path().join("test");
+    // f keeps its first chunks and g is gone: g's chunks are read from f,
+    // which is a directory by then (it can't be read, nor made again by
+    // f's own writes). h is left as it is: a blob to write that sorts
+    // first in the pack would have the pack read whole, f's chunks too
+    // (PackInfo::coalesce).
+    let mut changed = data.clone();
+    let len = changed.len();
+    changed[len - 4096..].fill(0x5a);
+    fs::write(t.join("f"), &changed)?;
+    fs::remove_file(t.join("g"))?;
+
+    let snap = repo.get_snapshot_from_str("latest", |_| true)?;
+    let opts = RestoreOptions::default().origin(SnapshotOrigin::of(&snap));
+    let node = repo.node_from_snapshot_path("latest", |_| true)?;
+    let dest = LocalDestination::new(target.path().to_str().expect("utf-8"), true, false)?;
+    let ls = repo.ls(&node, &LsOptions::default())?;
+    let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false)?;
+    fs::remove_file(t.join("f"))?;
+    fs::create_dir(t.join("f"))?;
+    // f and g without their contents: the restore's error.
+    let err = repo.restore(plan, &opts, ls, &dest).expect_err("contents not restored");
+    assert!(err.to_string().contains("could not be restored"), "{err}");
+    assert!(fs::read(t.join("g")).ok() != Some(data), "g restored from what?");
+    assert_eq!(fs::read_to_string(t.join("h"))?, "h");
+    Ok(())
+}
+
+/// BackOtter (D7): `--exact --delete` over a hard-linked pair whose names
+/// are two immutable files with other names each, unexpected ones: the
+/// pair gets a file of its own, and both unexpected names go, the second
+/// file's too (its name `b` is in the way of the link, removed early, so
+/// that `--delete` knows it: rustic-bko 0.11.4+backotter.14 left
+/// `y_extra`, "Operation not permitted"). Root only, on a file system with
+/// flags (TMPDIR).
+#[rstest]
+#[cfg(target_os = "linux")]
+fn test_restore_exact_delete_link_group_in_the_way(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    let source = tempdir()?;
+    let s = source.path();
+    fs::create_dir(s.join("d"))?;
+    fs::write(s.join("d/a"), "snapshot")?;
+    fs::hard_link(s.join("d/a"), s.join("d/b"))?;
+    if !chattr("+i", &s.join("d/a")) {
+        eprintln!("no immutable flag in {}", s.display());
+        return Ok(());
+    }
+    let repo = backed_up(set_up_repo?, s);
+    _ = chattr("-i", &s.join("d/a"));
+    let repo = repo?;
+    let target = tempdir()?;
+    let d = target.path().join("test/d");
+    fs::create_dir_all(&d)?;
+    fs::write(d.join("a"), "old X")?;
+    fs::hard_link(d.join("a"), d.join("x_extra"))?;
+    fs::write(d.join("b"), "old Y")?;
+    fs::hard_link(d.join("b"), d.join("y_extra"))?;
+    assert!(chattr("+i", &d.join("a")) && chattr("+i", &d.join("b")));
+    let exact = RestoreOptions::default().exact(true).delete(true).numeric_id(true);
+    let result = restore_counting(&repo, target.path(), exact);
+    let left: Vec<_> = ["x_extra", "y_extra"].into_iter().filter(|n| d.join(n).exists()).collect();
+    let flagged = immutable(&d.join("a")) && immutable(&d.join("b"));
+    for entry in fs::read_dir(&d)? {
+        _ = chattr("-i", &entry?.path());
+    }
+    assert_eq!(result?, 0);
+    assert!(left.is_empty(), "unexpected names left: {left:?}");
+    assert!(flagged, "the pair lost immutable");
+    assert_eq!(fs::read_to_string(d.join("a"))?, "snapshot");
+    assert_eq!(fs::metadata(d.join("a"))?.ino(), fs::metadata(d.join("b"))?.ino());
+    assert_eq!(fs::metadata(d.join("a"))?.nlink(), 2);
     Ok(())
 }
