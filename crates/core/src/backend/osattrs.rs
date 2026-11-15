@@ -1253,7 +1253,7 @@ fn lower_birthtime(path: &Path, node: &Node, birth: Timestamp) -> io::Result<()>
     let Some(birth) = birthtime_first(node, birth) else {
         return Ok(());
     };
-    match utimensat_nofollow(path, None, birth) {
+    match utimensat_nofollow(path, None, Some(birth)) {
         Ok(()) => Ok(()),
         Err(err)
             if node.is_symlink()
@@ -1278,14 +1278,33 @@ fn lower_birthtime(path: &Path, node: &Node, birth: Timestamp) -> io::Result<()>
 /// * If the times can't be set.
 #[cfg(target_os = "dragonfly")]
 pub(crate) fn set_times(path: &Path, atime: Timestamp, mtime: Timestamp) -> io::Result<()> {
-    utimensat_nofollow(path, Some(atime), mtime)
+    utimensat_nofollow(path, Some(atime), Some(mtime))
 }
 
-/// Sets the mtime of the file at `path` and its atime, unless that is
+/// Sets the atime of the file at `path` alone, not following a symlink, to
+/// the nanosecond, with `utimensat(2)` and the mtime omitted: on NetBSD's
+/// FFS that leaves the change time as it is, which setting the mtime with
+/// it doesn't. `--exact` puts back the atimes the restore's own reads moved
+/// with it (`commands::restore::exact`).
+///
+/// # Errors
+///
+/// * If the atime can't be set.
+#[cfg(target_os = "netbsd")]
+pub(crate) fn set_atime(path: &Path, atime: Timestamp) -> io::Result<()> {
+    utimensat_nofollow(path, Some(atime), None)
+        .map_err(|err| path_error("utimensat (atime)", path, &err))
+}
+
+/// Sets the atime and mtime of the file at `path`, each unless it is
 /// `None` (`UTIME_OMIT`), with `utimensat(2)` and `AT_SYMLINK_NOFOLLOW`, to
 /// the nanosecond.
 #[cfg(any(target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd"))]
-fn utimensat_nofollow(path: &Path, atime: Option<Timestamp>, mtime: Timestamp) -> io::Result<()> {
+fn utimensat_nofollow(
+    path: &Path,
+    atime: Option<Timestamp>,
+    mtime: Option<Timestamp>,
+) -> io::Result<()> {
     let spec = |t: Option<Timestamp>| {
         t.map_or(
             libc::timespec {
@@ -1302,7 +1321,7 @@ fn utimensat_nofollow(path: &Path, atime: Option<Timestamp>, mtime: Timestamp) -
         )
     };
     let p = c_path(path)?;
-    let times = [spec(atime), spec(Some(mtime))];
+    let times = [spec(atime), spec(mtime)];
     // SAFETY: p is a C string, times two timespecs.
     let r = unsafe {
         libc::utimensat(libc::AT_FDCWD, p.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW)

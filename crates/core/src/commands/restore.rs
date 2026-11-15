@@ -1288,11 +1288,14 @@ fn restore_metadata(
         // BackOtter: under --exact, an entry whose metadata already matches
         // is left untouched, its restricting flags too: setting it again
         // would change its inode (the change time), which a btrfs snapshot
-        // then no longer shares.
+        // then no longer shares. On NetBSD one whose atime alone differs
+        // (the restore's own reads moved it) gets it back alone, which
+        // leaves its change time.
         let attrs = if opts.exact
-            && dest
-                .path(path)
-                .is_ok_and(|t| exact::already_matches(&t, node, numeric, owned, known_bko))
+            && dest.path(path).is_ok_and(|t| {
+                exact::already_matches(&t, node, numeric, owned, known_bko)
+                    || exact::atime_put_back(&t, node, numeric, owned, known_bko)
+            })
         {
             trace!("metadata already matches: {}", path.display());
             only_had_xfs
