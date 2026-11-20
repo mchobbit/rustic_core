@@ -691,6 +691,7 @@ pub(super) fn restore_file_flags(
         current,
         flags,
         compression,
+        || get_flags(&f),
         |flags| set_flags(&f, flags),
         |value| set_xattr(&f, BTRFS_COMPRESSION, value),
         |xflags| {
@@ -911,12 +912,19 @@ const fn casefold_differs(typ: &NodeType, current: u32, flags: u32) -> bool {
 /// So for a file with the property (`compression`), `set` gets the flags
 /// but immutable and append-only, `set_compression` puts the property back,
 /// and `add_xflags` adds those two through `FS_IOC_FSSETXATTR`, which leaves
-/// it alone.
+/// it alone. `get` (`FS_IOC_GETFLAGS`) then checks them: where the file
+/// system has no `FS_IOC_FSSETXATTR`, or that didn't give the file exactly
+/// those two (ZFS 2.2, which takes `fsx_xflags` for `FS_IOC_GETFLAGS`'s
+/// flags, so that `FS_XFLAG_APPEND` set immutable), `set` gives it all its
+/// flags, as [`put_back_restricting_with`] does. Only a file system without
+/// the property gets there: btrfs has `FS_IOC_FSSETXATTR`, and maps the two.
+#[allow(clippy::too_many_arguments)]
 fn restore_flags_with(
     path: &Path,
     current: u32,
     flags: u32,
     compression: Option<&[u8]>,
+    mut get: impl FnMut() -> io::Result<u32>,
     mut set: impl FnMut(u32) -> io::Result<()>,
     mut set_compression: impl FnMut(&[u8]) -> io::Result<()>,
     mut add_xflags: impl FnMut(u32) -> io::Result<()>,
@@ -961,15 +969,40 @@ fn restore_flags_with(
     }
     let set_late = match xflags {
         0 => Ok(()),
-        _ => add_xflags(xflags).map_err(|err| {
-            if unsupported(&err) {
-                Unsupported::error(LINUX_INODE_FLAGS, late.into(), err)
-            } else {
-                path_error("FS_IOC_FSSETXATTR", path, &err)
+        _ => match add_xflags(xflags) {
+            Ok(()) if get().is_ok_and(|now| now & (FS_IMMUTABLE_FL | FS_APPEND_FL) == late) => {
+                Ok(())
             }
-        }),
+            Ok(()) => set_all_late(path, own, first | late, get().ok(), &mut set),
+            Err(err) if unsupported(&err) => {
+                set_all_late(path, own, first | late, get().ok(), &mut set)
+            }
+            Err(err) => Err(path_error("FS_IOC_FSSETXATTR", path, &err)),
+        },
     };
     set_first.and(set_property).and(set_late)
+}
+
+/// Gives a file the [`KEPT_LATE`] flags `want` with `set`
+/// (`FS_IOC_SETFLAGS`), keeping `own`, the file system's own flags and
+/// casefolding, where [`restore_flags_with`]'s `FS_IOC_FSSETXATTR` didn't
+/// give it immutable and append-only right. `now`, its flags as read back
+/// (if they could be), are what a flag refused alone is reported against.
+fn set_all_late(
+    path: &Path,
+    own: u32,
+    want: u32,
+    now: Option<u32>,
+    set: &mut impl FnMut(u32) -> io::Result<()>,
+) -> io::Result<()> {
+    set_flags_best_effort(
+        LINUX_INODE_FLAGS,
+        path,
+        "FS_IOC_SETFLAGS",
+        now.map(|now| now & KEPT_LATE),
+        want,
+        |f| set(own | f),
+    )
 }
 
 pub(super) fn prepare_file_for_flags(path: &Path, flags: u32) -> io::Result<()> {
@@ -1724,16 +1757,19 @@ mod tests {
     }
 
     /// Runs [`restore_flags_with`] on a file with the flags `current` and
-    /// returns the calls it made.
+    /// returns the calls it made (but the reads).
     fn restore_flags_calls(current: u32, flags: u32, compression: Option<&[u8]>) -> Vec<String> {
         let calls = RefCell::new(Vec::new());
+        let now = std::cell::Cell::new(current);
         restore_flags_with(
             Path::new("f"),
             current,
             flags,
             compression,
+            || Ok(now.get()),
             |f| {
                 calls.borrow_mut().push(format!("set {f:#x}"));
+                now.set(f);
                 Ok(())
             },
             |v| {
@@ -1744,6 +1780,12 @@ mod tests {
             },
             |x| {
                 calls.borrow_mut().push(format!("xflags {x:#x}"));
+                if x & FS_XFLAG_IMMUTABLE != 0 {
+                    now.set(now.get() | FS_IMMUTABLE_FL);
+                }
+                if x & FS_XFLAG_APPEND != 0 {
+                    now.set(now.get() | FS_APPEND_FL);
+                }
                 Ok(())
             },
         )
@@ -1786,6 +1828,76 @@ mod tests {
         );
         // Without the property, as on any other file system.
         assert_eq!(restore_flags_calls(COMPR, COMPR | FS_IMMUTABLE_FL, None), ["set 0x14"]);
+    }
+
+    // A btrfs file's compression property and i/a, restored onto a file
+    // system without the property, where FS_IOC_FSSETXATTR isn't there or
+    // doesn't set the two right (ZFS 2.2 takes fsx_xflags for
+    // FS_IOC_GETFLAGS's flags: FS_XFLAG_APPEND is FS_IMMUTABLE_FL, and
+    // FS_XFLAG_IMMUTABLE FS_SYNC_FL, which it refuses): the file still gets
+    // its flags, not others.
+    #[test]
+    fn restore_flags_compression_on_zfs_xflags() {
+        const SYNC: u32 = 0x0000_0008;
+        let ia = FS_IMMUTABLE_FL | FS_APPEND_FL;
+        for (name, zfs, no_xattr, flags, want_sets) in [
+            // The flags but i and a, then i and a through FS_IOC_FSSETXATTR.
+            ("btrfs a", false, false, COMPR | FS_APPEND_FL, 1),
+            ("btrfs i+a", false, false, COMPR | NODUMP | ia, 1),
+            // Then all of them through FS_IOC_SETFLAGS.
+            ("zfs a", true, false, COMPR | FS_APPEND_FL, 2),
+            ("zfs i", true, false, COMPR | FS_IMMUTABLE_FL, 2),
+            ("zfs i+a", true, false, COMPR | NODUMP | ia, 2),
+            ("no FSSETXATTR a", false, true, COMPR | FS_APPEND_FL, 2),
+        ] {
+            let now = std::cell::Cell::new(EXTENTS);
+            let sets = std::cell::Cell::new(0);
+            let result = restore_flags_with(
+                Path::new("f"),
+                EXTENTS,
+                flags,
+                Some(&b"zstd"[..]),
+                || Ok(now.get()),
+                |f| {
+                    sets.set(sets.get() + 1);
+                    now.set(f);
+                    Ok(())
+                },
+                |_| {
+                    if zfs {
+                        // ZFS has no handler for btrfs.* names.
+                        Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |xflags| {
+                    if no_xattr {
+                        return Err(io::Error::from_raw_os_error(libc::ENOTTY));
+                    }
+                    let mut f = now.get();
+                    if zfs {
+                        if xflags & SYNC != 0 {
+                            return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+                        }
+                        f |= xflags;
+                    } else {
+                        if xflags & FS_XFLAG_IMMUTABLE != 0 {
+                            f |= FS_IMMUTABLE_FL;
+                        }
+                        if xflags & FS_XFLAG_APPEND != 0 {
+                            f |= FS_APPEND_FL;
+                        }
+                    }
+                    now.set(f);
+                    Ok(())
+                },
+            );
+            assert_eq!(now.get(), EXTENTS | flags, "{name}");
+            assert_eq!(sets.get(), want_sets, "{name}");
+            // The property alone wasn't restored, where there is none.
+            assert_eq!(result.is_err(), zfs, "{name}: {result:?}");
+        }
     }
 
     /// Runs [`prepare_dir_with`] on a directory with the flags `current` and
