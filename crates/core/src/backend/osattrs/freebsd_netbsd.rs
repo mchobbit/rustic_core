@@ -8,14 +8,20 @@
 //! alone, and a POSIX.1e ACL's mode holds the mask in its group bits, so
 //! the owning group can end up with more access than it had.
 
-use std::{collections::BTreeMap, ffi::CString, io, path::Path, ptr};
+use std::{
+    collections::BTreeMap,
+    ffi::{CString, OsString},
+    io,
+    path::Path,
+    ptr,
+};
 
 use log::debug;
 use serde_derive::{Deserialize, Serialize};
 use serde_with::{DefaultOnNull, base64::Base64, serde_as};
 
 use super::{
-    acl_set_error, c_path, check,
+    acl_set_error, bsd_extattr, c_path, check,
     freebsd_acl::{self, AclEntry, AclType, MAX_ENTRIES, Os},
     path_error,
 };
@@ -217,34 +223,26 @@ fn extattr_read(
     extattr_call(size, f)
 }
 
-/// The names of the user extended attributes of the file at `path`,
-/// without following a symlink.
-pub(super) fn user_extattr_names(path: &Path) -> io::Result<Vec<String>> {
-    list_extattrs(path, libc::EXTATTR_NAMESPACE_USER)
+/// The names of the user extended attributes of the file at `path`, as the
+/// xattr crate names them (`user.NAME`, by the name's bytes), without
+/// following a symlink.
+pub(super) fn user_extattr_names(path: &Path) -> io::Result<Vec<OsString>> {
+    let names = list_extattrs(path, libc::EXTATTR_NAMESPACE_USER)?;
+    Ok(names.iter().map(|name| bsd_extattr::user_name(name)).collect())
 }
 
 /// The names of the extended attributes in `namespace` of the file at
-/// `path`, without following a symlink.
-fn list_extattrs(path: &Path, namespace: libc::c_int) -> io::Result<Vec<String>> {
+/// `path`, without following a symlink: bytes, which needn't be UTF-8.
+fn list_extattrs(path: &Path, namespace: libc::c_int) -> io::Result<Vec<Vec<u8>>> {
     let p = c_path(path)?;
     let list = extattr_read(|data, n| {
         // SAFETY: data is null or points to n bytes.
         unsafe { libc::extattr_list_link(p.as_ptr(), namespace, data, n) }
     })?;
-    // Each name follows a byte holding its length.
-    let mut names = Vec::new();
-    let mut rest = list.as_slice();
-    while let Some((&n, tail)) = rest.split_first() {
-        let Some(name) = tail.get(..usize::from(n)) else {
-            break;
-        };
-        names.push(String::from_utf8_lossy(name).into_owned());
-        rest = &tail[usize::from(n)..];
-    }
-    Ok(names)
+    Ok(bsd_extattr::list_names(&list))
 }
 
-fn get_system_extattr(path: &Path, name: &str) -> io::Result<Vec<u8>> {
+fn get_system_extattr(path: &Path, name: &[u8]) -> io::Result<Vec<u8>> {
     let p = c_path(path)?;
     let n = CString::new(name)?;
     extattr_read(|data, size| {
@@ -304,14 +302,17 @@ fn fill_system_extattrs(path: &Path, node: &mut Node) -> io::Result<()> {
     };
     let mut attrs = SystemExtattrs::default();
     for name in names {
-        if UFS_ACL_EXTATTRS.contains(&name.as_str()) {
+        if UFS_ACL_EXTATTRS.iter().any(|acl| acl.as_bytes() == name) {
             continue;
         }
+        // Read by its own bytes, kept by a name that is valid UTF-8.
+        let node_name = bsd_extattr::node_name(&name);
         match get_system_extattr(path, &name) {
-            Ok(value) => _ = attrs.0.insert(name, value),
+            Ok(value) => _ = attrs.0.insert(node_name, value),
             Err(err) if err.raw_os_error() == Some(libc::ENOATTR) => {} // removed since the listing
             Err(err) => {
-                return Err(path_error(&format!("extattr_get_link system.{name}"), path, &err));
+                let op = format!("extattr_get_link system.{node_name}");
+                return Err(path_error(&op, path, &err));
             }
         }
     }

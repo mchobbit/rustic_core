@@ -47,6 +47,8 @@ use crate::backend::node::{
     },
 };
 
+#[cfg(unix)]
+mod bsd_extattr;
 mod bsd_flags;
 #[cfg(any(
     target_os = "dragonfly",
@@ -1454,10 +1456,7 @@ pub(crate) fn xattr_list(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
     // BackOtter: past PATH_MAX, through a short path to it.
     let path = &*walkdir::short_path(path);
     #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
-    let names = freebsd_netbsd::user_extattr_names(path)?
-        .into_iter()
-        .map(|name| format!("user.{name}").into())
-        .collect();
+    let names = freebsd_netbsd::user_extattr_names(path)?;
     #[cfg(target_os = "linux")]
     let names = os::xattr_list(path)?;
     #[cfg(not(any(target_os = "freebsd", target_os = "netbsd", target_os = "linux")))]
