@@ -253,6 +253,22 @@ impl LocalDestination {
         Ok(res)
     }
 
+    /// BackOtter: [`Self::path`] as a system call takes it: past
+    /// `PATH_MAX`, a short path to the same file ([`walkdir::short_path`]).
+    /// For this destination's own system calls; the restore's decisions
+    /// (what is where, in which order) go by [`Self::path`].
+    ///
+    /// # Errors
+    ///
+    /// * As [`Self::path`].
+    pub(crate) fn sys_path(&self, item: impl AsRef<Path>) -> LocalDestinationResult<PathBuf> {
+        let path = self.path(item)?;
+        Ok(match walkdir::short_path(&path) {
+            std::borrow::Cow::Borrowed(_) => path,
+            std::borrow::Cow::Owned(short) => short,
+        })
+    }
+
     /// Remove the given directory (relative to the base path)
     ///
     /// # Arguments
@@ -312,7 +328,7 @@ impl LocalDestination {
     pub(crate) fn create_dir(&self, item: impl AsRef<Path>) -> LocalDestinationResult<()> {
         // BackOtter: waits for the exit once XFS options are put back for it.
         let _making = crate::commands::restore::making_entries();
-        let dirname = self.path(item)?;
+        let dirname = self.sys_path(item)?;
         fs::create_dir_all(dirname).map_err(LocalDestinationErrorKind::DirectoryCreationFailed)?;
         Ok(())
     }
@@ -332,7 +348,7 @@ impl LocalDestination {
         item: impl AsRef<Path>,
         meta: &Metadata,
     ) -> LocalDestinationResult<()> {
-        let filename = self.path(item)?;
+        let filename = self.sys_path(item)?;
         if let Some(mtime) = meta.mtime {
             let atime = meta.atime.unwrap_or(mtime);
             // BackOtter: on DragonFly filetime takes microseconds alone.
@@ -391,7 +407,7 @@ impl LocalDestination {
         item: impl AsRef<Path>,
         meta: &Metadata,
     ) -> LocalDestinationResult<()> {
-        let filename = self.path(item)?;
+        let filename = self.sys_path(item)?;
 
         let user = meta.user.clone().and_then(helpers::uid_from_name);
         // use uid from user if valid, else from saved uid (if saved)
@@ -444,7 +460,7 @@ impl LocalDestination {
         item: impl AsRef<Path>,
         meta: &Metadata,
     ) -> LocalDestinationResult<()> {
-        let filename = self.path(item)?;
+        let filename = self.sys_path(item)?;
 
         let uid = meta.uid.map(Uid::from_raw);
         let gid = meta.gid.map(Gid::from_raw);
@@ -547,7 +563,7 @@ impl LocalDestination {
             return Ok(());
         }
 
-        let filename = self.path(item)?;
+        let filename = self.sys_path(item)?;
 
         // BackOtter: restic leaves a mode of 0 out ("omitempty"), and a
         // regular file's Go mode is its permissions alone: a file without a
@@ -613,7 +629,7 @@ impl LocalDestination {
         extended_attributes: &[ExtendedAttribute],
         _stock_names: bool,
     ) -> LocalDestinationResult<()> {
-        osattrs::set_native_xattrs(&self.path(item)?, extended_attributes)
+        osattrs::set_native_xattrs(&self.sys_path(item)?, extended_attributes)
             .map_err(LocalDestinationErrorKind::XattrsNotSet)
     }
 
@@ -658,7 +674,7 @@ impl LocalDestination {
         stock_names: bool,
         remove_label: bool,
     ) -> LocalDestinationResult<()> {
-        let filename = self.path(item)?;
+        let filename = self.sys_path(item)?;
         // BackOtter: nothing to do where the xattr crate has no support,
         // rather than an error for each file.
         if !xattr::SUPPORTED_PLATFORM {
@@ -706,7 +722,7 @@ impl LocalDestination {
     ) -> LocalDestinationResult<File> {
         // BackOtter: waits for the exit once XFS options are put back for it.
         let _making = crate::commands::restore::making_entries();
-        let filename = self.path(item)?;
+        let filename = self.sys_path(item)?;
         let dir = filename
             .parent()
             .ok_or_else(|| LocalDestinationErrorKind::FileDoesNotHaveParent(filename.clone()))?;
@@ -737,7 +753,7 @@ impl LocalDestination {
     pub(crate) fn open_for_write(&self, item: impl AsRef<Path>) -> LocalDestinationResult<File> {
         // BackOtter: waits for the exit once XFS options are put back for it.
         let _making = crate::commands::restore::making_entries();
-        let filename = self.path(item)?;
+        let filename = self.sys_path(item)?;
         OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -791,7 +807,7 @@ impl LocalDestination {
     ) -> LocalDestinationResult<()> {
         // BackOtter: waits for the exit once XFS options are put back for it.
         let _making = crate::commands::restore::making_entries();
-        let filename = self.path(item)?;
+        let filename = self.sys_path(item)?;
 
         match &node.node_type {
             NodeType::Symlink { .. } => {
@@ -903,7 +919,7 @@ impl LocalDestination {
         offset: u64,
         length: u64,
     ) -> LocalDestinationResult<Bytes> {
-        let filename = self.path(item)?;
+        let filename = self.sys_path(item)?;
         // BackOtter: reading leaves the file's atime alone (open_reading).
         let mut file =
             open_reading(&filename).map_err(LocalDestinationErrorKind::OpeningFileFailed)?;
@@ -937,7 +953,7 @@ impl LocalDestination {
     /// If a file exists and size matches, this returns a `File` open for reading.
     /// In all other cases, returns `None`
     pub fn get_matching_file(&self, item: impl AsRef<Path>, size: u64) -> Option<File> {
-        let filename = self.path(item).ok()?;
+        let filename = self.sys_path(item).ok()?;
         fs::symlink_metadata(&filename).map_or_else(
             |_| None,
             |meta| {
@@ -1029,8 +1045,8 @@ impl LocalDestination {
     ) -> LocalDestinationResult<()> {
         // BackOtter: waits for the exit once XFS options are put back for it.
         let _making = crate::commands::restore::making_entries();
-        let source_path = self.path(source_item)?;
-        let filename = self.path(item)?;
+        let source_path = self.sys_path(source_item)?;
+        let filename = self.sys_path(item)?;
         let dir = filename
             .parent()
             .ok_or_else(|| LocalDestinationErrorKind::FileDoesNotHaveParent(filename.clone()))?;

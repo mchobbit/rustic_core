@@ -46,7 +46,9 @@ impl fmt::Debug for ReadDir {
 /// Opens the directory at `path` for reading, without updating its access
 /// time where the caller may ask for that.
 pub(crate) fn read_dir(path: &Path) -> io::Result<ReadDir> {
-    let c_path = CString::new(path.as_os_str().as_bytes())?;
+    // Past PATH_MAX, through a short path to it (longpath.rs); its entries
+    // keep the long one.
+    let c_path = CString::new(crate::short_path(path).as_os_str().as_bytes())?;
     let how = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
     // SAFETY: c_path is a C string.
     let mut fd = unsafe { libc::open(c_path.as_ptr(), how | libc::O_NOATIME) };

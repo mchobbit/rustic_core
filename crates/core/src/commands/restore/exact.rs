@@ -214,6 +214,8 @@ fn clone_over_with(
 /// symlink or waiting on a FIFO ([`open_regular`]), must hold; and it
 /// mustn't be `dst` itself (by another name too).
 pub(super) fn clone_file(src: &Path, dst: &Path, size: u64) -> Result<(), CloneFailed> {
+    // BackOtter: past PATH_MAX, through short paths to them.
+    let (src, dst) = (&*walkdir::short_path(src), &*walkdir::short_path(dst));
     // BackOtter: waits for the exit once XFS options are put back for it.
     let _making = super::making_entries();
     if !CLONE_SUPPORTED {
@@ -250,7 +252,8 @@ pub(super) fn clone_file(src: &Path, dst: &Path, size: u64) -> Result<(), CloneF
 /// file. True if it is a clone. A clone that failed and left its temporary
 /// file is an error naming it, and `path` stays as it is.
 pub(super) fn break_link(path: &Path) -> io::Result<bool> {
-    break_link_with(path, clone_over)
+    // BackOtter: past PATH_MAX, through short paths to them.
+    break_link_with(&walkdir::short_path(path), clone_over)
 }
 
 /// [`break_link`], cloning with `clone_over` (for tests).
@@ -278,7 +281,9 @@ pub(super) fn has_other_names(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.nlink() > 1)
+        // BackOtter: past PATH_MAX, through a short path to it.
+        std::fs::symlink_metadata(walkdir::short_path(path))
+            .is_ok_and(|m| m.is_file() && m.nlink() > 1)
     }
     #[cfg(not(unix))]
     {
@@ -290,6 +295,8 @@ pub(super) fn has_other_names(path: &Path) -> bool {
 /// What a backup would record for what is at `target` now, if it can all
 /// be read.
 fn node_now(target: &Path) -> Option<Node> {
+    // BackOtter: past PATH_MAX, through short paths to them.
+    let target = &*walkdir::short_path(target);
     let m = std::fs::symlink_metadata(target).ok()?;
     let name = target.file_name().unwrap_or_else(|| OsStr::new(""));
     let incomplete = Incomplete::default();
@@ -303,6 +310,8 @@ fn node_now(target: &Path) -> Option<Node> {
 /// Whether what is at `target` is already `node`'s type: for a special
 /// file, the same symlink target or device.
 pub(super) fn same_type(target: &Path, node: &Node) -> bool {
+    // BackOtter: past PATH_MAX, through short paths to them.
+    let target = &*walkdir::short_path(target);
     let Ok(m) = std::fs::symlink_metadata(target) else {
         return false;
     };
@@ -317,7 +326,11 @@ pub(super) fn same_file(a: &Path, b: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+        // BackOtter: past PATH_MAX, through short paths to them.
+        match (
+            std::fs::symlink_metadata(walkdir::short_path(a)),
+            std::fs::symlink_metadata(walkdir::short_path(b)),
+        ) {
             (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
             _ => false,
         }

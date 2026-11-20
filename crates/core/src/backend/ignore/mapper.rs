@@ -108,7 +108,9 @@ impl LocalSourceSaveOptions {
                 name: name.to_string_lossy().to_string(),
                 source: err,
             })?;
-        let node = self.map_path(entry.path(), name, &m, incomplete, false)?;
+        // BackOtter: an entry past PATH_MAX is read through a short path to
+        // it (walkdir::short_path), and keeps its own.
+        let node = self.map_path(&walkdir::short_path(entry.path()), name, &m, incomplete, false)?;
         let path = entry.into_path();
         // BackOtter: a file with holes is read by its data extents.
         let open = Some(OpenFile::new(path.clone(), osattrs::is_sparse(&node)));

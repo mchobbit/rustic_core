@@ -255,6 +255,43 @@ that either program restores what the other backed up.
   tools. With the default (`mtime`) or `no` the scan runs on every system,
   as in stock rustic. Files' access times are those before the backup read
   them.
+- Paths past `PATH_MAX` (Linux and Android, 0.13.0+backotter.16): a tree
+  deeper than a path a system call takes (4096 bytes, its NUL included) is
+  backed up and restored whole, as tar and rsync keep it. Stock rustic and
+  0.13.0+backotter.15 left out of a backup everything past it, warning
+  ("ignoring error ... File name too long") and exiting 0 without
+  `--strict-exit`, and couldn't restore it (`ENAMETOOLONG`); BackOtter's
+  restic still leaves it out (exit 3). Each system call on such a path
+  goes through `walkdir::short_path` (the vendored walkdir's
+  `src/longpath.rs`): a shorter path to the same file, through a symbolic
+  link to a directory at a prefix of the path (at most 2048 bytes, ending at
+  a component), and links to links for a longer one. The links are in a
+  directory of the process's own (`$TMPDIR/.bko-longpath-PID-N`, mode
+  0700, a new one only it made), removed at exit (`atexit`); one per prefix,
+  so a path always gets the same short path, and followed by name, as the
+  long path's components are, so the short path names what the long one
+  names after the tree changes too. Where no link can be made (no
+  temporary directory), a long path fails as before. Only the system calls
+  take the short paths: the walk's entries, the restore's comparisons with
+  what the destination holds (`--delete`), its aliases and every message
+  keep the long ones, but for errors from `LocalDestination`'s own calls
+  (`sys_path`), which name the short one. The calls so routed: the
+  walker's listing and `lstat` (walkdir: `noatime::read_dir`,
+  `DirEntry::metadata`, `--one-file-system`'s device), a backup's reads of
+  an entry's metadata (`map_path`), contents (`OpenFile::open`) and
+  `--exclude-if-present`/`--exclude-if-xattr`; every `osattrs` function that
+  takes a path; `LocalDestination`'s calls; and the restore's own (`lstat`,
+  removals, `--exact`'s clones and comparisons). `--delete`'s alias check
+  (`no_symlink_to`), which compares canonical paths, and there are none
+  past `PATH_MAX`, looks at each directory below the destination instead
+  (`no_symlink_below`). Not handled: a backed-up path itself (a `backup`
+  argument) or a destination past `PATH_MAX`, `.gitignore` and custom
+  ignore files past it (the ignore crate reads them by path), and the other
+  systems (BSDs, illumos, Haiku: their `PATH_MAX` is 1024), where a long
+  path fails as before. Tested by `test_backup_restore_past_path_max` (a
+  tree of 4.9 KB paths: modes, mtimes, an extended attribute, contents and a
+  symlink, restored, restored again, and with `--delete`) and walkdir's
+  `longpath` tests.
 - A restore looks the owners up by user and group name, falling back to
   the saved uid and gid, as stock rustic does (`--by-name`, or
   `--ownership-by-name`, restic's name for it, says so explicitly);

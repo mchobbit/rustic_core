@@ -209,7 +209,7 @@ impl LocalSource {
                     && tpe.is_dir()
                     && exclude_if_present
                         .iter()
-                        .any(|file| entry.path().join(file).exists())
+                        .any(|file| walkdir::short_path(&entry.path().join(file)).exists())
                 {
                     return false;
                 }
@@ -217,7 +217,7 @@ impl LocalSource {
                 // exclude-if-xattr: skip entries that have a matching xattr
                 #[cfg(not(any(windows, target_os = "openbsd")))]
                 if xattr::SUPPORTED_PLATFORM && !exclude_if_xattr.is_empty() {
-                    match xattr::list(entry.path()) {
+                    match xattr::list(walkdir::short_path(entry.path())) {
                         Ok(mut attrs) => {
                             if attrs.any(|attr| exclude_if_xattr.contains(&attr)) {
                                 return false;
@@ -279,7 +279,8 @@ impl ReadSourceOpen for OpenFile {
     /// * If the file could not be opened.
     fn open(self) -> RusticResult<Self::Reader> {
         let path = self.path;
-        let f = open_noatime(&path).map_err(|err| {
+        // BackOtter: past PATH_MAX, through a short path to it.
+        let f = open_noatime(&walkdir::short_path(&path)).map_err(|err| {
             RusticError::with_source(
                 ErrorKind::InputOutput,
                 "Failed to open file at `{path}`. Please make sure the file exists and is accessible.",

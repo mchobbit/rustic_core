@@ -128,9 +128,12 @@ pub use crate::dent::DirEntry;
 #[cfg(unix)]
 pub use crate::dent::DirEntryExt;
 pub use crate::error::Error;
+// BackOtter: paths past PATH_MAX (longpath.rs).
+pub use crate::longpath::short_path;
 
 mod dent;
 mod error;
+mod longpath;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod noatime;
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -652,7 +655,8 @@ impl Ancestor {
     /// the same directory as this ancestor.
     #[cfg(not(windows))]
     fn is_same(&self, child: &Handle) -> io::Result<bool> {
-        Ok(child == &Handle::from_path(&self.path)?)
+        // BackOtter: through a short path past PATH_MAX.
+        Ok(child == &Handle::from_path(short_path(&self.path))?)
     }
 }
 
@@ -878,7 +882,8 @@ impl IntoIter {
             // the follow_links setting. When it's disabled, it should report
             // itself as a symlink. When it's enabled, it should always report
             // itself as the target.
-            let md = itry!(fs::metadata(dent.path()).map_err(|err| {
+            // BackOtter: through a short path past PATH_MAX.
+            let md = itry!(fs::metadata(short_path(dent.path())).map_err(|err| {
                 Error::from_path(dent.depth(), dent.path().to_path_buf(), err)
             }));
             if md.file_type().is_dir() {
@@ -986,7 +991,8 @@ impl IntoIter {
     }
 
     fn check_loop<P: AsRef<Path>>(&self, child: P) -> Result<()> {
-        let hchild = Handle::from_path(&child)
+        // BackOtter: through a short path past PATH_MAX.
+        let hchild = Handle::from_path(short_path(child.as_ref()))
             .map_err(|err| Error::from_io(self.depth, err))?;
         for ancestor in self.stack_path.iter().rev() {
             let is_same = ancestor

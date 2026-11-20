@@ -130,6 +130,8 @@ use other as os;
 /// (left out of the node), which BackOtter's restic counts toward its exit
 /// status 3.
 pub(crate) fn fill(path: &Path, node: &mut Node, m: &std::fs::Metadata, xattrs: bool) -> bool {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     let mut incomplete = false;
     // On Linux, the one open of the file for its flags, project ID and holes;
     // on illumos, of its system attribute view.
@@ -252,6 +254,8 @@ pub(crate) fn is_quarantined(node: &Node) -> bool {
 /// `EACCES`, as for a file illumos quarantined ([`is_quarantined`]). It is
 /// opened and closed, nothing more.
 pub(crate) fn open_refused(path: &Path) -> bool {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     match File::open(path) {
         Ok(_) => false,
         #[cfg(unix)]
@@ -268,6 +272,8 @@ pub(crate) fn open_refused(path: &Path) -> bool {
 /// extended attributes, which couldn't be read either, are left out; the
 /// rest of its metadata is kept. A warning names it.
 pub(crate) fn keep_unread(path: &Path, node: &mut Node) {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     let size = node.meta.size;
     node.content = Some(Vec::new());
     node.meta.size = 0;
@@ -328,6 +334,8 @@ pub(crate) fn takes_nothing_before_data(node: &Node) -> bool {
 }
 
 pub(crate) fn prepare_file(path: &Path, node: &Node) -> io::Result<()> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     // BackOtter: it creates the file when there is none, so it waits for the
     // exit once XFS options are put back.
     let _making = crate::commands::restore::making_entries();
@@ -367,6 +375,8 @@ pub(crate) fn prepare_file(path: &Path, node: &Node) -> io::Result<()> {
 /// and project ID too, which bcachefs passes only to entries created after
 /// them, as BackOtter's restic does (`linux::prepare_dir_for_options`).
 pub(crate) fn prepare_dir(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     if os::FLAGS_BEFORE_ENTRIES == 0 {
         return Ok(());
     }
@@ -427,6 +437,8 @@ pub(crate) const fn scan_moves_saved_atimes(real_atimes: bool, listing_keeps_ati
 /// securelevel above 0, not root) is only logged: what the restore does
 /// next to the file fails and says why.
 pub(crate) fn clear_restricting_flags(path: &Path) {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     match os::clear_restricting_flags(path) {
         Err(err) if err.kind() != io::ErrorKind::NotFound => {
             debug!("restricting flags of {} not cleared: {err}", path.display());
@@ -551,6 +563,8 @@ impl HeldFlags {
 /// wasn't, sets them again through that descriptor (`fchflags`, Linux's
 /// ioctls). As in BackOtter's restic (`ClearRestrictingFlagsHeld`).
 pub(crate) fn clear_restricting_flags_held(path: &Path) -> HeldFlags {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     #[cfg(target_os = "linux")]
     let held = os::clear_restricting_flags_held(path);
     #[cfg(any(
@@ -604,6 +618,8 @@ pub(crate) fn restore_file_flags(
     flags: u32,
     xattrs: &[ExtendedAttribute],
 ) -> io::Result<()> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     os::restore_file_flags(path, node_type, flags, xattrs)
 }
 
@@ -622,6 +638,8 @@ pub(crate) fn restore_zfs_dos_flags(
     node_type: &NodeType,
     flags: u64,
 ) -> io::Result<()> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     os::restore_zfs_dos_flags(path, node_type, flags)
 }
 
@@ -634,6 +652,8 @@ pub(crate) fn restore_zfs_dos_flags(
 /// * If they couldn't be set: an [`Unsupported`] error if the file system
 ///   isn't FAT, or refuses them as unsupported.
 pub(crate) fn restore_fat_attrs(path: &Path, node_type: &NodeType, attrs: u32) -> io::Result<()> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     #[cfg(target_os = "linux")]
     return os::restore_fat_attrs(path, node_type, attrs);
     #[cfg(not(target_os = "linux"))]
@@ -650,6 +670,8 @@ pub(crate) fn restore_fat_attrs(path: &Path, node_type: &NodeType, attrs: u32) -
 /// in the late pass where the directory's node has none. Only on XFS; an
 /// error leaves the directory as it is. Elsewhere nothing.
 pub(crate) fn clear_dir_xfs_options(path: &Path) -> Option<XfsOptions> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     #[cfg(target_os = "linux")]
     return os::clear_dir_xfs_options(path);
     #[cfg(not(target_os = "linux"))]
@@ -675,6 +697,8 @@ pub(crate) fn restore_xfs_options(
     node_type: &NodeType,
     opts: &XfsOptions,
 ) -> io::Result<()> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     #[cfg(target_os = "linux")]
     return os::restore_xfs_options(path, node_type, opts);
     #[cfg(not(target_os = "linux"))]
@@ -772,6 +796,8 @@ pub(crate) struct FilledHoles {
 /// end of a file, and nothing is written into a file whose contents are
 /// right already.
 pub(crate) fn fill_holes(path: &Path, len: u64) -> FilledHoles {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     #[cfg(any(target_os = "linux", target_os = "android"))]
     return sparse::fill_holes(path, len);
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -786,6 +812,8 @@ pub(crate) fn fill_holes(path: &Path, len: u64) -> FilledHoles {
 /// `restore --dry-run`, which counts such a file as one to modify, as
 /// BackOtter's restic does.
 pub(crate) fn holes_to_fill(path: &Path, len: u64) -> bool {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     #[cfg(any(target_os = "linux", target_os = "android"))]
     return sparse::holes_to_fill(path, len);
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -1166,6 +1194,8 @@ pub(crate) fn report_unsupported() {
 /// * If the owner couldn't be set, or a SID couldn't be mapped (a
 ///   [`SidUnmapped`] error: the file got nobody instead).
 pub(crate) fn restore_owner(path: &Path, node: &Node) -> io::Result<()> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     os::restore_owner(path, node)
 }
 
@@ -1182,6 +1212,8 @@ pub(crate) fn restore_owner(path: &Path, node: &Node) -> io::Result<()> {
 /// (`known_bko`), which bcachefs then gets where the file inherited another;
 /// in any other snapshot the file keeps the one it has or inherited.
 pub(crate) fn restore_attributes(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     warn_unknown(node);
     #[cfg(target_os = "linux")]
     return os::restore_attributes(path, node, known_bko);
@@ -1199,6 +1231,8 @@ pub(crate) fn restore_attributes(path: &Path, node: &Node, known_bko: bool) -> i
 ///
 /// * If an ACL couldn't be set.
 pub(crate) fn restore_acls(path: &Path, node: &Node) -> io::Result<()> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     os::restore_acls(path, node)
 }
 
@@ -1212,6 +1246,8 @@ pub(crate) fn restore_acls(path: &Path, node: &Node) -> io::Result<()> {
 ///
 /// * If the birth time couldn't be set.
 pub(crate) fn restore_birthtime(path: &Path, node: &Node) -> io::Result<()> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     let Some(birth) = node.meta.generic_attributes.timestamp(UNIX_BIRTHTIME) else {
         return Ok(());
     };
@@ -1278,6 +1314,8 @@ fn lower_birthtime(path: &Path, node: &Node, birth: Timestamp) -> io::Result<()>
 /// * If the times can't be set.
 #[cfg(target_os = "dragonfly")]
 pub(crate) fn set_times(path: &Path, atime: Timestamp, mtime: Timestamp) -> io::Result<()> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     utimensat_nofollow(path, Some(atime), Some(mtime))
 }
 
@@ -1292,6 +1330,8 @@ pub(crate) fn set_times(path: &Path, atime: Timestamp, mtime: Timestamp) -> io::
 /// * If the atime can't be set.
 #[cfg(target_os = "netbsd")]
 pub(crate) fn set_atime(path: &Path, atime: Timestamp) -> io::Result<()> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     utimensat_nofollow(path, Some(atime), None)
         .map_err(|err| path_error("utimensat (atime)", path, &err))
 }
@@ -1356,6 +1396,8 @@ fn unix_time(t: Timestamp) -> (i64, u32) {
 ///
 /// * If the permissions couldn't be set.
 pub(crate) fn restore_symlink_mode(path: &Path, node: &Node) -> io::Result<()> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     os::restore_symlink_mode(path, node)
 }
 
@@ -1370,6 +1412,8 @@ pub(crate) fn restore_symlink_mode(path: &Path, node: &Node) -> io::Result<()> {
 ///   neither illumos nor Haiku.
 #[cfg_attr(not(any(target_os = "illumos", target_os = "haiku")), allow(dead_code))]
 pub(crate) fn native_xattrs(path: &Path) -> io::Result<XattrsRead> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     // BackOtter: on illumos, one whose value can't be read is left out
     // alone (in `unreadable`), as BackOtter's restic does.
     #[cfg(target_os = "illumos")]
@@ -1391,6 +1435,8 @@ pub(crate) fn set_native_xattrs(
     path: &Path,
     attrs: &[ExtendedAttribute],
 ) -> Result<(), XattrErrors> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     os::set_xattrs(path, attrs)
 }
 
@@ -1405,6 +1451,8 @@ pub(crate) fn set_native_xattrs(
 /// * If they can't be listed.
 #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
 pub(crate) fn xattr_list(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     let names = freebsd_netbsd::user_extattr_names(path)?
         .into_iter()
@@ -1427,6 +1475,8 @@ pub(crate) fn xattr_list(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
 /// * If it can't be read.
 #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
 pub(crate) fn xattr_get(path: &Path, name: &std::ffi::OsStr) -> io::Result<Option<Vec<u8>>> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     #[cfg(target_os = "linux")]
     return os::xattr_get(path, name);
     #[cfg(not(target_os = "linux"))]
