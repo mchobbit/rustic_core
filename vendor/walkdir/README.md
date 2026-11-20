@@ -12,7 +12,11 @@ directory's metadata is taken before it is listed and kept in its entry
 (`DirEntry::keep_metadata`), for `metadata()` to give: where a listing
 moves the access time (no `O_NOATIME`: FreeBSD and the other BSDs,
 illumos, Haiku), a backup keeps the one it had. Each change is marked
-`BackOtter:`. Everything else is walkdir as released.
+`BackOtter:`. And on Linux and Android a path of `PATH_MAX` bytes or
+more is listed and looked up through a shorter path to it
+(`src/longpath.rs`, `short_path`, which BackOtter's rustic_core uses for its
+own system calls too), so that a walk goes past `PATH_MAX`. Everything else
+is walkdir as released.
 A cross platform Rust library for efficiently walking a directory recursively.
 Comes with support for following symbolic links, controlling the number of
 open file descriptors and efficient mechanisms for pruning the entries in the

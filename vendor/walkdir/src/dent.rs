@@ -151,10 +151,12 @@ impl DirEntry {
         if let Some(md) = &self.listed_metadata {
             return Ok(md.clone());
         }
+        // BackOtter: through a short path past PATH_MAX.
+        let path = crate::short_path(&self.path);
         if self.follow_link {
-            fs::metadata(&self.path)
+            fs::metadata(&path)
         } else {
-            fs::symlink_metadata(&self.path)
+            fs::symlink_metadata(&path)
         }
         .map_err(|err| Error::from_entry(self, err))
     }
@@ -300,11 +302,13 @@ impl DirEntry {
     ) -> Result<DirEntry> {
         use std::os::unix::fs::MetadataExt;
 
+        // BackOtter: through a short path past PATH_MAX.
+        let short = crate::short_path(&pb);
         let md = if follow {
-            fs::metadata(&pb)
+            fs::metadata(&short)
                 .map_err(|err| Error::from_path(depth, pb.clone(), err))?
         } else {
-            fs::symlink_metadata(&pb)
+            fs::symlink_metadata(&short)
                 .map_err(|err| Error::from_path(depth, pb.clone(), err))?
         };
         Ok(DirEntry {
@@ -357,7 +361,8 @@ fn file_type(path: &Path, d_type: u8) -> std::io::Result<FileType> {
     if let Some(ty) = known.and_then(OnceLock::get) {
         return Ok(*ty);
     }
-    let ty = fs::symlink_metadata(path)?.file_type();
+    // Through a short path past PATH_MAX (longpath.rs).
+    let ty = fs::symlink_metadata(crate::short_path(path))?.file_type();
     // Keep it only if it is what d_type says: the entry may have been
     // replaced by another type of file since it was read.
     let of_ty = match () {

@@ -1316,3 +1316,131 @@ fn test_restore_exact_delete_link_group_in_the_way(set_up_repo: Result<RepoOpen>
     assert_eq!(fs::metadata(d.join("a"))?.nlink(), 2);
     Ok(())
 }
+
+/// BackOtter: the directories below `top` named by `names`, one in the
+/// other, opened by descriptors (a path that deep is too long for a system
+/// call): each one's, `top`'s first.
+#[cfg(target_os = "linux")]
+fn open_chain(top: &Path, names: &[String]) -> Result<Vec<std::os::fd::OwnedFd>> {
+    use nix::fcntl::{OFlag, open, openat};
+    use nix::sys::stat::Mode;
+
+    let how = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let mut fds = vec![open(top, how, Mode::empty())?];
+    for name in names {
+        let fd = openat(fds.last().unwrap(), name.as_str(), how, Mode::empty())
+            .map_err(|err| anyhow::anyhow!("{name}: {err}"))?;
+        fds.push(fd);
+    }
+    Ok(fds)
+}
+
+/// BackOtter: the file `name` in the directory `dir`, opened by `how`
+/// (`O_NOFOLLOW` too), with `mode` if it is made.
+#[cfg(target_os = "linux")]
+fn file_at(
+    dir: &std::os::fd::OwnedFd,
+    name: &str,
+    how: nix::fcntl::OFlag,
+    mode: u32,
+) -> Result<File> {
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+
+    let how = how | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    Ok(File::from(openat(dir, name, how, Mode::from_bits_truncate(mode))?))
+}
+
+/// BackOtter (BackShot2's fail-001): a tree deeper than a path a system
+/// call takes (`PATH_MAX`, 4096 bytes) is backed up whole, and restored
+/// whole, each directory and the file at the bottom with their metadata (a
+/// mode, an mtime, an extended attribute) and contents, and a symlink;
+/// then restored again over itself, and with `--delete` over an unexpected
+/// file at the bottom, which goes. rustic-bko 0.11.4+backotter.16 left out
+/// of the backup everything past `PATH_MAX`, with a warning, and exited 0;
+/// its restore couldn't make it either (`ENAMETOOLONG`).
+#[rstest]
+#[cfg(target_os = "linux")]
+fn test_backup_restore_past_path_max(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    use std::io::Read;
+    use std::time::{Duration, SystemTime};
+
+    use nix::fcntl::{AtFlags, OFlag, readlinkat};
+    use nix::sys::stat::{FileStat, Mode, fstat, fstatat, mkdirat};
+    use rustic_core::PathList;
+    use xattr::FileExt;
+
+    let source = tempdir()?;
+    let names: Vec<String> = (0..120).map(|i| format!("d{i:03}{}", "x".repeat(36))).collect();
+    let deep: PathBuf = names.iter().collect();
+    assert!(source.path().join(&deep).as_os_str().len() > 4096);
+    // The tree, made through descriptors.
+    for (i, name) in names.iter().enumerate() {
+        let fds = open_chain(source.path(), &names[..i])?;
+        let mode = if i % 2 == 0 { 0o750 } else { 0o705 };
+        mkdirat(fds.last().unwrap(), name.as_str(), Mode::from_bits_truncate(mode))?;
+    }
+    let fds = open_chain(source.path(), &names)?;
+    let bottom = fds.last().unwrap();
+    let mut leaf = file_at(bottom, "leaf", OFlag::O_WRONLY | OFlag::O_CREAT, 0o640)?;
+    leaf.write_all(b"deep down")?;
+    if leaf.set_xattr("user.bko", b"otter").is_err() {
+        eprintln!("no user xattrs in {}", source.path().display());
+        return Ok(());
+    }
+    let mtime = SystemTime::UNIX_EPOCH + Duration::new(1_600_000_000, 123_456_789);
+    leaf.set_times(fs::FileTimes::new().set_modified(mtime).set_accessed(mtime))?;
+    drop(leaf);
+    nix::unistd::symlinkat("leaf", bottom, "lnk")?;
+    let times = |st: &FileStat| (st.st_mode, st.st_mtime, st.st_mtime_nsec);
+    let want: Vec<_> = fds.iter().map(|fd| fstat(fd).map(|st| times(&st))).collect::<Result<_, _>>()?;
+    let want_leaf = times(&fstatat(bottom, "leaf", AtFlags::AT_SYMLINK_NOFOLLOW)?);
+    drop(fds);
+
+    let repo = set_up_repo?.to_indexed_ids()?;
+    let opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
+    let paths = PathList::from_iter(Some(source.path().to_path_buf()));
+    let snap = repo.backup(&opts, &paths, SnapshotFile::default())?;
+    assert_eq!(snap.summary.as_ref().map(|s| s.items_incomplete), Some(0));
+    let repo = repo.to_indexed()?;
+    let node = repo.node_from_snapshot_path("latest", |_| true)?;
+    let listed: Vec<PathBuf> = repo
+        .ls(&node, &LsOptions::default())?
+        .map(|item| item.map(|(p, _)| p))
+        .collect::<Result<_, _>>()?;
+    let test = PathBuf::from("test");
+    assert!(listed.contains(&test.join(&deep).join("leaf")), "{} entries", listed.len());
+    assert!(listed.contains(&test.join(&deep).join("lnk")));
+
+    let target = tempdir()?;
+    let check = || -> Result<()> {
+        let fds = open_chain(&target.path().join("test"), &names)?;
+        for (i, (fd, want)) in fds.iter().zip(&want).enumerate().skip(1) {
+            assert_eq!(times(&fstat(fd)?), *want, "mode and mtime of directory {i}");
+        }
+        let bottom = fds.last().unwrap();
+        assert_eq!(times(&fstatat(bottom, "leaf", AtFlags::AT_SYMLINK_NOFOLLOW)?), want_leaf);
+        let mut leaf = file_at(bottom, "leaf", OFlag::O_RDONLY, 0)?;
+        let mut data = String::new();
+        _ = leaf.read_to_string(&mut data)?;
+        assert_eq!(data, "deep down");
+        assert_eq!(leaf.get_xattr("user.bko")?, Some(b"otter".to_vec()));
+        assert_eq!(readlinkat(bottom, "lnk")?, "leaf");
+        assert!(fstatat(bottom, "extra", AtFlags::AT_SYMLINK_NOFOLLOW).is_err(), "extra left");
+        Ok(())
+    };
+    assert_eq!(restore_counting(&repo, target.path(), RestoreOptions::default())?, 0);
+    check()?;
+
+    // Again over it, as it is.
+    assert_eq!(restore_counting(&repo, target.path(), RestoreOptions::default())?, 0);
+    check()?;
+
+    // And with --delete, over a file the snapshot hasn't got at the bottom.
+    let fds = open_chain(&target.path().join("test"), &names)?;
+    drop(file_at(fds.last().unwrap(), "extra", OFlag::O_WRONLY | OFlag::O_CREAT, 0o600)?);
+    drop(fds);
+    let delete = RestoreOptions::default().delete(true);
+    assert_eq!(restore_counting(&repo, target.path(), delete)?, 0);
+    check()
+}

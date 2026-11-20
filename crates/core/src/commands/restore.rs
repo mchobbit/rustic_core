@@ -785,7 +785,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
         let fresh = if dry_run {
             !exists
         } else {
-            matches!(std::fs::symlink_metadata(target),
+            matches!(std::fs::symlink_metadata(walkdir::short_path(target)),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound)
         };
         if fresh && !dry_run {
@@ -922,9 +922,16 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
         let (Some(canonical), Some(parent)) = (&canonical_dest, target.parent()) else {
             return false;
         };
-        parent
-            .strip_prefix(&dest_path)
-            .is_ok_and(|rel| parent.canonicalize().is_ok_and(|c| c == canonical.join(rel)))
+        parent.strip_prefix(&dest_path).is_ok_and(|rel| match parent.canonicalize() {
+            Ok(c) => c == canonical.join(rel),
+            // BackOtter: past PATH_MAX, which no canonical path is given
+            // for (ENAMETOOLONG): each directory below the destination looked
+            // at, through a short path to it.
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidFilename => {
+                no_symlink_below(&dest_path, rel)
+            }
+            Err(_) => false,
+        })
     };
     let mut aliases = Aliases::default();
 
@@ -933,7 +940,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
         let mut exists = exists;
         if may_alias && !exists && matches!(node.node_type, NodeType::Dir | NodeType::File) {
             let below = aliases.below_alias(&target);
-            if let Ok(meta) = std::fs::symlink_metadata(&target)
+            if let Ok(meta) = std::fs::symlink_metadata(walkdir::short_path(&target))
                 && (below || no_symlink_to(&target))
             {
                 debug!("{} is there under another name", target.display());
@@ -964,7 +971,8 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                     // gets them last): realtime inheritance would make its
                     // new regular files realtime, on an XFS with a realtime
                     // device, for good once they have data.
-                    let is_dir = std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir());
+                    let is_dir = std::fs::symlink_metadata(walkdir::short_path(&target))
+                        .is_ok_and(|m| m.is_dir());
                     if !dry_run && is_dir {
                         dirs.borrow_mut().note(&target, path, osattrs::node_sets_flags(node, known_bko));
                     }
@@ -974,7 +982,8 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                     // its metadata already match (--exact).
                     if !dry_run
                         && is_dir
-                        && std::fs::read_dir(&target).is_ok_and(|mut dir| dir.next().is_none())
+                        && std::fs::read_dir(walkdir::short_path(&target))
+                            .is_ok_and(|mut dir| dir.next().is_none())
                         && !(opts.exact
                             && exact::already_matches(&target, node, numeric, owned, known_bko))
                     {
@@ -1051,7 +1060,10 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                     // restic: a file there may be quarantined, which keeps
                     // its contents and extended attributes closed to the
                     // restore too.
-                    if !dry_run && std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_file()) {
+                    if !dry_run
+                        && std::fs::symlink_metadata(walkdir::short_path(&target))
+                            .is_ok_and(|m| m.is_file())
+                    {
                         dirs.borrow_mut().change_parent(&target);
                         let sets = osattrs::node_sets_flags(node, known_bko);
                         let (removed, put_back) =
@@ -1517,7 +1529,7 @@ fn link_name(
             ));
         }
     }
-    let in_the_way = std::fs::symlink_metadata(&target).is_ok();
+    let in_the_way = std::fs::symlink_metadata(walkdir::short_path(&target)).is_ok();
     let replaced = RefCell::new(Replaced::default());
     let (linked, put_back) = remove_held(&target, sets && in_the_way, &replaced, |_| {
         dest.hard_link(canonical, path)
@@ -2217,7 +2229,7 @@ impl LinkGroup {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            std::fs::symlink_metadata(&self.target).is_ok_and(|m| {
+            std::fs::symlink_metadata(walkdir::short_path(&self.target)).is_ok_and(|m| {
                 m.is_file() && m.nlink() == 1 + self.others.len() as u64
             }) && self
                 .others
@@ -2246,7 +2258,7 @@ fn file_id(path: &Path) -> Option<((u64, u64), bool)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        std::fs::symlink_metadata(path)
+        std::fs::symlink_metadata(walkdir::short_path(path))
             .ok()
             .filter(|m| !m.is_dir())
             .map(|m| ((m.dev(), m.ino()), m.nlink() > 1))
@@ -2273,6 +2285,8 @@ fn remove_held(
     replaced: &RefCell<Replaced>,
     remove: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> (std::io::Result<()>, std::io::Result<()>) {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let target = &*walkdir::short_path(target);
     if !sets_flags {
         return (remove(target), Ok(()));
     }
@@ -2298,6 +2312,8 @@ fn remove_held(
 ///
 /// * If it couldn't be removed, or the flags couldn't be put back.
 fn remove_extra(path: &Path, replaced: &RefCell<Replaced>) -> std::io::Result<()> {
+    // BackOtter: past PATH_MAX, through a short path to it.
+    let path = &*walkdir::short_path(path);
     if !file_id(path).is_some_and(|(id, _)| replaced.borrow().0.contains(&id)) {
         return std::fs::remove_file(path);
     }
@@ -2354,13 +2370,28 @@ impl Aliases {
     }
 }
 
+/// BackOtter: whether each component of `rel`, below `dest`, is a
+/// directory, not a symlink to one: what a canonical path shows, for a path
+/// past `PATH_MAX`, which has none (`process_node`'s `no_symlink_to`).
+fn no_symlink_below(dest: &Path, rel: &Path) -> bool {
+    let mut path = dest.to_path_buf();
+    rel.components().all(|c| {
+        path.push(c);
+        matches!(c, std::path::Component::Normal(_))
+            && std::fs::symlink_metadata(walkdir::short_path(&path)).is_ok_and(|m| m.is_dir())
+    })
+}
+
 /// BackOtter: whether `a` and `b` are the same entry, the same device and
 /// inode, not following a symlink; a directory too.
 fn same_entry(a: &Path, b: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+        match (
+            std::fs::symlink_metadata(walkdir::short_path(a)),
+            std::fs::symlink_metadata(walkdir::short_path(b)),
+        ) {
             (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
             _ => false,
         }
@@ -2388,7 +2419,7 @@ fn remove_unexpected(
     dirs: &RefCell<DirChanges>,
     replaced: &RefCell<Replaced>,
 ) -> std::io::Result<()> {
-    if std::fs::symlink_metadata(path)
+    if std::fs::symlink_metadata(walkdir::short_path(path))
         .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
     {
         return Ok(());
@@ -2406,11 +2437,11 @@ fn remove_unexpected(
     debug!("{} left: it is {}", path.display(), target.display());
     // A directory the walk saw there may since have been replaced by the
     // snapshot's file of that name: that stays, as a whole.
-    if !is_dir || !std::fs::symlink_metadata(target).is_ok_and(|m| m.is_dir()) {
+    if !is_dir || !std::fs::symlink_metadata(walkdir::short_path(target)).is_ok_and(|m| m.is_dir()) {
         return Ok(());
     }
     let mut first = None;
-    for entry in std::fs::read_dir(target)? {
+    for entry in std::fs::read_dir(walkdir::short_path(target))? {
         let removed = entry.and_then(|entry| {
             let child = target.join(entry.file_name());
             let child_dir = entry.file_type()?.is_dir();
@@ -2440,7 +2471,9 @@ fn remove_tree(dir: &Path, replaced: &RefCell<Replaced>) -> std::io::Result<()> 
     for entry in WalkDir::new(dir).follow_links(false).contents_first(true) {
         let result = match &entry {
             Err(err) => Err(std::io::Error::other(err.to_string())),
-            Ok(entry) if entry.file_type().is_dir() => std::fs::remove_dir(entry.path()),
+            Ok(entry) if entry.file_type().is_dir() => {
+                std::fs::remove_dir(walkdir::short_path(entry.path()))
+            }
             Ok(entry) => remove_extra(entry.path(), replaced),
         };
         match result {
