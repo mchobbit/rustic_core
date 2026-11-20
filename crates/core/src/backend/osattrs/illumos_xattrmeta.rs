@@ -7,10 +7,41 @@
 
 #![cfg_attr(not(target_os = "illumos"), allow(dead_code))]
 
+use std::io;
+
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use super::illumos_acl::AceEntry;
+
+/// The system attribute views in every attribute directory, which aren't
+/// extended attributes of their own.
+pub(super) const SYSTEM_VIEWS: [&str; 2] = ["SUNWattr_ro", "SUNWattr_rw"];
+
+/// Why the extended attribute `name`, a snapshot's, isn't set or given its
+/// metadata, or `None` for one that names an attribute file. An attribute's
+/// name is a path relative to its file's attribute directory, where `..` is
+/// the file itself (`fsattr(7)`): `..` would be the file truncated and
+/// written, its owner and mode changed, and a name with a `/` can lead
+/// out of the attribute directory to anywhere in the tree. So an empty name,
+/// `.`, `..`, one with a `/` or a NUL and the system attribute views are
+/// refused. An attribute on illumos can't be named so; a crafted snapshot,
+/// or another system's (a Linux name can hold a `/`), can hold one.
+pub(super) fn attr_name_refused(name: &str) -> Option<io::Error> {
+    let why = if name.is_empty() || name == "." || name == ".." {
+        "not an attribute file's name"
+    } else if name.contains(['/', '\0']) {
+        "a name with a '/' or a NUL"
+    } else if SYSTEM_VIEWS.contains(&name) {
+        "a system attribute view"
+    } else {
+        return None;
+    };
+    Some(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("not restored on illumos: {why}"),
+    ))
+}
 
 /// The metadata of one attribute file. The times are in UTC, in the form of
 /// a node's mtime; the ACL is there only when it says more than the mode
@@ -32,6 +63,17 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    #[test]
+    fn attr_names_refused() {
+        for name in ["", ".", "..", "../x", "a/b", "/etc/x", "a\0b", "SUNWattr_ro", "SUNWattr_rw"] {
+            let err = attr_name_refused(name).unwrap_or_else(|| panic!("{name:?} allowed"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{name:?}");
+        }
+        for name in ["a", "user.x", "...", "..x", ".hidden", "\u{fffd}", "SUNWattr_rw2"] {
+            assert!(attr_name_refused(name).is_none(), "{name:?} refused");
+        }
+    }
 
     #[test]
     fn xattr_meta_json() {

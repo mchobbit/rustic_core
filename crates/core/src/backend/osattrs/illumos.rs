@@ -38,7 +38,7 @@ use super::{
     illumos_idmap,
     illumos_project::ZfsProject,
     illumos_sysattr::{self, View},
-    illumos_xattrmeta::XattrMeta,
+    illumos_xattrmeta::{SYSTEM_VIEWS, XattrMeta, attr_name_refused},
     path_error, set_flags_best_effort, unix_time,
 };
 use crate::backend::node::{
@@ -650,10 +650,6 @@ fn birthtime_unsupported(err: &io::Error) -> bool {
     )
 }
 
-/// The system attribute views in every attribute directory, which aren't
-/// extended attributes of their own.
-const SYSTEM_VIEWS: [&str; 2] = ["SUNWattr_ro", "SUNWattr_rw"];
-
 /// Opens the attribute directory of the file at `path`, a regular file or
 /// directory. `None` for other types of file, which have none worth keeping
 /// (and opening a device could have side effects), and on a file system
@@ -778,7 +774,8 @@ fn attr_has_value(dir: &File, name: &str, want: &[u8]) -> bool {
 /// removed, as in BackOtter's restic: each failure is returned, by name.
 /// One the file has already, with its node's value, is left as it is, as on
 /// every other system and in BackOtter's restic; one that can't be read is
-/// written.
+/// written. One whose name isn't an attribute file's, such as `..`, is
+/// refused ([`attr_name_refused`]).
 pub(super) fn set_xattrs(path: &Path, attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
     let Some(dir) = attr_dir(path)? else {
         // Each one named, as those that can't be set are.
@@ -817,6 +814,11 @@ pub(super) fn set_xattrs(path: &Path, attrs: &[ExtendedAttribute]) -> Result<(),
         }
     };
     for a in attrs {
+        // Never a path out of the attribute directory.
+        if let Some(err) = attr_name_refused(&a.name) {
+            errors.push(a.name.as_str(), err);
+            continue;
+        }
         let value = a.value.as_deref().unwrap_or_default();
         if present.contains(&a.name) && attr_has_value(&dir, &a.name, value) {
             continue;
@@ -952,6 +954,10 @@ fn restore_one_xattr_meta(
     unmapped: &mut Option<io::Error>,
 ) -> io::Result<()> {
     let at = attr_path(path, name);
+    // Never a path out of the attribute directory.
+    if let Some(err) = attr_name_refused(name) {
+        return Err(path_error("extended attribute metadata", &at, &err));
+    }
     let n = CString::new(name)?;
     let fd = dir.as_raw_fd();
     // SAFETY: n is a C string.
@@ -1057,5 +1063,31 @@ mod tests {
                 xattr("same", b"v"),
             ]
         );
+    }
+
+    /// BackOtter: a snapshot's attribute named `..` (the file itself, in
+    /// its attribute directory) or with a `/` is refused, and the others
+    /// are still set: neither the file nor anything outside the attribute
+    /// directory is written.
+    #[test]
+    fn set_xattrs_refuses_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"data").unwrap();
+        if set_xattrs(&file, &[xattr("probe", b"")]).is_err() {
+            eprintln!("no extended attributes in {}", dir.path().display());
+            return;
+        }
+        let attrs = [xattr("..", b"X"), xattr("../x", b"y"), xattr("ok", b"v")];
+        let err = set_xattrs(&file, &attrs).unwrap_err();
+        assert!(err.counts(true), "{err}");
+        assert_eq!(err.to_string().matches("not restored on illumos").count(), 2, "{err}");
+        assert_eq!(std::fs::read(&file).unwrap(), b"data");
+        assert!(!dir.path().join("x").exists());
+        assert_eq!(xattrs_read(&file).unwrap().attrs, [xattr("ok", b"v")]);
+        let sub = dir.path().join("d");
+        std::fs::create_dir(&sub).unwrap();
+        assert!(set_xattrs(&sub, &[xattr("../x", b"y")]).is_err());
+        assert!(!dir.path().join("x").exists());
     }
 }
