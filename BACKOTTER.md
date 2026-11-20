@@ -427,7 +427,12 @@ that either program restores what the other backed up.
   BackOtter's snapshots keep the bare names.
 - On FreeBSD and NetBSD the user namespace is listed directly: the xattr
   crate (1.6) names the last attribute of the system namespace as one of
-  the user namespace, which a restore then creates, empty.
+  the user namespace, which a restore then creates, empty. Both namespaces'
+  values are read by their names' bytes; a node keeps a name that isn't
+  UTF-8 with U+FFFD for what isn't, as a Linux one and as BackOtter's
+  restic's JSON keep it (0.13.0+backotter.18; before, such a name read a
+  name that doesn't exist, so a user attribute kept no value and a system
+  one was dropped).
 - On illumos, extended attributes are named attribute files (`runat(1)`),
   which the xattr crate doesn't support: they are read and written through
   `openat(2)` with `O_XATTR`, without the `SUNWattr_ro` and `SUNWattr_rw`
@@ -442,7 +447,12 @@ that either program restores what the other backed up.
   leaves them) and flags. A snapshot without the attribute restores as
   before. An attribute the file has already, with its node's value, is
   left as it is (read and compared first; only one of the same size is
-  read), as on every other system and in BackOtter's restic.
+  read), as on every other system and in BackOtter's restic. A snapshot's
+  attribute whose name isn't an attribute file's (empty, `.`, `..`, which
+  is the file itself there, one with a `/` or a NUL, a system attribute
+  view) is neither set nor given its metadata, a warning
+  (0.13.0+backotter.18; before, `..` truncated and wrote the file and a `/`
+  led out of the attribute directory).
 - FreeBSD ZFS project IDs (`freebsd.zfs_project`) are restored with the
   system extended attributes, before the flags, as each node's own ID and
   inheritance, as on illumos; on UFS (`ENOTTY`) they get one warning per
