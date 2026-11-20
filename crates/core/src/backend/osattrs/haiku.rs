@@ -111,13 +111,15 @@ impl AttrFile for Attributes {
                     Err(err)
                 };
             }
-            // SAFETY: d_name is a C string, valid until the next
-            // fs_read_attr_dir.
-            names.push(
-                unsafe { CStr::from_ptr((*e).d_name.as_ptr()) }
-                    .to_bytes()
-                    .to_vec(),
-            );
+            // SAFETY: e is the entry fs_read_attr_dir just gave, valid until
+            // the next. Haiku's record is only as long as its name (d_name[1]
+            // in its header, 1024 bytes in libc's), so the name is read
+            // through a pointer taken from e itself, never a reference to
+            // libc's array, which could reach past the record.
+            let name_ptr = unsafe { &raw const (*e).d_name }.cast();
+            // SAFETY: d_name is a C string NUL-terminated inside the record,
+            // which is valid until the next fs_read_attr_dir.
+            names.push(unsafe { CStr::from_ptr(name_ptr) }.to_bytes().to_vec());
         };
         // SAFETY: dir is an open attribute directory, closed once.
         _ = unsafe { libc::fs_close_attr_dir(dir) };

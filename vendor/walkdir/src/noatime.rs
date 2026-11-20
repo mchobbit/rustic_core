@@ -103,11 +103,20 @@ impl Iterator for ReadDir {
                     Some(_) => Some(Err(err)),
                 };
             }
-            // SAFETY: ent is a valid entry, d_name a C string in it.
-            let (name, d_type, ino) = unsafe {
-                let ent = &*ent;
-                (CStr::from_ptr(ent.d_name.as_ptr()), ent.d_type, ent.d_ino)
-            };
+            // ent is the entry readdir just gave, valid until the next
+            // readdir. The record is only as long as its name (d_reclen),
+            // shorter than libc's struct, so no reference to the whole struct
+            // or its d_name array is made: the fields are read through ent
+            // itself, as std's readdir does.
+            // SAFETY: d_type is in the record, before the name.
+            let d_type = unsafe { (*ent).d_type };
+            // SAFETY: d_ino is in the record, before the name.
+            let ino = unsafe { (*ent).d_ino };
+            // SAFETY: d_name starts inside the record; no reference is made.
+            let name_ptr = unsafe { std::ptr::addr_of!((*ent).d_name) }.cast();
+            // SAFETY: d_name is a C string NUL-terminated inside the record,
+            // which is valid until the next readdir.
+            let name = unsafe { CStr::from_ptr(name_ptr) };
             let name = name.to_bytes();
             if name == b"." || name == b".." {
                 continue;

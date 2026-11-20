@@ -698,8 +698,14 @@ fn attr_names(dir: &File) -> io::Result<Vec<String>> {
         if e.is_null() {
             break;
         }
-        // SAFETY: d_name is a C string, valid until the next readdir.
-        let name = unsafe { CStr::from_ptr((*e).d_name.as_ptr()) }.to_string_lossy();
+        // SAFETY: e is the entry readdir just gave, valid until the next
+        // readdir. libc declares d_name with 3 bytes, so the name is read
+        // through a pointer taken from e itself, never a reference to that
+        // array, which a longer name would read past.
+        let name_ptr = unsafe { &raw const (*e).d_name }.cast();
+        // SAFETY: d_name is a C string the kernel NUL-terminated inside the
+        // record, which is valid until the next readdir.
+        let name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
         if name != "." && name != ".." && !SYSTEM_VIEWS.contains(&&*name) {
             names.push(name.into_owned());
         }
