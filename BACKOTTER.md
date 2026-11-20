@@ -852,7 +852,13 @@ that either program restores what the other backed up.
   is needed on a file with that property, the flags but immutable and
   append-only go on first, the property is set again, and immutable and
   append-only go on last through `FS_IOC_FSSETXATTR`, which leaves it
-  alone (checked on Linux 6.12).
+  alone (checked on Linux 6.12). The flags are read back after that: where
+  those two aren't what was asked, or the file system has no
+  `FS_IOC_FSSETXATTR`, all the flags go on through `FS_IOC_SETFLAGS`, as
+  where there is no property (0.13.0+backotter.17). That is a node with the
+  property restored elsewhere: OpenZFS 2.2 reads `fsx_xflags` as
+  `FS_IOC_GETFLAGS`'s flags, so that such a file came back immutable
+  instead of append-only, or without either (immutable refused).
 - btrfs's no-copy-on-write flag is set while a new file is still empty: btrfs
   ignores it on a file with data.
 - Casefolding (`F`) is a creation-time flag: ext4 and f2fs refuse to change
