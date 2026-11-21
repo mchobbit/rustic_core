@@ -84,6 +84,9 @@ pub struct LocalSource {
     save_opts: LocalSourceSaveOptions,
     /// BackOtter: entries given without some of their metadata.
     incomplete: Incomplete,
+    /// BackOtter: what the ignore crate reads in each directory
+    /// ([`unread_ignore_files`]).
+    ignore_files: Arc<[String]>,
 }
 
 #[serde_as]
@@ -238,10 +241,20 @@ impl LocalSource {
 
         let builder = walk_builder;
 
+        // BackOtter: the files the ignore crate reads in a directory
+        // (unread_ignore_files): the custom ignore files, and with
+        // --git-ignore a .gitignore, the repository's .git and its
+        // info/exclude.
+        let mut ignore_files = filter_opts.custom_ignorefiles.clone();
+        if filter_opts.git_ignore {
+            ignore_files.extend([".gitignore", ".git", ".git/info/exclude"].map(String::from));
+        }
+
         Ok(Self {
             builder,
             save_opts,
             incomplete: Incomplete::default(),
+            ignore_files: ignore_files.into(),
         })
     }
 }
@@ -348,6 +361,7 @@ impl ReadSource for LocalSource {
             walker: self.builder.build(),
             save_opts: self.save_opts,
             incomplete: self.incomplete.clone(),
+            ignore_files: Arc::clone(&self.ignore_files),
         }
     }
 
@@ -447,6 +461,9 @@ pub struct LocalSourceWalker {
     /// BackOtter: entries given without some of their metadata, shared with
     /// the [`LocalSource`].
     incomplete: Incomplete,
+    /// BackOtter: what the ignore crate reads in each directory
+    /// ([`unread_ignore_files`]).
+    ignore_files: Arc<[String]>,
 }
 
 impl Iterator for LocalSourceWalker {
@@ -484,6 +501,20 @@ impl Iterator for LocalSourceWalker {
                 }
                 item => item,
             }?;
+            // BackOtter: ignore files the ignore crate couldn't read.
+            if let Ok(entry) = &next
+                && entry.file_type().is_some_and(|t| t.is_dir())
+            {
+                let unread = unread_ignore_files(entry.path(), &self.ignore_files);
+                if !unread.is_empty() {
+                    warn!(
+                        "{}: {} not read (a path of PATH_MAX bytes or more), so what it excludes is backed up",
+                        entry.path().display(),
+                        unread.join(", ")
+                    );
+                    self.incomplete.add();
+                }
+            }
             // BackOtter: an entry below a backed-up path that was deleted
             // after its directory was listed is warned about as before, but
             // is not an error the source returns (which counts toward exit
@@ -533,6 +564,34 @@ impl Iterator for LocalSourceWalker {
                 item => return Some(item),
             }
         }
+    }
+}
+
+/// BackOtter: those of `names` (ignore files, a repository's `.git`) that
+/// are in the directory `dir` at a path of `PATH_MAX` bytes or more. The
+/// ignore crate looks for each by its path (`Path::exists`, `metadata`),
+/// which fails there (`ENAMETOOLONG`) as if there were none, without an
+/// error, so their rules aren't applied; the walk itself goes past
+/// `PATH_MAX` (`walkdir::short_path`). A directory with any is warned about
+/// and counted as incomplete (`--strict-exit`). Only on Linux and Android,
+/// where the walk goes that deep; elsewhere none.
+fn unread_ignore_files<'a>(dir: &Path, names: &'a [String]) -> Vec<&'a str> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let max = usize::try_from(libc::PATH_MAX).unwrap_or(usize::MAX);
+        names
+            .iter()
+            .filter(|name| {
+                let path = dir.join(name);
+                path.as_os_str().len() >= max && walkdir::short_path(&path).exists()
+            })
+            .map(String::as_str)
+            .collect()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        _ = (dir, names);
+        Vec::new()
     }
 }
 

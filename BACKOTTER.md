@@ -306,13 +306,19 @@ that either program restores what the other backed up.
   (`no_symlink_to`), which compares canonical paths, and there are none
   past `PATH_MAX`, looks at each directory below the destination instead
   (`no_symlink_below`). Not handled: a backed-up path itself (a `backup`
-  argument) or a destination past `PATH_MAX`, `.gitignore` and custom
-  ignore files past it (the ignore crate reads them by path), and the other
-  systems (BSDs, illumos, Haiku: their `PATH_MAX` is 1024), where a long
-  path fails as before. Tested by `test_backup_restore_past_path_max` (a
-  tree of 4.9 KB paths: modes, mtimes, an extended attribute, contents and a
-  symlink, restored, restored again, and with `--delete`) and walkdir's
-  `longpath` tests.
+  argument) or a destination past `PATH_MAX`, and the other systems (BSDs,
+  illumos, Haiku: their `PATH_MAX` is 1024), where a long path fails as
+  before; and custom ignore files, `.gitignore` files and a repository's
+  `.git` (`--git-ignore`) past it, which the ignore crate looks for by
+  path and takes for missing there (`ENAMETOOLONG`, no error), so their
+  rules aren't applied and what they exclude is backed up. 0.13.0+backotter.16
+  to .20 did that without a word; since 0.13.0+backotter.21 the backup warns
+  about each directory with one ("... not read (a path of PATH_MAX bytes or
+  more) ...") and counts it as incomplete (exit 3 with `--strict-exit`).
+  Tested by `test_backup_restore_past_path_max` (a tree of 4.9 KB paths:
+  modes, mtimes, an extended attribute, contents and a symlink, restored,
+  restored again, and with `--delete`), `test_backup_past_path_max_ignorefile`
+  and walkdir's `longpath` tests.
 - A restore looks the owners up by user and group name, falling back to
   the saved uid and gid, as stock rustic does (`--by-name`, or
   `--ownership-by-name`, restic's name for it, says so explicitly);
