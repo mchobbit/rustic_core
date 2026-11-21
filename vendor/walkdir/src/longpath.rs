@@ -28,8 +28,9 @@
 // round cuts its prefix less the link's own path (its directory and some
 // 30 bytes), so the deepest path reached is about, with 2048-byte prefixes,
 // 82 KB (names of 40 bytes, an 18-byte $TMPDIR), 77 KB (names of 200
-// bytes) and 55 KB at worst (names of 255 bytes, a 495-byte $TMPDIR); with
-// 1000-byte prefixes 42 KB, 36 KB and 14 KB. The links' directory is in
+// bytes), 55 KB (names of 255 bytes, a 495-byte $TMPDIR) and 35 KB at worst
+// (names of 255 bytes, a 1024-byte $TMPDIR); with 1000-byte prefixes 42 KB,
+// 36 KB and 14 KB (a $TMPDIR of at most 500 bytes). The links' directory is in
 // $TMPDIR's canonical path, with no symbolic link in it: a link's path is
 // in its target's, and so in every later round's, and a symbolic link
 // there would be followed again in each round (0.13.0+backotter.16 to .20:
@@ -55,7 +56,7 @@ use std::sync::OnceLock;
 /// itself, unless it has `PATH_MAX` bytes or more, when it is a shorter one
 /// through a symbolic link to a directory along it (see this module). If
 /// that can't be made (no temporary directory to make links in, or one of
-/// over 500 bytes), `path` as
+/// over 1024 bytes, or over 500 with 1000-byte prefixes), `path` as
 /// it is, which then fails as before (`ENAMETOOLONG`); why it couldn't be
 /// made goes, the first time, to the function given to
 /// [`report_short_path_errors`].
@@ -142,13 +143,20 @@ mod imp {
     /// LONG, but over SHORT). A component is at most
     /// 255 bytes, so each link still cuts hundreds of bytes off.
     pub(super) const SHORT: usize = 1000;
-    /// The longest temporary directory the links are made in: a link's
-    /// path (it, `/.bko-longpath-PID-N/`, a number: under 50 bytes more)
-    /// must be shorter than the shortest prefix a round cuts, which ends at
-    /// the last '/' in its first chunk + 1 bytes, past chunk - NAME_MAX
-    /// (255), so that each round shortens the path, with either chunk.
-    const TMP_MAX: usize = SHORT / 2;
-    const _: () = assert!(TMP_MAX + 50 < SHORT - 255);
+    /// The longest temporary directory the links are made in, for prefixes
+    /// of at most `chunk` bytes: a link's path (it, `/.bko-longpath-PID-N/`,
+    /// a number: under 50 bytes more) must be shorter than the shortest
+    /// prefix a round cuts, which ends at the last '/' in its first chunk +
+    /// 1 bytes, past chunk - NAME_MAX (255), so that each round shortens the
+    /// path: 1024 bytes for LONG, 500 for SHORT. `make_dir` takes one of up
+    /// to LONG's, and `Links::for_process` refuses one past SHORT's where
+    /// `probe` chooses SHORT (0.13.0+backotter.19 and .20 refused one past
+    /// 500 bytes everywhere).
+    const fn tmp_max(chunk: usize) -> usize {
+        chunk / 2
+    }
+    const _: () = assert!(tmp_max(SHORT) + 50 < SHORT - 255);
+    const _: () = assert!(tmp_max(LONG) + 50 < LONG - 255);
     const _: () = assert!(SHORT < LONG && LONG < MAX);
 
     /// The directory of this process's links, once made (for `remove_dir`).
@@ -214,10 +222,23 @@ mod imp {
         /// its file system takes. Called with `LINKS` held, so made once.
         fn for_process() -> io::Result<Links> {
             let dir = make_dir()?;
+            let chunk = probe(&dir);
+            // A temporary directory within the bound for its chunk (tmp_max):
+            // make_dir takes one within LONG's.
+            let tmp = dir.parent().unwrap_or(&dir);
+            if tmp.as_os_str().as_bytes().len() > tmp_max(chunk) {
+                let why = format!(
+                    "the temporary directory {} is over {} bytes, where links lead to {} at most",
+                    tmp.display(),
+                    tmp_max(chunk),
+                    chunk
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(too_long(why));
+            }
             let _ = DIR.set(dir.clone());
             // SAFETY: remove_dir is an extern "C" fn taking nothing.
             let _ = unsafe { libc::atexit(remove_dir) };
-            let chunk = probe(&dir);
             Ok(Links::with_chunk(dir, chunk))
         }
 
@@ -295,8 +316,8 @@ mod imp {
             let why = format!("the temporary directory {} isn't absolute", tmp.display());
             return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
         }
-        if tmp.as_os_str().as_bytes().len() > TMP_MAX {
-            return Err(too_long(format!("the temporary directory {} is over {} bytes", tmp.display(), TMP_MAX)));
+        if tmp.as_os_str().as_bytes().len() > tmp_max(LONG) {
+            return Err(too_long(format!("the temporary directory {} is over {} bytes", tmp.display(), tmp_max(LONG))));
         }
         let pid = std::process::id();
         for n in 0..1000u32 {
@@ -499,6 +520,45 @@ mod tests {
         assert_eq!(fs::read(short.join("leaf")).unwrap(), b"deep");
         assert!(dir.starts_with(&canonical), "{}", dir.display());
         fs::remove_dir_all(&dir).unwrap();
+        let _ = std::process::Command::new("rm").arg("-rf").arg(&top).status();
+    }
+
+    #[test]
+    fn a_long_temporary_directory_serves_the_long_chunk() {
+        // $TMPDIR of over 500 bytes (of 1024 at most).
+        if std::env::var_os(CHILD).is_none() {
+            let base = top("tmp700");
+            let mut tmp = base.clone();
+            while tmp.as_os_str().len() < 700 {
+                tmp.push("t".repeat(100));
+            }
+            fs::create_dir_all(&tmp).unwrap();
+            assert!(!child("a_long_temporary_directory_serves_the_long_chunk", &tmp));
+            let _ = std::process::Command::new("rm").arg("-rf").arg(&base).status();
+            return;
+        }
+        let tmp = std::env::temp_dir();
+        assert!(tmp.as_os_str().len() > 500 && tmp.as_os_str().len() <= 1024);
+        let long_ok = takes_long_targets();
+        let top = top("deep");
+        let (bottom, id) = deep_tree(&top, 330);
+        let short = try_short_path(&bottom);
+        eprintln!("a {}-byte $TMPDIR; a target of 2048 bytes taken: {}", tmp.as_os_str().len(), long_ok);
+        if long_ok {
+            // Links to 2048-byte prefixes, as in .16 to .18.
+            let short = short.unwrap();
+            assert!(short.as_os_str().len() < imp::MAX, "{}", short.display());
+            let m = fs::symlink_metadata(&short).unwrap();
+            assert_eq!((m.dev(), m.ino()), id);
+            assert_eq!(imp::dir().unwrap().1, imp::LONG);
+        } else {
+            // With the short chunk a link would be too long: refused, and
+            // nothing left in $TMPDIR.
+            let err = short.unwrap_err();
+            assert!(err.to_string().contains("over 500 bytes"), "{}", err);
+            let pid = format!(".bko-longpath-{}-", std::process::id());
+            assert!(!fs::read_dir(&tmp).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with(&pid)));
+        }
         let _ = std::process::Command::new("rm").arg("-rf").arg(&top).status();
     }
 
