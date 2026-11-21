@@ -1081,7 +1081,11 @@ mod tests {
         let attrs = [xattr("..", b"X"), xattr("../x", b"y"), xattr("ok", b"v")];
         let err = set_xattrs(&file, &attrs).unwrap_err();
         assert!(err.counts(true), "{err}");
-        assert_eq!(err.to_string().matches("not restored on illumos").count(), 2, "{err}");
+        assert_eq!(
+            err.to_string().matches("not restored on illumos").count(),
+            2,
+            "{err}"
+        );
         assert_eq!(std::fs::read(&file).unwrap(), b"data");
         assert!(!dir.path().join("x").exists());
         assert_eq!(xattrs_read(&file).unwrap().attrs, [xattr("ok", b"v")]);

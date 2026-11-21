@@ -228,7 +228,7 @@ fn extattr_read(
 /// following a symlink.
 pub(super) fn user_extattr_names(path: &Path) -> io::Result<Vec<OsString>> {
     let names = list_extattrs(path, libc::EXTATTR_NAMESPACE_USER)?;
-    Ok(names.iter().map(|name| bsd_extattr::user_name(name)).collect())
+    Ok(names.iter().map(|n| bsd_extattr::user_name(n)).collect())
 }
 
 /// The names of the extended attributes in `namespace` of the file at

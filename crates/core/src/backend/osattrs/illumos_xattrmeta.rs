@@ -66,11 +66,29 @@ mod tests {
 
     #[test]
     fn attr_names_refused() {
-        for name in ["", ".", "..", "../x", "a/b", "/etc/x", "a\0b", "SUNWattr_ro", "SUNWattr_rw"] {
+        for name in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "/etc/x",
+            "a\0b",
+            "SUNWattr_ro",
+            "SUNWattr_rw",
+        ] {
             let err = attr_name_refused(name).unwrap_or_else(|| panic!("{name:?} allowed"));
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{name:?}");
         }
-        for name in ["a", "user.x", "...", "..x", ".hidden", "\u{fffd}", "SUNWattr_rw2"] {
+        for name in [
+            "a",
+            "user.x",
+            "...",
+            "..x",
+            ".hidden",
+            "\u{fffd}",
+            "SUNWattr_rw2",
+        ] {
             assert!(attr_name_refused(name).is_none(), "{name:?} refused");
         }
     }

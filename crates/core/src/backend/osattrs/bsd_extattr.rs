@@ -2,11 +2,14 @@
 //! `extattr_list_link(2)` lists them: bytes, which needn't be UTF-8. Each is
 //! read and set by those bytes; the name a node keeps is made valid UTF-8
 //! only there, as the name of a Linux extended attribute is
-//! (`xattr_node_name`) and as BackOtter's restic's JSON makes it. Portable,
+//! (`xattr_node_name`) and as restic-bko's JSON makes it. Portable,
 //! so that it is tested on any system; the system calls are in
 //! `freebsd_netbsd.rs`.
 
-#![cfg_attr(not(any(target_os = "freebsd", target_os = "netbsd")), allow(dead_code))]
+#![cfg_attr(
+    not(any(target_os = "freebsd", target_os = "netbsd")),
+    allow(dead_code)
+)]
 
 use std::{
     ffi::OsString,
@@ -39,7 +42,9 @@ pub(super) fn user_name(name: &[u8]) -> OsString {
 /// The name a node keeps for the extended attribute `name`, valid UTF-8, as
 /// a Linux one's (`OsStr::to_string_lossy`).
 pub(super) fn node_name(name: &[u8]) -> String {
-    std::ffi::OsStr::from_bytes(name).to_string_lossy().into_owned()
+    std::ffi::OsStr::from_bytes(name)
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[cfg(test)]
@@ -51,7 +56,12 @@ mod tests {
         let list = b"\x01\xff\x03abc\x00\x02\xc3\xa9";
         assert_eq!(
             list_names(list),
-            [b"\xff".to_vec(), b"abc".to_vec(), Vec::new(), "é".as_bytes().to_vec()]
+            [
+                b"\xff".to_vec(),
+                b"abc".to_vec(),
+                Vec::new(),
+                "é".as_bytes().to_vec()
+            ]
         );
         // A name cut short ends the list.
         assert_eq!(list_names(b"\x01a\x05ab"), [b"a".to_vec()]);
