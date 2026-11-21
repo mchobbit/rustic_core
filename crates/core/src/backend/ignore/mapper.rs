@@ -109,8 +109,9 @@ impl LocalSourceSaveOptions {
                 source: err,
             })?;
         // BackOtter: an entry past PATH_MAX is read through a short path to
-        // it (walkdir::short_path), and keeps its own.
-        let node = self.map_path(&walkdir::short_path(entry.path()), name, &m, incomplete, false)?;
+        // it (walkdir::short_path, in each call map_path makes), and its
+        // messages and errors name its own.
+        let node = self.map_path(entry.path(), name, &m, incomplete, false)?;
         let path = entry.into_path();
         // BackOtter: a file with holes is read by its data extents.
         let open = Some(OpenFile::new(path.clone(), osattrs::is_sparse(&node)));
@@ -239,7 +240,8 @@ impl LocalSourceSaveOptions {
         let node = if m.is_dir() {
             Node::new_node(name, NodeType::Dir, meta)
         } else if m.is_symlink() {
-            let target = std::fs::read_link(path).map_err(|err| IgnoreErrorKind::ErrorLink {
+            // BackOtter: past PATH_MAX, through a short path to it.
+            let target = std::fs::read_link(walkdir::short_path(path)).map_err(|err| IgnoreErrorKind::ErrorLink {
                 path: path.to_path_buf(),
                 source: err,
             })?;

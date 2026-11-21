@@ -132,16 +132,17 @@ use other as os;
 /// (left out of the node), which BackOtter's restic counts toward its exit
 /// status 3.
 pub(crate) fn fill(path: &Path, node: &mut Node, m: &std::fs::Metadata, xattrs: bool) -> bool {
-    // BackOtter: past PATH_MAX, through a short path to it.
-    let path = &*walkdir::short_path(path);
+    // BackOtter: past PATH_MAX, through a short path to it (`sys`); the
+    // warnings name `path`.
+    let sys = &*walkdir::short_path(path);
     let mut incomplete = false;
     // On Linux, the one open of the file for its flags, project ID and holes;
     // on illumos, of its system attribute view.
-    let f = os::open_for_attrs(path, &node.node_type, m);
+    let f = os::open_for_attrs(sys, &node.node_type, m);
     if let Some(name) = os::FILE_FLAGS {
         // The system's module says when there are none worth an attribute:
         // a 0 can say something (a cleared archive flag on ZFS).
-        match os::file_flags(path, &node.node_type, m, f.as_ref()) {
+        match os::file_flags(sys, &node.node_type, m, f.as_ref()) {
             Ok(Some(flags)) => node.meta.generic_attributes.set_u64(name, flags.into()),
             Ok(None) => {}
             Err(err) => {
@@ -150,12 +151,12 @@ pub(crate) fn fill(path: &Path, node: &mut Node, m: &std::fs::Metadata, xattrs: 
             }
         }
     }
-    if let Err(err) = os::fill_attributes(path, node, f.as_ref()) {
+    if let Err(err) = os::fill_attributes(sys, node, f.as_ref()) {
         warn!("ignoring attributes of {}: {err}", path.display());
         incomplete = true;
     }
     if xattrs {
-        os::fill_xattr_meta(path, node);
+        os::fill_xattr_meta(sys, node);
     }
     // The birth time of every type of file, where the lstat has one (on
     // illumos it is in the system attribute view, which `fill_attributes`
@@ -167,7 +168,7 @@ pub(crate) fn fill(path: &Path, node: &mut Node, m: &std::fs::Metadata, xattrs: 
     }
     // A regular file, not a block device saved as one.
     #[cfg(unix)]
-    if node.is_file() && m.is_file() && sparse::has_holes(path, m, f.as_ref()) {
+    if node.is_file() && m.is_file() && sparse::has_holes(sys, m, f.as_ref()) {
         node.meta.generic_attributes.set_true(UNIX_SPARSE);
     }
     incomplete
@@ -274,8 +275,6 @@ pub(crate) fn open_refused(path: &Path) -> bool {
 /// extended attributes, which couldn't be read either, are left out; the
 /// rest of its metadata is kept. A warning names it.
 pub(crate) fn keep_unread(path: &Path, node: &mut Node) {
-    // BackOtter: past PATH_MAX, through a short path to it.
-    let path = &*walkdir::short_path(path);
     let size = node.meta.size;
     node.content = Some(Vec::new());
     node.meta.size = 0;
@@ -439,9 +438,9 @@ pub(crate) const fn scan_moves_saved_atimes(real_atimes: bool, listing_keeps_ati
 /// securelevel above 0, not root) is only logged: what the restore does
 /// next to the file fails and says why.
 pub(crate) fn clear_restricting_flags(path: &Path) {
-    // BackOtter: past PATH_MAX, through a short path to it.
-    let path = &*walkdir::short_path(path);
-    match os::clear_restricting_flags(path) {
+    // BackOtter: past PATH_MAX, through a short path to it; the message
+    // names `path`.
+    match os::clear_restricting_flags(&walkdir::short_path(path)) {
         Err(err) if err.kind() != io::ErrorKind::NotFound => {
             debug!("restricting flags of {} not cleared: {err}", path.display());
         }
@@ -565,17 +564,26 @@ impl HeldFlags {
 /// wasn't, sets them again through that descriptor (`fchflags`, Linux's
 /// ioctls). As in BackOtter's restic (`ClearRestrictingFlagsHeld`).
 pub(crate) fn clear_restricting_flags_held(path: &Path) -> HeldFlags {
-    // BackOtter: past PATH_MAX, through a short path to it.
-    let path = &*walkdir::short_path(path);
+    // BackOtter: past PATH_MAX, through a short path to it (`sys`); the
+    // messages name `path`, as does `put_back`'s, which on Linux takes no
+    // path but for them.
+    let sys = &*walkdir::short_path(path);
     #[cfg(target_os = "linux")]
-    let held = os::clear_restricting_flags_held(path);
+    let held = os::clear_restricting_flags_held(sys).map(|held| match held {
+        HeldFlags::Held { file, cleared, .. } => HeldFlags::Held {
+            file,
+            cleared,
+            path: path.to_path_buf(),
+        },
+        held => held,
+    });
     #[cfg(any(
         target_os = "dragonfly",
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd"
     ))]
-    let held = bsd_held::clear_restricting_flags_held(path);
+    let held = bsd_held::clear_restricting_flags_held(sys);
     #[cfg(not(any(
         target_os = "dragonfly",
         target_os = "freebsd",
@@ -583,7 +591,7 @@ pub(crate) fn clear_restricting_flags_held(path: &Path) -> HeldFlags {
         target_os = "netbsd",
         target_os = "openbsd"
     )))]
-    let held = os::clear_restricting_flags(path).map(|()| HeldFlags::Nothing);
+    let held = os::clear_restricting_flags(sys).map(|()| HeldFlags::Nothing);
     match held {
         Ok(held) => held,
         Err(err) => {
