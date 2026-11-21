@@ -15,8 +15,9 @@
 //
 // A prefix is at most 2048 bytes (PATH_MAX / 2) where the links' directory
 // takes a link's target of that many bytes, and at most 1000 where it
-// doesn't: XFS refuses a target past 1024 bytes, ext2/3/4 and minix on
-// 1 KiB blocks past 1023 (symlink(2) ENAMETOOLONG). Which one is decided
+// doesn't: XFS refuses a target past 1024 bytes, ext2/3/4 and minix past
+// a block less its NUL, 1023 bytes on 1 KiB blocks and 2047 on 2 KiB ones
+// (symlink(2) ENAMETOOLONG). Which one is decided
 // once per process, by a link made in the new directory before any other
 // (`probe`), so a prefix is always cut at the same place.
 //
@@ -137,7 +138,8 @@ mod imp {
     pub(super) const LONG: usize = MAX / 2;
     /// The longest prefix a link leads to where it doesn't: XFS keeps a
     /// target to 1024 bytes (XFS_SYMLINK_MAXLEN), ext2/3/4 and minix to a
-    /// block with its NUL (1023 on 1 KiB blocks). A component is at most
+    /// block with its NUL (1023 on 1 KiB blocks, 2047 on 2 KiB blocks: under
+    /// LONG, but over SHORT). A component is at most
     /// 255 bytes, so each link still cuts hundreds of bytes off.
     pub(super) const SHORT: usize = 1000;
     /// The longest temporary directory the links are made in: a link's
@@ -261,7 +263,7 @@ mod imp {
 
     /// LONG if a link in `dir` (new, and only this process's) takes a
     /// target of LONG bytes and keeps it whole, else SHORT: symlink(2)
-    /// ENAMETOOLONG (XFS, ext2/3/4 and minix on 1 KiB blocks), or any other
+    /// ENAMETOOLONG (XFS, ext2/3/4 and minix on 1 or 2 KiB blocks), or any other
     /// failure, where SHORT does as well as LONG. The link, `probe` (the
     /// others are numbers), is removed again.
     fn probe(dir: &Path) -> usize {
@@ -395,11 +397,16 @@ mod tests {
         n
     }
 
-    /// Whether a link to a target of over 1024 bytes can be made in the
-    /// temporary directory's file system (in a directory of its own).
+    /// Whether a link to a target of LONG bytes can be made in the
+    /// temporary directory's file system (in a directory of its own) and
+    /// reads back whole: what `probe` asks, asked again. (Over 1024 bytes
+    /// isn't enough: ext2/3/4 on 2 KiB blocks takes 2047.)
     fn takes_long_targets() -> bool {
         let dir = imp::make_dir().unwrap();
-        let ok = std::os::unix::fs::symlink("x".repeat(1025), dir.join("over-1024")).is_ok();
+        let target = PathBuf::from("x".repeat(imp::LONG));
+        let link = dir.join("long");
+        let ok = std::os::unix::fs::symlink(&target, &link).is_ok()
+            && fs::read_link(&link).map_or(false, |t| t == target);
         fs::remove_dir_all(&dir).unwrap();
         ok
     }
@@ -529,11 +536,11 @@ mod tests {
         let mode = fs::symlink_metadata(&links).unwrap().mode();
         assert_eq!(mode & 0o777, 0o700);
         // The short chunk where the temporary directory's file system
-        // refuses a target over 1024 bytes (XFS: rustic-bko
+        // refuses a target of 2048 bytes (XFS: rustic-bko
         // 0.11.4+backotter.17's 2048-byte targets were ENAMETOOLONG there,
         // the long paths left out), the long one where it takes them.
         let long_ok = takes_long_targets();
-        eprintln!("links in {}: chunk {chunk}; a target over 1024 bytes taken: {long_ok}", links.display());
+        eprintln!("links in {}: chunk {chunk}; a target of 2048 bytes taken: {long_ok}", links.display());
         assert_eq!(chunk, if long_ok { imp::LONG } else { imp::SHORT });
         // Each link's target is within it, and fits XFS with the short one.
         let n = check_targets(&links, chunk);
@@ -561,7 +568,7 @@ mod tests {
 
     #[test]
     fn the_short_chunk_reaches_the_same_file() {
-        // The fallback for XFS and 1 KiB-block ext2/3/4, wherever the
+        // The fallback for XFS and 1 or 2 KiB-block ext2/3/4, wherever the
         // temporary directory is: links of their own, in a directory of
         // their own, to prefixes of at most SHORT bytes.
         let top = top("fallback");

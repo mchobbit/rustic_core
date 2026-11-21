@@ -273,8 +273,9 @@ that either program restores what the other backed up.
   so a path always gets the same short path, and followed by name, as the
   long path's components are, so the short path names what the long one
   names after the tree changes too. A link's target is the prefix, and XFS
-  refuses one over 1024 bytes (`XFS_SYMLINK_MAXLEN`; ext2/3/4 and minix on
-  1 KiB blocks, over 1023), so 0.13.0+backotter.16 to .18, whose prefixes
+  refuses one over 1024 bytes (`XFS_SYMLINK_MAXLEN`; ext2/3/4 and minix
+  one over a block less its NUL: 1023 bytes on 1 KiB blocks, 2047 on 2 KiB
+  ones), so 0.13.0+backotter.16 to .18, whose prefixes
   were up to 2048 bytes, left the long paths out of a backup ("File name
   too long") and couldn't restore them where `$TMPDIR` is on XFS;
   0.13.0+backotter.19 cut every prefix to 1000 bytes, on every file system.
