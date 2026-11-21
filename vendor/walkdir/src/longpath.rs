@@ -4,11 +4,12 @@
 // (PATH_MAX, 4096 bytes on Linux, its NUL included: ENAMETOOLONG past it),
 // and a backup must read them and a restore make them, as tar and rsync do.
 // `short_path` gives, for such a path, a shorter one to the same file: the
-// directory at a prefix of the path (of at most PATH_MAX / 2 bytes, ending
-// at a component) is reached through a symbolic link to it, in a directory
-// of this process's own (mode 0700, in the temporary directory, removed at
-// exit), and the rest of the path follows the link; a rest still too long
-// is shortened the same way, from that link. A link is followed by name, as
+// directory at a prefix of the path (of at most 1000 bytes, ending at a
+// component: XFS refuses a symbolic link's target past 1024 bytes) is
+// reached through a symbolic link to it, in a directory of this process's
+// own (mode 0700, in the temporary directory, removed at exit), and the
+// rest of the path follows the link; a rest still too long is shortened the
+// same way, from that link. A link is followed by name, as
 // the long path's own components are, so the short path names whatever the
 // long one names, now and after the tree changes; and each prefix has one
 // link, so a path gets the same short path every time.
@@ -23,7 +24,8 @@ use std::path::Path;
 /// BackOtter: a path to the file at `path` that a system call takes: `path`
 /// itself, unless it has `PATH_MAX` bytes or more, when it is a shorter one
 /// through a symbolic link to a directory along it (see this module). If
-/// that can't be made (no temporary directory to make links in), `path` as
+/// that can't be made (no temporary directory to make links in, or one of
+/// over 500 bytes), `path` as
 /// it is, which then fails as before (`ENAMETOOLONG`).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn short_path(path: &Path) -> Cow<'_, Path> {
@@ -52,8 +54,20 @@ mod imp {
 
     /// The bytes a path given to a system call has fewer than.
     pub(super) const MAX: usize = libc::PATH_MAX as usize;
-    /// The longest prefix a link leads to.
-    const CHUNK: usize = MAX / 2;
+    /// The longest prefix a link leads to: a link's target, which XFS
+    /// keeps to 1024 bytes (XFS_SYMLINK_MAXLEN; symlink(2) is ENAMETOOLONG
+    /// past it), ext2/3/4 and minix to a block with its NUL (1023 bytes on
+    /// 1 KiB blocks), and tmpfs, btrfs, f2fs and ZFS to a page, a block or
+    /// PATH_MAX. A component is at most 255 bytes, so each link still cuts
+    /// hundreds of bytes off.
+    const CHUNK: usize = 1000;
+    /// The longest temporary directory the links are made in: a link's
+    /// path (it, `/.bko-longpath-PID-N/`, a number: under 50 bytes more)
+    /// must be shorter than the shortest prefix a round cuts, which ends at
+    /// the last '/' in its first CHUNK + 1 bytes, past CHUNK - NAME_MAX
+    /// (255), so that each round shortens the path.
+    const TMP_MAX: usize = CHUNK / 2;
+    const _: () = assert!(TMP_MAX + 50 < CHUNK - 255);
 
     /// The directory the links are in, once made.
     static DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -114,7 +128,7 @@ mod imp {
         use std::os::unix::fs::DirBuilderExt;
 
         let tmp = std::env::temp_dir();
-        if !tmp.is_absolute() || tmp.as_os_str().as_bytes().len() > CHUNK / 2 {
+        if !tmp.is_absolute() || tmp.as_os_str().as_bytes().len() > TMP_MAX {
             return Err(too_long());
         }
         let pid = std::process::id();
@@ -164,6 +178,11 @@ mod tests {
     /// file `leaf` holding "deep" at the bottom; returns the bottom
     /// directory's path and its device and inode.
     fn deep_tree(top: &Path, depth: usize) -> (PathBuf, (u64, u64)) {
+        deep_tree_of(top, depth, 40)
+    }
+
+    /// `deep_tree` with names of `len` bytes.
+    fn deep_tree_of(top: &Path, depth: usize, len: usize) -> (PathBuf, (u64, u64)) {
         let c = |s: &[u8]| CString::new(s).unwrap();
         let mut path = top.to_path_buf();
         // SAFETY: plain system calls on C strings and descriptors this owns.
@@ -171,7 +190,7 @@ mod tests {
             let mut fd = libc::open(c(top.as_os_str().as_bytes()).as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
             assert!(fd >= 0);
             for i in 0..depth {
-                let name = format!("d{i:03}{}", "x".repeat(36));
+                let name = format!("d{i:03}{}", "x".repeat(len - 4));
                 path.push(&name);
                 let n = c(name.as_bytes());
                 assert_eq!(libc::mkdirat(fd, n.as_ptr(), 0o755), 0);
@@ -231,7 +250,36 @@ mod tests {
         assert!(links.starts_with(std::env::temp_dir()));
         let mode = fs::symlink_metadata(&links).unwrap().mode();
         assert_eq!(mode & 0o777, 0o700);
+        // Each link's target fits XFS's 1024 bytes, for a temporary
+        // directory there (rustic-bko 0.11.4+backotter.17 on 2048-byte
+        // targets: symlink(2) ENAMETOOLONG, the long paths left out).
+        let mut n = 0;
+        for e in fs::read_dir(&links).unwrap() {
+            let target = fs::read_link(e.unwrap().path()).unwrap();
+            assert!(target.as_os_str().len() <= 1024, "{} bytes", target.as_os_str().len());
+            n += 1;
+        }
+        assert!(n >= 4, "{n} links");
         // GNU rm removes a tree of any depth.
+        let _ = std::process::Command::new("rm").arg("-rf").arg(&top).status();
+    }
+
+    #[test]
+    fn names_of_name_max_bytes_are_cut_too() {
+        // A '/' every 256 bytes: a prefix is cut as far as 255 bytes short
+        // of CHUNK, and each round still shortens the path.
+        let top = top("namemax");
+        let (bottom, id) = deep_tree_of(&top, 40, 255);
+        assert!(bottom.as_os_str().len() > 2 * imp::MAX);
+        let short = short_path(&bottom);
+        assert!(short.as_os_str().len() < imp::MAX, "{}", short.display());
+        let m = fs::symlink_metadata(&short).unwrap();
+        assert_eq!((m.dev(), m.ino()), id);
+        assert_eq!(fs::read(short_path(&bottom.join("leaf"))).unwrap(), b"deep");
+        for e in fs::read_dir(imp::dir().unwrap()).unwrap() {
+            let target = fs::read_link(e.unwrap().path()).unwrap();
+            assert!(target.as_os_str().len() <= 1024, "{} bytes", target.as_os_str().len());
+        }
         let _ = std::process::Command::new("rm").arg("-rf").arg(&top).status();
     }
 

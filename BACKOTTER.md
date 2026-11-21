@@ -264,14 +264,20 @@ that either program restores what the other backed up.
   restic still leaves it out (exit 3). Each system call on such a path
   goes through `walkdir::short_path` (the vendored walkdir's
   `src/longpath.rs`): a shorter path to the same file, through a symbolic
-  link to a directory at a prefix of the path (at most 2048 bytes, ending at
+  link to a directory at a prefix of the path (at most 1000 bytes, ending at
   a component), and links to links for a longer one. The links are in a
   directory of the process's own (`$TMPDIR/.bko-longpath-PID-N`, mode
   0700, a new one only it made), removed at exit (`atexit`); one per prefix,
   so a path always gets the same short path, and followed by name, as the
   long path's components are, so the short path names what the long one
-  names after the tree changes too. Where no link can be made (no
-  temporary directory), a long path fails as before. Only the system calls
+  names after the tree changes too. A prefix is at most 1000 bytes since
+  0.13.0+backotter.19: a link's target is, and XFS refuses one over 1024
+  bytes (`XFS_SYMLINK_MAXLEN`; ext2/3/4 on 1 KiB blocks, over 1023), so
+  0.13.0+backotter.16 to .18, whose prefixes were up to 2048 bytes, still
+  left the long paths out of a backup ("File name too long") and couldn't
+  restore them where `$TMPDIR` is on XFS. Where no link can be made (no
+  temporary directory, or one of over 500 bytes, which would leave a link
+  too long to shorten a path), a long path fails as before. Only the system calls
   take the short paths: the walk's entries, the restore's comparisons with
   what the destination holds (`--delete`), its aliases and every message
   keep the long ones, but for errors from `LocalDestination`'s own calls
