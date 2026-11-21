@@ -54,12 +54,16 @@ use std::sync::OnceLock;
 
 /// BackOtter: a path to the file at `path` that a system call takes: `path`
 /// itself, unless it has `PATH_MAX` bytes or more, when it is a shorter one
-/// through a symbolic link to a directory along it (see this module). If
-/// that can't be made (no temporary directory to make links in, or one of
-/// over 1024 bytes, or over 500 with 1000-byte prefixes), `path` as
-/// it is, which then fails as before (`ENAMETOOLONG`); why it couldn't be
-/// made goes, the first time, to the function given to
-/// [`report_short_path_errors`].
+/// through symbolic links to directories along it (see this module).
+///
+/// Where a link can't be made (no usable temporary directory for the
+/// links, a link refused, a path with no '/' to cut it at: the errors of
+/// [`try_short_path`]), it is `path` as it is, which then fails as before
+/// (`ENAMETOOLONG`), and why goes, the first time, to the function given to
+/// [`report_short_path_errors`]. A path that takes more than 40 links
+/// (about 82 KB with 40-byte names; see this module) gets a short path all
+/// the same, which fails with `ELOOP` ("Too many levels of symbolic
+/// links").
 pub fn short_path(path: &Path) -> Cow<'_, Path> {
     try_short_path(path).unwrap_or_else(|err| {
         report(&err);
@@ -73,9 +77,11 @@ pub fn short_path(path: &Path) -> Cow<'_, Path> {
 ///
 /// For a path of `PATH_MAX` bytes or more (Linux and Android), if a link to
 /// shorten it with couldn't be made: no directory for the links in the
-/// temporary directory (none, not writable, not absolute, or too long), a
-/// link refused (`symlink(2)`: no space, a quota), or a path that can't be
-/// cut (no '/' to cut it at); or, for a relative one, no current directory.
+/// temporary directory (none, not writable, not absolute, or over 1024
+/// bytes, or over 500 where links lead to 1000-byte prefixes), a link
+/// refused (`symlink(2)`: no space, a quota, a file system without
+/// symbolic links), or a path that can't be cut (no '/' to cut it at); or,
+/// for a relative one, no current directory.
 /// The error says what failed, and where. A directory for the links that
 /// couldn't be made is the process's for good: each later call gives that
 /// error again, without trying again.
