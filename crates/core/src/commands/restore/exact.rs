@@ -101,6 +101,22 @@ pub(super) enum CloneFailed {
     },
 }
 
+impl CloneFailed {
+    /// BackOtter: this, with a temporary file left in `dst`'s directory
+    /// named through `dst`: by the long path, past `PATH_MAX`, of a file
+    /// cloned onto through a short path to it (`walkdir::short_path`).
+    fn beside(self, dst: &Path) -> Self {
+        match self {
+            Self::TempLeft { err, tmp, remove } => {
+                let name = tmp.file_name().map(ToOwned::to_owned);
+                let tmp = name.map_or(tmp, |name| dst.with_file_name(name));
+                Self::TempLeft { err, tmp, remove }
+            }
+            failed @ Self::Failed(_) => failed,
+        }
+    }
+}
+
 impl std::fmt::Display for CloneFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -214,8 +230,9 @@ fn clone_over_with(
 /// symlink or waiting on a FIFO ([`open_regular`]), must hold; and it
 /// mustn't be `dst` itself (by another name too).
 pub(super) fn clone_file(src: &Path, dst: &Path, size: u64) -> Result<(), CloneFailed> {
-    // BackOtter: past PATH_MAX, through short paths to them.
-    let (src, dst) = (&*walkdir::short_path(src), &*walkdir::short_path(dst));
+    // BackOtter: past PATH_MAX, through short paths to them; the errors
+    // name `src` and `dst`.
+    let (src_sys, dst_sys) = (&*walkdir::short_path(src), &*walkdir::short_path(dst));
     // BackOtter: waits for the exit once XFS options are put back for it.
     let _making = super::making_entries();
     if !CLONE_SUPPORTED {
@@ -224,7 +241,7 @@ pub(super) fn clone_file(src: &Path, dst: &Path, size: u64) -> Result<(), CloneF
             "reflinks not supported on this system",
         )));
     }
-    let (s, m) = open_regular(src).map_err(CloneFailed::Failed)?;
+    let (s, m) = open_regular(src_sys).map_err(CloneFailed::Failed)?;
     if m.len() != size {
         return Err(CloneFailed::Failed(io::Error::other(format!(
             "{} isn't {size} bytes",
@@ -234,7 +251,7 @@ pub(super) fn clone_file(src: &Path, dst: &Path, size: u64) -> Result<(), CloneF
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if std::fs::symlink_metadata(dst).is_ok_and(|d| d.dev() == m.dev() && d.ino() == m.ino()) {
+        if std::fs::symlink_metadata(dst_sys).is_ok_and(|d| d.dev() == m.dev() && d.ino() == m.ino()) {
             return Err(CloneFailed::Failed(io::Error::other(format!(
                 "{} is {} itself",
                 src.display(),
@@ -242,7 +259,7 @@ pub(super) fn clone_file(src: &Path, dst: &Path, size: u64) -> Result<(), CloneF
             ))));
         }
     }
-    clone_over(&s, dst)
+    clone_over(&s, dst_sys).map_err(|failed| failed.beside(dst))
 }
 
 /// The existing regular file `path`, which has other names, gets a file of
@@ -252,8 +269,7 @@ pub(super) fn clone_file(src: &Path, dst: &Path, size: u64) -> Result<(), CloneF
 /// file. True if it is a clone. A clone that failed and left its temporary
 /// file is an error naming it, and `path` stays as it is.
 pub(super) fn break_link(path: &Path) -> io::Result<bool> {
-    // BackOtter: past PATH_MAX, through short paths to them.
-    break_link_with(&walkdir::short_path(path), clone_over)
+    break_link_with(path, clone_over)
 }
 
 /// [`break_link`], cloning with `clone_over` (for tests).
@@ -261,10 +277,16 @@ fn break_link_with(
     path: &Path,
     clone_over: impl FnOnce(&std::fs::File, &Path) -> Result<(), CloneFailed>,
 ) -> io::Result<bool> {
+    // BackOtter: past PATH_MAX, through a short path to it; the messages,
+    // and a temporary file left, name `path`.
+    let sys = &*walkdir::short_path(path);
     // BackOtter: waits for the exit once XFS options are put back for it.
     let _making = super::making_entries();
     if CLONE_SUPPORTED {
-        match open_regular(path).map_err(CloneFailed::Failed).and_then(|(f, _)| clone_over(&f, path)) {
+        match open_regular(sys)
+            .map_err(CloneFailed::Failed)
+            .and_then(|(f, _)| clone_over(&f, sys).map_err(|failed| failed.beside(path)))
+        {
             Ok(()) => return Ok(true),
             Err(left @ CloneFailed::TempLeft { .. }) => return Err(left.into()),
             Err(CloneFailed::Failed(err)) => {
@@ -272,7 +294,7 @@ fn break_link_with(
             }
         }
     }
-    std::fs::remove_file(path)?;
+    std::fs::remove_file(sys)?;
     Ok(false)
 }
 
@@ -295,9 +317,9 @@ pub(super) fn has_other_names(path: &Path) -> bool {
 /// What a backup would record for what is at `target` now, if it can all
 /// be read.
 fn node_now(target: &Path) -> Option<Node> {
-    // BackOtter: past PATH_MAX, through short paths to them.
-    let target = &*walkdir::short_path(target);
-    let m = std::fs::symlink_metadata(target).ok()?;
+    // BackOtter: past PATH_MAX, through a short path to it (map_path makes
+    // its own for each call).
+    let m = std::fs::symlink_metadata(walkdir::short_path(target)).ok()?;
     let name = target.file_name().unwrap_or_else(|| OsStr::new(""));
     let incomplete = Incomplete::default();
     let opts = LocalSourceSaveOptions::default()
@@ -310,9 +332,9 @@ fn node_now(target: &Path) -> Option<Node> {
 /// Whether what is at `target` is already `node`'s type: for a special
 /// file, the same symlink target or device.
 pub(super) fn same_type(target: &Path, node: &Node) -> bool {
-    // BackOtter: past PATH_MAX, through short paths to them.
-    let target = &*walkdir::short_path(target);
-    let Ok(m) = std::fs::symlink_metadata(target) else {
+    // BackOtter: past PATH_MAX, through a short path to it (map_path makes
+    // its own for each call).
+    let Ok(m) = std::fs::symlink_metadata(walkdir::short_path(target)) else {
         return false;
     };
     let name = target.file_name().unwrap_or_else(|| OsStr::new(""));

@@ -294,9 +294,16 @@ that either program restores what the other backed up.
   temporary directory, or one of over 500 bytes, which would leave a link
   too long to shorten a path), a long path fails as before. Only the system calls
   take the short paths: the walk's entries, the restore's comparisons with
-  what the destination holds (`--delete`), its aliases and every message
+  what the destination holds (`--delete`), its aliases and the messages
   keep the long ones, but for errors from `LocalDestination`'s own calls
-  (`sys_path`), which name the short one. The calls so routed: the
+  (`sys_path`) and those the system modules make of their calls' errors
+  (`osattrs/linux.rs`: an ioctl's error naming the file, its debug
+  messages), which name the short one. 0.13.0+backotter.16 to .20 named
+  the short one, under `$TMPDIR/.bko-longpath-PID-N` (gone at exit), in a
+  few more: a backup's warnings about flags, attributes and extended
+  attributes and its symlink errors, `--delete`'s "entries not removed",
+  `--exact`'s clone errors and the temporary file one leaves, and the
+  flags not put back on a file's other names. The calls so routed: the
   walker's listing and `lstat` (walkdir: `noatime::read_dir`,
   `DirEntry::metadata`, `--one-file-system`'s device), a backup's reads of
   an entry's metadata (`map_path`), contents (`OpenFile::open`) and

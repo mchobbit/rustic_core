@@ -677,9 +677,9 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
         // refuses removal stays, as with --delete.
         let (removed, put_back) =
             remove_held(path, sets, &replaced, |path| match (is_dir, opts.delete) {
-                (false, _) => std::fs::remove_file(path),
+                (false, _) => std::fs::remove_file(walkdir::short_path(path)),
                 (true, true) => remove_tree(path, &replaced),
-                (true, false) => std::fs::remove_dir(path),
+                (true, false) => std::fs::remove_dir(walkdir::short_path(path)),
             });
         if let Err(err) = put_back {
             put_back_failed(path, &err);
@@ -1067,7 +1067,9 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         dirs.borrow_mut().change_parent(&target);
                         let sets = osattrs::node_sets_flags(node, known_bko);
                         let (removed, put_back) =
-                            remove_held(&target, sets, &replaced, |t| std::fs::remove_file(t));
+                            remove_held(&target, sets, &replaced, |t| {
+                                std::fs::remove_file(walkdir::short_path(t))
+                            });
                         if let Err(err) = removed {
                             warn!("restore {}: {err}", path.display());
                             count();
@@ -1200,7 +1202,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
             continue;
         }
         dirs.borrow_mut().change_parent(&target);
-        match remove_held(&target, true, &replaced, |t| std::fs::remove_file(t)) {
+        match remove_held(&target, true, &replaced, |t| std::fs::remove_file(walkdir::short_path(t))) {
             (Ok(()), Err(err)) => put_back_failed(&target, &err),
             (Ok(()), Ok(())) => {}
             (Err(err), _) => debug!("{} not removed early: {err}", target.display()),
@@ -2285,8 +2287,9 @@ fn remove_held(
     replaced: &RefCell<Replaced>,
     remove: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> (std::io::Result<()>, std::io::Result<()>) {
-    // BackOtter: past PATH_MAX, through a short path to it.
-    let target = &*walkdir::short_path(target);
+    // BackOtter: past PATH_MAX, `remove` and the calls here take a short
+    // path to it each (walkdir::short_path), and their messages name
+    // `target`.
     if !sets_flags {
         return (remove(target), Ok(()));
     }
@@ -3308,5 +3311,40 @@ mod tests {
         );
         assert!(!dir.path().join("after").exists());
         assert!(!early.exists());
+    }
+
+    /// BackOtter (RustAudit1 XR1-02): what a removal past `PATH_MAX` can't
+    /// remove is named by its own path, not by the short one it was reached
+    /// through (in `$TMPDIR/.bko-longpath-PID-N`, gone at exit), which
+    /// rustic-bko 0.11.4+backotter.20's `remove_held` named.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn removal_past_path_max_names_the_long_path() {
+        use std::fs::{self, Permissions};
+        use std::os::unix::fs::PermissionsExt;
+
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("root removes it anyway");
+            return;
+        }
+        let top = tempfile::tempdir().unwrap();
+        let mut deep = top.path().to_path_buf();
+        for i in 0..110 {
+            deep.push(format!("d{i:03}{}", "x".repeat(36)));
+            fs::create_dir(walkdir::short_path(&deep)).unwrap();
+        }
+        let held = deep.join("held");
+        fs::create_dir(walkdir::short_path(&held)).unwrap();
+        fs::write(walkdir::short_path(&held.join("f")), b"x").unwrap();
+        fs::set_permissions(walkdir::short_path(&held), Permissions::from_mode(0o555)).unwrap();
+        assert!(held.as_os_str().len() > 4096);
+        let replaced = RefCell::new(Replaced::default());
+        let (removed, put_back) =
+            remove_held(&deep, false, &replaced, |path| remove_tree(path, &replaced));
+        fs::set_permissions(walkdir::short_path(&held), Permissions::from_mode(0o755)).unwrap();
+        assert!(put_back.is_ok());
+        let msg = removed.unwrap_err().to_string();
+        assert!(msg.contains(&*held.join("f").to_string_lossy()), "{msg}");
+        assert!(!msg.contains(".bko-longpath"), "{msg}");
     }
 }
