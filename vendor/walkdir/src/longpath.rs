@@ -4,15 +4,32 @@
 // (PATH_MAX, 4096 bytes on Linux, its NUL included: ENAMETOOLONG past it),
 // and a backup must read them and a restore make them, as tar and rsync do.
 // `short_path` gives, for such a path, a shorter one to the same file: the
-// directory at a prefix of the path (of at most 1000 bytes, ending at a
-// component: XFS refuses a symbolic link's target past 1024 bytes) is
-// reached through a symbolic link to it, in a directory of this process's
-// own (mode 0700, in the temporary directory, removed at exit), and the
-// rest of the path follows the link; a rest still too long is shortened the
-// same way, from that link. A link is followed by name, as
-// the long path's own components are, so the short path names whatever the
-// long one names, now and after the tree changes; and each prefix has one
-// link, so a path gets the same short path every time.
+// directory at a prefix of the path (ending at a component) is reached
+// through a symbolic link to it, in a directory of this process's own (mode
+// 0700, in the temporary directory, removed at exit), and the rest of the
+// path follows the link; a rest still too long is shortened the same way,
+// from that link. A link is followed by name, as the long path's own
+// components are, so the short path names whatever the long one names, now
+// and after the tree changes; and each prefix has one link, so a path gets
+// the same short path every time.
+//
+// A prefix is at most 2048 bytes (PATH_MAX / 2) where the links' directory
+// takes a link's target of that many bytes, and at most 1000 where it
+// doesn't: XFS refuses a target past 1024 bytes, ext2/3/4 and minix on
+// 1 KiB blocks past 1023 (symlink(2) ENAMETOOLONG). Which one is decided
+// once per process, by a link made in the new directory before any other
+// (`probe`), so a prefix is always cut at the same place.
+//
+// Depth: a system call follows at most 40 symbolic links in a path (Linux's
+// MAXSYMLINKS; ELOOP past it), and a short path made in k rounds follows k
+// links (each link's target starts with the link before), so a path that
+// takes more than 40 rounds fails (ELOOP), as one too long did before. A
+// round cuts its prefix less the link's own path (its directory and some
+// 30 bytes), so the deepest path reached is about, with 2048-byte prefixes,
+// 82 KB (names of 40 bytes, an 18-byte $TMPDIR), 77 KB (names of 200
+// bytes) and 55 KB at worst (names of 255 bytes, a 495-byte $TMPDIR); with
+// 1000-byte prefixes 42 KB, 36 KB and 14 KB. Other links along the path
+// (in $TMPDIR, say) count toward the 40 too.
 //
 // Only on Linux and Android, where the rest of BackOtter's rustic_core is
 // tested past PATH_MAX; elsewhere a path is given back as it is, and a
@@ -54,77 +71,138 @@ mod imp {
 
     /// The bytes a path given to a system call has fewer than.
     pub(super) const MAX: usize = libc::PATH_MAX as usize;
-    /// The longest prefix a link leads to: a link's target, which XFS
-    /// keeps to 1024 bytes (XFS_SYMLINK_MAXLEN; symlink(2) is ENAMETOOLONG
-    /// past it), ext2/3/4 and minix to a block with its NUL (1023 bytes on
-    /// 1 KiB blocks), and tmpfs, btrfs, f2fs and ZFS to a page, a block or
-    /// PATH_MAX. A component is at most 255 bytes, so each link still cuts
-    /// hundreds of bytes off.
-    const CHUNK: usize = 1000;
+    /// The longest prefix a link leads to where the links' directory takes
+    /// a link's target of this many bytes (tmpfs, btrfs, f2fs, ZFS, ext4 on
+    /// 4 KiB blocks: a page, a block or PATH_MAX).
+    pub(super) const LONG: usize = MAX / 2;
+    /// The longest prefix a link leads to where it doesn't: XFS keeps a
+    /// target to 1024 bytes (XFS_SYMLINK_MAXLEN), ext2/3/4 and minix to a
+    /// block with its NUL (1023 on 1 KiB blocks). A component is at most
+    /// 255 bytes, so each link still cuts hundreds of bytes off.
+    pub(super) const SHORT: usize = 1000;
     /// The longest temporary directory the links are made in: a link's
     /// path (it, `/.bko-longpath-PID-N/`, a number: under 50 bytes more)
     /// must be shorter than the shortest prefix a round cuts, which ends at
-    /// the last '/' in its first CHUNK + 1 bytes, past CHUNK - NAME_MAX
-    /// (255), so that each round shortens the path.
-    const TMP_MAX: usize = CHUNK / 2;
-    const _: () = assert!(TMP_MAX + 50 < CHUNK - 255);
+    /// the last '/' in its first chunk + 1 bytes, past chunk - NAME_MAX
+    /// (255), so that each round shortens the path, with either chunk.
+    const TMP_MAX: usize = SHORT / 2;
+    const _: () = assert!(TMP_MAX + 50 < SHORT - 255);
+    const _: () = assert!(SHORT < LONG && LONG < MAX);
 
-    /// The directory the links are in, once made.
+    /// The directory of this process's links, once made (for `remove_dir`).
     static DIR: OnceLock<PathBuf> = OnceLock::new();
-    /// The link made to each prefix.
-    static LINKS: Mutex<Option<HashMap<PathBuf, PathBuf>>> = Mutex::new(None);
+    /// This process's links, once their directory is made.
+    static LINKS: Mutex<Option<Links>> = Mutex::new(None);
+
+    /// Links to prefixes, in a directory only they are made in.
+    pub(super) struct Links {
+        dir: PathBuf,
+        /// The longest prefix a link leads to: LONG or SHORT, for good.
+        chunk: usize,
+        /// The link made to each prefix.
+        map: HashMap<PathBuf, PathBuf>,
+    }
 
     fn too_long() -> io::Error {
         io::Error::from_raw_os_error(libc::ENAMETOOLONG)
     }
 
-    pub(super) fn shorten(path: &Path) -> io::Result<PathBuf> {
-        // Absolute, for a link to lead to; without doubled slashes or "."
-        // components, so that one prefix is always spelled one way.
-        let mut p: PathBuf = if path.is_absolute() {
+    /// Absolute, for a link to lead to; without doubled slashes or "."
+    /// components, so that one prefix is always spelled one way.
+    pub(super) fn absolute(path: &Path) -> io::Result<PathBuf> {
+        Ok(if path.is_absolute() {
             path.components().collect()
         } else {
             std::env::current_dir()?.join(path).components().collect()
+        })
+    }
+
+    pub(super) fn shorten(path: &Path) -> io::Result<PathBuf> {
+        let p = absolute(path)?;
+        let mut guard = LINKS.lock().unwrap_or_else(PoisonError::into_inner);
+        let links = match guard.take() {
+            Some(links) => links,
+            None => Links::for_process()?,
         };
-        while p.as_os_str().as_bytes().len() >= MAX {
-            let b = p.as_os_str().as_bytes();
-            let cut = b[..=CHUNK]
-                .iter()
-                .rposition(|&c| c == b'/')
-                .filter(|&i| i > 0)
-                .ok_or_else(too_long)?;
-            let link = link_to(Path::new(OsStr::from_bytes(&b[..cut])))?;
-            // Each round must shorten it (a component of thousands of bytes
-            // can't be cut).
-            if link.as_os_str().as_bytes().len() >= cut {
-                return Err(too_long());
+        guard.insert(links).shorten(p)
+    }
+
+    impl Links {
+        /// This process's: a new directory, removed at exit, and the chunk
+        /// its file system takes. Called with `LINKS` held, so made once.
+        fn for_process() -> io::Result<Links> {
+            let dir = make_dir()?;
+            let _ = DIR.set(dir.clone());
+            // SAFETY: remove_dir is an extern "C" fn taking nothing.
+            let _ = unsafe { libc::atexit(remove_dir) };
+            let chunk = probe(&dir);
+            Ok(Links::with_chunk(dir, chunk))
+        }
+
+        /// In `dir`, with prefixes of at most `chunk` bytes (LONG or SHORT).
+        pub(super) fn with_chunk(dir: PathBuf, chunk: usize) -> Links {
+            assert!(chunk == LONG || chunk == SHORT);
+            Links { dir, chunk, map: HashMap::new() }
+        }
+
+        /// `p` (absolute, as `absolute` spells it) shortened below MAX.
+        pub(super) fn shorten(&mut self, mut p: PathBuf) -> io::Result<PathBuf> {
+            while p.as_os_str().as_bytes().len() >= MAX {
+                let b = p.as_os_str().as_bytes();
+                // In bounds: chunk + 1 <= MAX <= the path's length.
+                let cut = b[..=self.chunk]
+                    .iter()
+                    .rposition(|&c| c == b'/')
+                    .filter(|&i| i > 0)
+                    .ok_or_else(too_long)?;
+                let link = self.link_to(Path::new(OsStr::from_bytes(&b[..cut])))?;
+                // Each round must shorten it (a component of thousands of
+                // bytes can't be cut).
+                if link.as_os_str().as_bytes().len() >= cut {
+                    return Err(too_long());
+                }
+                p = link.join(OsStr::from_bytes(&b[cut + 1..]));
             }
-            p = link.join(OsStr::from_bytes(&b[cut + 1..]));
+            Ok(p)
         }
-        Ok(p)
+
+        /// The link to the directory at `prefix`, made the first time.
+        fn link_to(&mut self, prefix: &Path) -> io::Result<PathBuf> {
+            if let Some(link) = self.map.get(prefix) {
+                return Ok(link.clone());
+            }
+            let link = self.dir.join(self.map.len().to_string());
+            std::os::unix::fs::symlink(prefix, &link)?;
+            let _ = self.map.insert(prefix.to_path_buf(), link.clone());
+            Ok(link)
+        }
     }
 
-    /// The link to the directory at `prefix`, made the first time.
-    fn link_to(prefix: &Path) -> io::Result<PathBuf> {
-        let mut links = LINKS.lock().unwrap_or_else(PoisonError::into_inner);
-        let links = links.get_or_insert_with(HashMap::new);
-        if let Some(link) = links.get(prefix) {
-            return Ok(link.clone());
+    /// LONG if a link in `dir` (new, and only this process's) takes a
+    /// target of LONG bytes and keeps it whole, else SHORT: symlink(2)
+    /// ENAMETOOLONG (XFS, ext2/3/4 and minix on 1 KiB blocks), or any other
+    /// failure, where SHORT does as well as LONG. The link, `probe` (the
+    /// others are numbers), is removed again.
+    fn probe(dir: &Path) -> usize {
+        let link = dir.join("probe");
+        let target = vec![b'p'; LONG];
+        let target = Path::new(OsStr::from_bytes(&target));
+        if std::os::unix::fs::symlink(target, &link).is_err() {
+            return SHORT;
         }
-        let dir = match DIR.get() {
-            Some(dir) => dir.clone(),
-            None => make_dir()?,
-        };
-        let link = dir.join(links.len().to_string());
-        std::os::unix::fs::symlink(prefix, &link)?;
-        let _ = links.insert(prefix.to_path_buf(), link.clone());
-        Ok(link)
+        let kept = std::fs::read_link(&link).is_ok_and(|t| t == target);
+        let _ = std::fs::remove_file(&link);
+        if kept {
+            LONG
+        } else {
+            SHORT
+        }
     }
 
-    /// Makes the directory of this process's links, a new one only it can
-    /// enter (another user's of the same name is passed over), removed at
-    /// exit. Called with `LINKS` held.
-    fn make_dir() -> io::Result<PathBuf> {
+    /// Makes a directory for links, a new one only this process can enter
+    /// (another user's of the same name is passed over), in the temporary
+    /// directory.
+    pub(super) fn make_dir() -> io::Result<PathBuf> {
         use std::os::unix::fs::DirBuilderExt;
 
         let tmp = std::env::temp_dir();
@@ -135,12 +213,7 @@ mod imp {
         for n in 0..1000u32 {
             let dir = tmp.join(format!(".bko-longpath-{pid}-{n}"));
             match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-                Ok(()) => {
-                    let _ = DIR.set(dir.clone());
-                    // SAFETY: remove_dir is an extern "C" fn taking nothing.
-                    let _ = unsafe { libc::atexit(remove_dir) };
-                    return Ok(dir);
-                }
+                Ok(()) => return Ok(dir),
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(err) => return Err(err),
             }
@@ -156,10 +229,11 @@ mod imp {
         }
     }
 
-    /// The links' directory, for tests.
+    /// The process's links' directory and chunk, for tests.
     #[cfg(test)]
-    pub(super) fn dir() -> Option<PathBuf> {
-        DIR.get().cloned()
+    pub(super) fn dir() -> Option<(PathBuf, usize)> {
+        let guard = LINKS.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.as_ref().map(|links| (links.dir.clone(), links.chunk))
     }
 }
 
@@ -217,6 +291,31 @@ mod tests {
         dir
     }
 
+    /// Every link in `dir` leads to at most `chunk` bytes, and with the
+    /// short chunk to at most XFS's 1024; returns how many there are.
+    fn check_targets(dir: &Path, chunk: usize) -> usize {
+        let mut n = 0;
+        for e in fs::read_dir(dir).unwrap() {
+            let target = fs::read_link(e.unwrap().path()).unwrap();
+            let len = target.as_os_str().len();
+            assert!(len <= chunk, "{} bytes, chunk {}", len, chunk);
+            if chunk == imp::SHORT {
+                assert!(len <= 1024, "{} bytes, past XFS's 1024", len);
+            }
+            n += 1;
+        }
+        n
+    }
+
+    /// Whether a link to a target of over 1024 bytes can be made in the
+    /// temporary directory's file system (in a directory of its own).
+    fn takes_long_targets() -> bool {
+        let dir = imp::make_dir().unwrap();
+        let ok = std::os::unix::fs::symlink("x".repeat(1025), dir.join("over-1024")).is_ok();
+        fs::remove_dir_all(&dir).unwrap();
+        ok
+    }
+
     #[test]
     fn short_paths_are_given_as_they_are() {
         let p = Path::new("/a/b/c");
@@ -246,20 +345,20 @@ mod tests {
         fs::write(short_path(&bottom.join("new")), b"made").unwrap();
         assert!(fs::read_dir(&short).unwrap().any(|e| e.unwrap().file_name() == "new"));
         // The links are in a directory only this user can enter.
-        let links = imp::dir().unwrap();
+        let (links, chunk) = imp::dir().unwrap();
         assert!(links.starts_with(std::env::temp_dir()));
         let mode = fs::symlink_metadata(&links).unwrap().mode();
         assert_eq!(mode & 0o777, 0o700);
-        // Each link's target fits XFS's 1024 bytes, for a temporary
-        // directory there (rustic-bko 0.11.4+backotter.17 on 2048-byte
-        // targets: symlink(2) ENAMETOOLONG, the long paths left out).
-        let mut n = 0;
-        for e in fs::read_dir(&links).unwrap() {
-            let target = fs::read_link(e.unwrap().path()).unwrap();
-            assert!(target.as_os_str().len() <= 1024, "{} bytes", target.as_os_str().len());
-            n += 1;
-        }
-        assert!(n >= 4, "{n} links");
+        // The short chunk where the temporary directory's file system
+        // refuses a target over 1024 bytes (XFS: rustic-bko
+        // 0.11.4+backotter.17's 2048-byte targets were ENAMETOOLONG there,
+        // the long paths left out), the long one where it takes them.
+        let long_ok = takes_long_targets();
+        eprintln!("links in {}: chunk {chunk}; a target over 1024 bytes taken: {long_ok}", links.display());
+        assert_eq!(chunk, if long_ok { imp::LONG } else { imp::SHORT });
+        // Each link's target is within it, and fits XFS with the short one.
+        let n = check_targets(&links, chunk);
+        assert!(n >= 2, "{} links", n);
         // GNU rm removes a tree of any depth.
         let _ = std::process::Command::new("rm").arg("-rf").arg(&top).status();
     }
@@ -267,7 +366,7 @@ mod tests {
     #[test]
     fn names_of_name_max_bytes_are_cut_too() {
         // A '/' every 256 bytes: a prefix is cut as far as 255 bytes short
-        // of CHUNK, and each round still shortens the path.
+        // of the chunk, and each round still shortens the path.
         let top = top("namemax");
         let (bottom, id) = deep_tree_of(&top, 40, 255);
         assert!(bottom.as_os_str().len() > 2 * imp::MAX);
@@ -276,10 +375,42 @@ mod tests {
         let m = fs::symlink_metadata(&short).unwrap();
         assert_eq!((m.dev(), m.ino()), id);
         assert_eq!(fs::read(short_path(&bottom.join("leaf"))).unwrap(), b"deep");
-        for e in fs::read_dir(imp::dir().unwrap()).unwrap() {
-            let target = fs::read_link(e.unwrap().path()).unwrap();
-            assert!(target.as_os_str().len() <= 1024, "{} bytes", target.as_os_str().len());
-        }
+        let (links, chunk) = imp::dir().unwrap();
+        let _ = check_targets(&links, chunk);
+        let _ = std::process::Command::new("rm").arg("-rf").arg(&top).status();
+    }
+
+    #[test]
+    fn the_short_chunk_reaches_the_same_file() {
+        // The fallback for XFS and 1 KiB-block ext2/3/4, wherever the
+        // temporary directory is: links of their own, in a directory of
+        // their own, to prefixes of at most SHORT bytes.
+        let top = top("fallback");
+        let (bottom, id) = deep_tree(&top, 330);
+        let dir = imp::make_dir().unwrap();
+        let mut links = imp::Links::with_chunk(dir.clone(), imp::SHORT);
+        let long = imp::absolute(&bottom).unwrap();
+        let short = links.shorten(long.clone()).unwrap();
+        assert!(short.as_os_str().len() < imp::MAX, "{}", short.display());
+        let m = fs::symlink_metadata(&short).unwrap();
+        assert_eq!((m.dev(), m.ino()), id);
+        assert_eq!(fs::read(short.join("leaf")).unwrap(), b"deep");
+        // At least one link per SHORT bytes cut; the same short path again,
+        // and no new link for it.
+        let n = check_targets(&dir, imp::SHORT);
+        assert!(n * imp::SHORT >= long.as_os_str().len() - imp::MAX, "{} links", n);
+        assert_eq!(links.shorten(long).unwrap(), short);
+        assert_eq!(check_targets(&dir, imp::SHORT), n);
+        // 255-byte names too: a '/' every 256 bytes.
+        let names = top.join("namemax");
+        fs::create_dir(&names).unwrap();
+        let (bottom, id) = deep_tree_of(&names, 40, 255);
+        let short = links.shorten(imp::absolute(&bottom).unwrap()).unwrap();
+        assert!(short.as_os_str().len() < imp::MAX, "{}", short.display());
+        let m = fs::symlink_metadata(&short).unwrap();
+        assert_eq!((m.dev(), m.ino()), id);
+        assert!(check_targets(&dir, imp::SHORT) > n);
+        fs::remove_dir_all(&dir).unwrap();
         let _ = std::process::Command::new("rm").arg("-rf").arg(&top).status();
     }
 
