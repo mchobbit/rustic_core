@@ -214,9 +214,8 @@ mod imp {
                 if let Some((kind, why)) = FAILED.get() {
                     return Err(io::Error::new(*kind, why.clone()));
                 }
-                Links::for_process().map_err(|err| {
+                Links::for_process().inspect_err(|err| {
                     let _ = FAILED.set((err.kind(), err.to_string()));
-                    err
                 })?
             }
         };
@@ -433,7 +432,7 @@ mod tests {
         let target = PathBuf::from("x".repeat(imp::LONG));
         let link = dir.join("long");
         let ok = std::os::unix::fs::symlink(&target, &link).is_ok()
-            && fs::read_link(&link).map_or(false, |t| t == target);
+            && fs::read_link(&link).is_ok_and(|t| t == target);
         fs::remove_dir_all(&dir).unwrap();
         ok
     }
@@ -451,7 +450,7 @@ mod tests {
         }
         let test = format!("longpath::tests::{}", name);
         let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(&["--exact", &test, "--nocapture", "--test-threads=1"])
+            .args(["--exact", &test, "--nocapture", "--test-threads=1"])
             .env(CHILD, "1")
             .env("TMPDIR", tmp)
             .output()
@@ -520,7 +519,7 @@ mod tests {
         let mut links = imp::Links::with_chunk(dir.clone(), imp::SHORT);
         let short = links.shorten(imp::absolute(&bottom).unwrap()).unwrap();
         let n = check_targets(&dir, imp::SHORT);
-        assert!(n >= 25 && n <= 40, "{} links", n);
+        assert!((25..=40).contains(&n), "{} links", n);
         let m = fs::symlink_metadata(&short).unwrap_or_else(|err| panic!("{} links: {}", n, err));
         assert_eq!((m.dev(), m.ino()), id);
         assert_eq!(fs::read(short.join("leaf")).unwrap(), b"deep");
