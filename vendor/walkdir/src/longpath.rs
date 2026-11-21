@@ -28,8 +28,12 @@
 // 30 bytes), so the deepest path reached is about, with 2048-byte prefixes,
 // 82 KB (names of 40 bytes, an 18-byte $TMPDIR), 77 KB (names of 200
 // bytes) and 55 KB at worst (names of 255 bytes, a 495-byte $TMPDIR); with
-// 1000-byte prefixes 42 KB, 36 KB and 14 KB. Other links along the path
-// (in $TMPDIR, say) count toward the 40 too.
+// 1000-byte prefixes 42 KB, 36 KB and 14 KB. The links' directory is in
+// $TMPDIR's canonical path, with no symbolic link in it: a link's path is
+// in its target's, and so in every later round's, and a symbolic link
+// there would be followed again in each round (0.13.0+backotter.16 to .20:
+// one halved the depth reached). Symbolic links in the long path's first
+// prefix count toward the 40 too, once.
 //
 // Where a short path can't be made, `short_path` gives the path as it is,
 // whose system call then fails as before, and the reason goes once to the
@@ -278,11 +282,13 @@ mod imp {
 
     /// Makes a directory for links, a new one only this process can enter
     /// (another user's of the same name is passed over), in the temporary
-    /// directory.
+    /// directory, by its canonical path (as it is if it has none): with no
+    /// symbolic link in a link's path, which each round would follow again.
     pub(super) fn make_dir() -> io::Result<PathBuf> {
         use std::os::unix::fs::DirBuilderExt;
 
         let tmp = std::env::temp_dir();
+        let tmp = std::fs::canonicalize(&tmp).unwrap_or(tmp);
         if !tmp.is_absolute() {
             let why = format!("the temporary directory {} isn't absolute", tmp.display());
             return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
@@ -457,6 +463,39 @@ mod tests {
     }
 
     #[test]
+    fn a_symlink_in_the_temporary_directory_is_followed_once() {
+        // $TMPDIR is a symbolic link to a directory.
+        let base = top("symtmp");
+        if std::env::var_os(CHILD).is_none() {
+            fs::create_dir(base.join("real")).unwrap();
+            std::os::unix::fs::symlink("real", base.join("tmp")).unwrap();
+        }
+        let tmp = base.join("tmp");
+        if !child("a_symlink_in_the_temporary_directory_is_followed_once", &tmp) {
+            let _ = std::process::Command::new("rm").arg("-rf").arg(&base).status();
+            return;
+        }
+        let tmp = std::env::temp_dir();
+        let canonical = fs::canonicalize(&tmp).unwrap();
+        assert_ne!(canonical, tmp);
+        let dir = imp::make_dir().unwrap();
+        // A path that takes some 27 rounds with the short chunk: through a
+        // link to the symbolic link each, it would follow 54 (ELOOP).
+        let top = top("deep");
+        let (bottom, id) = deep_tree(&top, 700);
+        let mut links = imp::Links::with_chunk(dir.clone(), imp::SHORT);
+        let short = links.shorten(imp::absolute(&bottom).unwrap()).unwrap();
+        let n = check_targets(&dir, imp::SHORT);
+        assert!(n >= 25 && n <= 40, "{} links", n);
+        let m = fs::symlink_metadata(&short).unwrap_or_else(|err| panic!("{} links: {}", n, err));
+        assert_eq!((m.dev(), m.ino()), id);
+        assert_eq!(fs::read(short.join("leaf")).unwrap(), b"deep");
+        assert!(dir.starts_with(&canonical), "{}", dir.display());
+        fs::remove_dir_all(&dir).unwrap();
+        let _ = std::process::Command::new("rm").arg("-rf").arg(&top).status();
+    }
+
+    #[test]
     fn short_paths_are_given_as_they_are() {
         let p = Path::new("/a/b/c");
         assert!(matches!(short_path(p), Cow::Borrowed(q) if q == p));
@@ -486,7 +525,7 @@ mod tests {
         assert!(fs::read_dir(&short).unwrap().any(|e| e.unwrap().file_name() == "new"));
         // The links are in a directory only this user can enter.
         let (links, chunk) = imp::dir().unwrap();
-        assert!(links.starts_with(std::env::temp_dir()));
+        assert!(links.starts_with(fs::canonicalize(std::env::temp_dir()).unwrap()));
         let mode = fs::symlink_metadata(&links).unwrap().mode();
         assert_eq!(mode & 0o777, 0o700);
         // The short chunk where the temporary directory's file system
