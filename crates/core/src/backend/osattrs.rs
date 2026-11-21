@@ -119,6 +119,17 @@ mod other;
 )))]
 use other as os;
 
+/// BackOtter: has the first error that keeps `walkdir::short_path` from
+/// shortening a path of `PATH_MAX` bytes or more (no directory for its
+/// links in `$TMPDIR`, a link refused) warned about, once in the process:
+/// such a path then fails as "File name too long", which doesn't say why.
+/// For a backup's source and a restore's destination.
+pub(crate) fn warn_on_short_path_errors() {
+    walkdir::report_short_path_errors(|err| {
+        warn!("paths of PATH_MAX bytes or more can't be reached, and fail as \"File name too long\": {err}");
+    });
+}
+
 /// Records the file flags and other attributes of the file at `path`, with
 /// metadata `m` (its lstat), in the generic attributes of its `node`. Errors
 /// are warned about: the rest of the node is still worth saving.

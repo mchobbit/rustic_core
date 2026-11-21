@@ -31,33 +31,89 @@
 // 1000-byte prefixes 42 KB, 36 KB and 14 KB. Other links along the path
 // (in $TMPDIR, say) count toward the 40 too.
 //
+// Where a short path can't be made, `short_path` gives the path as it is,
+// whose system call then fails as before, and the reason goes once to the
+// function given to `report_short_path_errors` (walkdir has no logger of
+// its own); `try_short_path` returns it.
+//
 // Only on Linux and Android, where the rest of BackOtter's rustic_core is
 // tested past PATH_MAX; elsewhere a path is given back as it is, and a
 // system call on one too long fails as before.
 
 use std::borrow::Cow;
+use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 /// BackOtter: a path to the file at `path` that a system call takes: `path`
 /// itself, unless it has `PATH_MAX` bytes or more, when it is a shorter one
 /// through a symbolic link to a directory along it (see this module). If
 /// that can't be made (no temporary directory to make links in, or one of
 /// over 500 bytes), `path` as
-/// it is, which then fails as before (`ENAMETOOLONG`).
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// it is, which then fails as before (`ENAMETOOLONG`); why it couldn't be
+/// made goes, the first time, to the function given to
+/// [`report_short_path_errors`].
 pub fn short_path(path: &Path) -> Cow<'_, Path> {
+    try_short_path(path).unwrap_or_else(|err| {
+        report(&err);
+        Cow::Borrowed(path)
+    })
+}
+
+/// BackOtter: [`short_path`], or why it couldn't shorten `path`.
+///
+/// # Errors
+///
+/// For a path of `PATH_MAX` bytes or more (Linux and Android), if a link to
+/// shorten it with couldn't be made: no directory for the links in the
+/// temporary directory (none, not writable, not absolute, or too long), a
+/// link refused (`symlink(2)`: no space, a quota), or a path that can't be
+/// cut (no '/' to cut it at); or, for a relative one, no current directory.
+/// The error says what failed, and where. A directory for the links that
+/// couldn't be made is the process's for good: each later call gives that
+/// error again, without trying again.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn try_short_path(path: &Path) -> io::Result<Cow<'_, Path>> {
     use std::os::unix::ffi::OsStrExt;
 
     if path.as_os_str().as_bytes().len() < imp::MAX {
-        return Cow::Borrowed(path);
+        return Ok(Cow::Borrowed(path));
     }
-    imp::shorten(path).map_or(Cow::Borrowed(path), Cow::Owned)
+    imp::shorten(path).map(Cow::Owned)
 }
 
 /// BackOtter: `path` as it is (see this module).
+///
+/// # Errors
+///
+/// None here.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn short_path(path: &Path) -> Cow<'_, Path> {
-    Cow::Borrowed(path)
+pub fn try_short_path(path: &Path) -> io::Result<Cow<'_, Path>> {
+    Ok(Cow::Borrowed(path))
+}
+
+/// BackOtter: has `report` called with the error, the first time in the
+/// process that [`short_path`] can't shorten a path (later ones are mostly
+/// the same, a directory for the links that couldn't be made, and their
+/// paths fail as `ENAMETOOLONG` each): for the caller to log, so that a
+/// path left out says why. Only the first `report` given is kept.
+pub fn report_short_path_errors(report: fn(&io::Error)) {
+    let _ = REPORT.set(report);
+}
+
+/// What [`report_short_path_errors`] was given.
+static REPORT: OnceLock<fn(&io::Error)> = OnceLock::new();
+/// Whether an error went to it.
+static REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// `err` to [`REPORT`], if it is set and has had none.
+fn report(err: &io::Error) {
+    if let Some(report) = REPORT.get() {
+        if !REPORTED.swap(true, Ordering::Relaxed) {
+            report(err);
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -93,6 +149,9 @@ mod imp {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     /// This process's links, once their directory is made.
     static LINKS: Mutex<Option<Links>> = Mutex::new(None);
+    /// Why their directory couldn't be made, for good: the error's kind and
+    /// message.
+    static FAILED: OnceLock<(io::ErrorKind, String)> = OnceLock::new();
 
     /// Links to prefixes, in a directory only they are made in.
     pub(super) struct Links {
@@ -103,8 +162,15 @@ mod imp {
         map: HashMap<PathBuf, PathBuf>,
     }
 
-    fn too_long() -> io::Error {
-        io::Error::from_raw_os_error(libc::ENAMETOOLONG)
+    /// `ENAMETOOLONG`, saying why.
+    fn too_long(why: String) -> io::Error {
+        let kind = io::Error::from_raw_os_error(libc::ENAMETOOLONG).kind();
+        io::Error::new(kind, why)
+    }
+
+    /// `err`, saying what failed first.
+    fn failed(what: String, err: io::Error) -> io::Error {
+        io::Error::new(err.kind(), format!("{}: {}", what, err))
     }
 
     /// Absolute, for a link to lead to; without doubled slashes or "."
@@ -113,7 +179,9 @@ mod imp {
         Ok(if path.is_absolute() {
             path.components().collect()
         } else {
-            std::env::current_dir()?.join(path).components().collect()
+            let cwd = std::env::current_dir()
+                .map_err(|err| failed("no current directory for a relative path".into(), err))?;
+            cwd.join(path).components().collect()
         })
     }
 
@@ -122,7 +190,15 @@ mod imp {
         let mut guard = LINKS.lock().unwrap_or_else(PoisonError::into_inner);
         let links = match guard.take() {
             Some(links) => links,
-            None => Links::for_process()?,
+            None => {
+                if let Some((kind, why)) = FAILED.get() {
+                    return Err(io::Error::new(*kind, why.clone()));
+                }
+                Links::for_process().map_err(|err| {
+                    let _ = FAILED.set((err.kind(), err.to_string()));
+                    err
+                })?
+            }
         };
         guard.insert(links).shorten(p)
     }
@@ -154,12 +230,12 @@ mod imp {
                     .iter()
                     .rposition(|&c| c == b'/')
                     .filter(|&i| i > 0)
-                    .ok_or_else(too_long)?;
+                    .ok_or_else(|| too_long(format!("no '/' to cut a path at in its first {} bytes", self.chunk + 1)))?;
                 let link = self.link_to(Path::new(OsStr::from_bytes(&b[..cut])))?;
                 // Each round must shorten it (a component of thousands of
                 // bytes can't be cut).
                 if link.as_os_str().as_bytes().len() >= cut {
-                    return Err(too_long());
+                    return Err(too_long(format!("the link {} isn't shorter than the {} bytes it leads to", link.display(), cut)));
                 }
                 p = link.join(OsStr::from_bytes(&b[cut + 1..]));
             }
@@ -172,7 +248,8 @@ mod imp {
                 return Ok(link.clone());
             }
             let link = self.dir.join(self.map.len().to_string());
-            std::os::unix::fs::symlink(prefix, &link)?;
+            std::os::unix::fs::symlink(prefix, &link)
+                .map_err(|err| failed(format!("no link {} made", link.display()), err))?;
             let _ = self.map.insert(prefix.to_path_buf(), link.clone());
             Ok(link)
         }
@@ -206,8 +283,12 @@ mod imp {
         use std::os::unix::fs::DirBuilderExt;
 
         let tmp = std::env::temp_dir();
-        if !tmp.is_absolute() || tmp.as_os_str().as_bytes().len() > TMP_MAX {
-            return Err(too_long());
+        if !tmp.is_absolute() {
+            let why = format!("the temporary directory {} isn't absolute", tmp.display());
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+        }
+        if tmp.as_os_str().as_bytes().len() > TMP_MAX {
+            return Err(too_long(format!("the temporary directory {} is over {} bytes", tmp.display(), TMP_MAX)));
         }
         let pid = std::process::id();
         for n in 0..1000u32 {
@@ -215,10 +296,11 @@ mod imp {
             match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
                 Ok(()) => return Ok(dir),
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(err) => return Err(err),
+                Err(err) => return Err(failed(format!("no directory {} made for links", dir.display()), err)),
             }
         }
-        Err(io::Error::from(io::ErrorKind::AlreadyExists))
+        let why = format!(".bko-longpath-{pid}-0 to -999 all in {}", tmp.display());
+        Err(io::Error::new(io::ErrorKind::AlreadyExists, why))
     }
 
     /// Removes the links' directory at exit: the links only, never what
@@ -314,6 +396,64 @@ mod tests {
         let ok = std::os::unix::fs::symlink("x".repeat(1025), dir.join("over-1024")).is_ok();
         fs::remove_dir_all(&dir).unwrap();
         ok
+    }
+
+    /// The variable that tells a test it runs in a child process (`child`).
+    const CHILD: &str = "BKO_LONGPATH_CHILD";
+
+    /// Whether this is the child process `child` runs a test in. In the
+    /// parent, it runs the test `name` (of this module) again in a child
+    /// process, with `tmp` the temporary directory, for what a process
+    /// decides once, and checks that it ran and passed.
+    fn child(name: &str, tmp: &Path) -> bool {
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        let test = format!("longpath::tests::{}", name);
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(&["--exact", &test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("TMPDIR", tmp)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{}", text);
+        assert!(text.contains("test result: ok. 1 passed"), "{}", text);
+        false
+    }
+
+    #[test]
+    fn a_link_directory_not_made_is_reported() {
+        // No such temporary directory.
+        let missing = std::env::temp_dir().join(format!("walkdir-longpath-missing-{}", std::process::id()));
+        if !child("a_link_directory_not_made_is_reported", &missing) {
+            return;
+        }
+        let missing = std::env::temp_dir();
+        let long = PathBuf::from(format!("/{}", "d/".repeat(3000)));
+        let err = try_short_path(&long).unwrap_err();
+        eprintln!("{}", err);
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(err.to_string().contains(&*missing.to_string_lossy()), "{}", err);
+        // The same error again, without trying again: not once it is there.
+        fs::create_dir(&missing).unwrap();
+        assert_eq!(try_short_path(&long).unwrap_err().to_string(), err.to_string());
+        assert_eq!(fs::read_dir(&missing).unwrap().count(), 0);
+        fs::remove_dir(&missing).unwrap();
+        // short_path gives the path as it is, and reports it once.
+        static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn seen(err: &std::io::Error) {
+            assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+            SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        report_short_path_errors(seen);
+        assert!(matches!(short_path(&long), Cow::Borrowed(p) if p == long));
+        assert!(matches!(short_path(&long), Cow::Borrowed(_)));
+        assert_eq!(SEEN.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]

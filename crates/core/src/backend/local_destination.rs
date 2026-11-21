@@ -211,6 +211,8 @@ impl LocalDestination {
             }
         }
 
+        // BackOtter: why paths past PATH_MAX can't be reached, if they can't.
+        osattrs::warn_on_short_path_errors();
         Ok(Self { path, is_file, clone_sources: None })
     }
 

@@ -129,7 +129,7 @@ pub use crate::dent::DirEntry;
 pub use crate::dent::DirEntryExt;
 pub use crate::error::Error;
 // BackOtter: paths past PATH_MAX (longpath.rs).
-pub use crate::longpath::short_path;
+pub use crate::longpath::{report_short_path_errors, short_path, try_short_path};
 
 mod dent;
 mod error;

@@ -240,6 +240,8 @@ impl LocalSource {
         }
 
         let builder = walk_builder;
+        // BackOtter: why paths past PATH_MAX can't be reached, if they can't.
+        osattrs::warn_on_short_path_errors();
 
         // BackOtter: the files the ignore crate reads in a directory
         // (unread_ignore_files): the custom ignore files, and with
