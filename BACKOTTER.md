@@ -264,18 +264,33 @@ that either program restores what the other backed up.
   restic still leaves it out (exit 3). Each system call on such a path
   goes through `walkdir::short_path` (the vendored walkdir's
   `src/longpath.rs`): a shorter path to the same file, through a symbolic
-  link to a directory at a prefix of the path (at most 1000 bytes, ending at
-  a component), and links to links for a longer one. The links are in a
+  link to a directory at a prefix of the path (at most 2048 bytes, or 1000
+  where `$TMPDIR`'s file system refuses a link to 2048 bytes, as XFS does;
+  ending at a component), and links to links for a longer one. The links
+  are in a
   directory of the process's own (`$TMPDIR/.bko-longpath-PID-N`, mode
   0700, a new one only it made), removed at exit (`atexit`); one per prefix,
   so a path always gets the same short path, and followed by name, as the
   long path's components are, so the short path names what the long one
-  names after the tree changes too. A prefix is at most 1000 bytes since
-  0.13.0+backotter.19: a link's target is, and XFS refuses one over 1024
-  bytes (`XFS_SYMLINK_MAXLEN`; ext2/3/4 on 1 KiB blocks, over 1023), so
-  0.13.0+backotter.16 to .18, whose prefixes were up to 2048 bytes, still
-  left the long paths out of a backup ("File name too long") and couldn't
-  restore them where `$TMPDIR` is on XFS. Where no link can be made (no
+  names after the tree changes too. A link's target is the prefix, and XFS
+  refuses one over 1024 bytes (`XFS_SYMLINK_MAXLEN`; ext2/3/4 and minix on
+  1 KiB blocks, over 1023), so 0.13.0+backotter.16 to .18, whose prefixes
+  were up to 2048 bytes, left the long paths out of a backup ("File name
+  too long") and couldn't restore them where `$TMPDIR` is on XFS;
+  0.13.0+backotter.19 cut every prefix to 1000 bytes, on every file system.
+  Since 0.13.0+backotter.20 the 2048-byte prefixes are kept where the links'
+  directory takes them: a process decides once, before its first link, by
+  making a link to a 2048-byte target there (`probe`), and takes 1000-byte
+  prefixes where that fails (`ENAMETOOLONG`, or anything else) or doesn't
+  read back whole. Depth limit: a system call follows at most 40 symbolic
+  links in a path (Linux's `MAXSYMLINKS`, `ELOOP` past it), and each link
+  leads to the one before, so a path that takes more than 40 links fails
+  (`ELOOP`) as before. Each link cuts its prefix less its own path
+  (`$TMPDIR` and some 30 bytes), so the deepest path reached is about 82 KB
+  with 2048-byte prefixes (40-byte names, an 18-byte `$TMPDIR`), 77 KB with
+  200-byte names and 55 KB at worst (255-byte names, a 495-byte `$TMPDIR`);
+  with 1000-byte prefixes (XFS) 42 KB, 36 KB and 14 KB (.19's, on every
+  file system). Where no link can be made (no
   temporary directory, or one of over 500 bytes, which would leave a link
   too long to shorten a path), a long path fails as before. Only the system calls
   take the short paths: the walk's entries, the restore's comparisons with
