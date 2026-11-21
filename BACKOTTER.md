@@ -290,7 +290,13 @@ that either program restores what the other backed up.
   with 2048-byte prefixes (40-byte names, an 18-byte `$TMPDIR`), 77 KB with
   200-byte names and 55 KB at worst (255-byte names, a 495-byte `$TMPDIR`);
   with 1000-byte prefixes (XFS) 42 KB, 36 KB and 14 KB (.19's, on every
-  file system). Where no link can be made (no
+  file system). The links' directory is in `$TMPDIR`'s canonical path, so
+  that no link's own path has a symbolic link in it: a link's path is in
+  the next link's target, and such a symbolic link was followed again in
+  every round, so with one in `$TMPDIR` (on an ostree system, `/home` ->
+  `var/home`) .16 to .20 reached half as deep (`ELOOP` at about 20
+  links). Symbolic links in the long path's own first prefix count once.
+  Where no link can be made (no
   temporary directory, or one of over 500 bytes, which would leave a link
   too long to shorten a path), a long path fails as before; since
   0.13.0+backotter.21 the first such failure in a run is warned about,
