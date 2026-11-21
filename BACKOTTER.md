@@ -285,8 +285,10 @@ that either program restores what the other backed up.
   prefixes where that fails (`ENAMETOOLONG`, or anything else) or doesn't
   read back whole. Depth limit: a system call follows at most 40 symbolic
   links in a path (Linux's `MAXSYMLINKS`, `ELOOP` past it), and each link
-  leads to the one before, so a path that takes more than 40 links fails
-  (`ELOOP`) as before. Each link cuts its prefix less its own path
+  leads to the one before, so a path that takes more than 40 links gets a
+  short path all the same, which fails with `ELOOP` ("Too many levels of
+  symbolic links", not "File name too long"), and is left out of a backup
+  as before. Each link cuts its prefix less its own path
   (`$TMPDIR` and some 30 bytes), so the deepest path reached is about 82 KB
   with 2048-byte prefixes (40-byte names, an 18-byte `$TMPDIR`), 77 KB with
   200-byte names, 55 KB with 255-byte names under a 495-byte `$TMPDIR` and
@@ -298,11 +300,14 @@ that either program restores what the other backed up.
   every round, so with one in `$TMPDIR` (on an ostree system, `/home` ->
   `var/home`) .16 to .20 reached half as deep (`ELOOP` at about 20
   links). Symbolic links in the long path's own first prefix count once.
-  Where no link can be made (no
-  temporary directory, or one of over 1024 bytes, or of over 500 where
-  the links lead to 1000-byte prefixes, which would leave a link too long
-  to shorten a path: .19 and .20 refused one of over 500 bytes everywhere,
-  where .16 to .18 took one of up to 1024), a long path fails as before; since
+  Where a link can't be made, a long path fails as before
+  (`ENAMETOOLONG`): no usable temporary directory for the links (none, not
+  writable, not absolute, or of over 1024 bytes, or of over 500 where the
+  links lead to 1000-byte prefixes, which would leave a link too long to
+  shorten a path: .19 and .20 refused one of over 500 bytes everywhere,
+  where .16 to .18 took one of up to 1024), a link refused (`symlink(2)`:
+  no space, a quota, a file system without symbolic links), or a path with
+  no '/' to cut it at. Since
   0.13.0+backotter.21 the first such failure in a run is warned about,
   once, saying why ("paths of PATH_MAX bytes or more can't be reached, and
   fail as "File name too long": no directory /tmp/.bko-longpath-... made
