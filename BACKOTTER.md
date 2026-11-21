@@ -292,7 +292,14 @@ that either program restores what the other backed up.
   with 1000-byte prefixes (XFS) 42 KB, 36 KB and 14 KB (.19's, on every
   file system). Where no link can be made (no
   temporary directory, or one of over 500 bytes, which would leave a link
-  too long to shorten a path), a long path fails as before. Only the system calls
+  too long to shorten a path), a long path fails as before; since
+  0.13.0+backotter.21 the first such failure in a run is warned about,
+  once, saying why ("paths of PATH_MAX bytes or more can't be reached, and
+  fail as "File name too long": no directory /tmp/.bko-longpath-... made
+  for links: Read-only file system"; `walkdir::report_short_path_errors`,
+  `try_short_path`), and a directory for the links that couldn't be made
+  isn't tried again for each path. .16 to .20 said only "File name too
+  long", for each path, which hid .16 to .18's XFS failure (above). Only the system calls
   take the short paths: the walk's entries, the restore's comparisons with
   what the destination holds (`--delete`), its aliases and the messages
   keep the long ones, but for errors from `LocalDestination`'s own calls
