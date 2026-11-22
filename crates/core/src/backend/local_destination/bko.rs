@@ -1009,7 +1009,7 @@ mod tests {
             off += blob.len() as u64;
         }
         for (blob, off) in blobs.iter().zip(&offsets).rev() {
-            LocalDestination::write_sparse_at(&file, *off, blob).unwrap();
+            LocalDestination::write_sparse_at(&file, *off, blob, block).unwrap();
         }
         let want: Vec<u8> = blobs.concat();
         assert_eq!(fs::read(dir.path().join("f")).unwrap(), want);

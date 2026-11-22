@@ -1019,9 +1019,10 @@ impl LocalDestination {
     }
 
     /// BackOtter: write `data` to `file`, a file restored sparse, at
-    /// `offset`, leaving holes: of each block of the file system
-    /// ([`osattrs::hole_block_size`]) that `data` reaches into, the part
-    /// inside `data` isn't written if it is all zeros ([`sparse_writes`]).
+    /// `offset`, leaving holes: of each block of `block` bytes, the file
+    /// system's ([`osattrs::hole_block_size`] of `file`, which the caller
+    /// takes once per file), that `data` reaches into, the part inside
+    /// `data` isn't written if it is all zeros ([`sparse_writes`]).
     /// The file must be new, sized without being allocated: what isn't
     /// written reads as zeros. Positioned writes, as in [`Self::write_at`].
     ///
@@ -1032,10 +1033,11 @@ impl LocalDestination {
         file: &File,
         offset: u64,
         data: &[u8],
+        block: u64,
     ) -> LocalDestinationResult<()> {
         // BackOtter: waits for the exit once XFS options are put back for it.
         let _making = crate::commands::restore::making_entries();
-        for range in sparse_writes(offset, data, osattrs::hole_block_size(file)) {
+        for range in sparse_writes(offset, data, block) {
             let at = offset + range.start as u64;
             write_all_at(file, &data[range], at)
                 .map_err(LocalDestinationErrorKind::CouldNotWriteToBuffer)?;

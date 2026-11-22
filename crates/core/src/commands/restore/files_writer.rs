@@ -26,7 +26,7 @@ use std::{
 
 use log::{debug, error};
 
-use crate::backend::local_destination::LocalDestination;
+use crate::backend::{local_destination::LocalDestination, osattrs};
 
 /// The buckets the files are spread over, by index: a file is sized
 /// (created, allocated) or opened under its bucket's lock, which the writes
@@ -78,6 +78,10 @@ struct Bucket {
     sizes: Vec<u64>,
     /// The writes each file has under way or to come.
     left: Vec<usize>,
+    /// The block each file restored sparse has its holes in
+    /// ([`osattrs::hole_block_size`]), taken at its first handle, as it is
+    /// the same for each blob; 0 until then.
+    blocks: Vec<u64>,
     /// The files with writes under way, by index: the handle, and how many.
     busy: HashMap<usize, (Arc<File>, usize)>,
 }
@@ -107,6 +111,7 @@ impl<'a> FilesWriter<'a> {
             let bucket = &mut buckets[file_idx % BUCKETS];
             bucket.sizes.push(*size);
             bucket.left.push(left);
+            bucket.blocks.push(0);
         }
         Self {
             dest,
@@ -155,30 +160,31 @@ impl<'a> FilesWriter<'a> {
     pub(super) fn write(&self, file_idx: usize, start: u64, data: &[u8], zeros: bool) {
         let sparse = self.sparse[file_idx];
         let file = self.acquire(file_idx, !(sparse && zeros));
-        if let Some(file) = &file {
+        if let Some((file, block)) = &file {
             let written = if !sparse {
                 LocalDestination::write_at(file, start, data)
             } else if zeros {
                 Ok(())
             } else {
-                LocalDestination::write_sparse_at(file, start, data)
+                LocalDestination::write_sparse_at(file, start, data, *block)
             };
             if let Err(err) = written {
                 self.fail(file_idx, &err);
             }
         }
-        self.release(file_idx, file);
+        self.release(file_idx, file.map(|(file, _)| file));
     }
 
     /// The handle for a write to the file `file_idx`: the one in use, the
     /// idle one, or one opened, which at the file's first write sizes it
-    /// ([`LocalDestination::set_length`]). `None` for a file that failed,
-    /// and for a write that needs no handle (`needed` is false) to a file
-    /// sized already.
+    /// ([`LocalDestination::set_length`]); with the block a file restored
+    /// sparse has its holes in (0 for any other). `None` for a file that
+    /// failed, and for a write that needs no handle (`needed` is false) to
+    /// a file sized already.
     // The bucket's lock is held throughout, so that the file's other
     // writes wait until it is sized or opened, and use that handle.
     #[allow(clippy::significant_drop_tightening)]
-    fn acquire(&self, file_idx: usize, needed: bool) -> Option<Arc<File>> {
+    fn acquire(&self, file_idx: usize, needed: bool) -> Option<(Arc<File>, u64)> {
         let mut bucket = lock(&self.buckets[file_idx % BUCKETS]);
         if self.is_failed(file_idx) {
             return None;
@@ -188,7 +194,8 @@ impl<'a> FilesWriter<'a> {
                 return None;
             }
             *users += 1;
-            return Some(Arc::clone(file));
+            let file = Arc::clone(file);
+            return Some((file, bucket.blocks[file_idx / BUCKETS]));
         }
         let path = &self.filenames[file_idx];
         let size = std::mem::take(&mut bucket.sizes[file_idx / BUCKETS]);
@@ -219,8 +226,13 @@ impl<'a> FilesWriter<'a> {
                 }
             }
         };
+        let block = &mut bucket.blocks[file_idx / BUCKETS];
+        if *block == 0 && self.sparse[file_idx] {
+            *block = osattrs::hole_block_size(&file);
+        }
+        let block = *block;
         _ = bucket.busy.insert(file_idx, (Arc::clone(&file), 1));
-        Some(file)
+        Some((file, block))
     }
 
     /// Counts one write of the file `file_idx` done, which had the handle
