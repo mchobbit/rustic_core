@@ -382,12 +382,18 @@ that either program restores what the other backed up.
   plainly (the end of file). Other files, and every file elsewhere,
   are read plainly. On JFS and nilfs2 (`unix.sparse`, above),
   `SEEK_HOLE` gives the size, so a file there is read whole, holes and
-  all. Each all-zero chunk (holes give many, all of the chunker's
-  minimum size) is hashed once per file and length: the same bytes give
-  the same ID (upstream's #611, in 0.14.0, does it once per backup; see
-  "Not ported"). The rolling hash isn't skipped over long zero
-  runs: all-zero data already gives a boundary at the minimum chunk size,
-  with no rolling over its bytes.
+  all. An all-zero chunk at the length runs of zeros are cut at (holes
+  give many) isn't hashed: upstream's 0abb59f (#611, in 0.14.0) gives it
+  the ID it computes once per backup (`chunk_len_zeroes`: the minimum
+  chunk size with Rabin, whose hash of a window of zeros is 0, the chunk
+  size with fixed-size chunks), and the hole reader's zero runs are cut at
+  just that length. The fork's own cache, one hashed ID per file and
+  length of all-zero chunk (`chunk_id`, `zero_ids` in
+  `archiver/file_archiver.rs`), was dropped in the rebase onto 0.14.0; an
+  all-zero chunk of another length (a file's last) is hashed. The same
+  bytes give the same ID either way. The rolling hash isn't skipped over
+  long zero runs: all-zero data already gives a boundary at the minimum
+  chunk size, with no rolling over its bytes.
 - A file is restored sparse if, and only if, it is marked `unix.sparse` (or
   `restore --sparse by-content` asks for every file; `--sparse no` doesn't
   unmark one), and it goes into a new, empty file: nothing was at its path
@@ -783,7 +789,8 @@ that either program restores what the other backed up.
   rustic stamps a merge with its own version whatever was merged.
   `rewrite`, `copy` and `repair snapshots` keep each snapshot's own
   program version, as in stock rustic.
-- A hard link over an entry already at its name (upstream's #634, below):
+- A hard link over an entry already at its name (upstream's 506a1da, #634,
+  in 0.14.0):
   the right link, where a restore is run again over its own result, is
   left as it is; another file or a symlink is replaced; a directory is an
   error. Stock rustic 0.13.0 tried to link over it, failed (`EEXIST`) and
@@ -1405,6 +1412,14 @@ that either program restores what the other backed up.
   before the late flags; a failed clone dropping the file and leaving its
   temporary file without a word; and a verified file's atime moved by the
   restore's own read.
+- Upstream's b78f648 (#561, in 0.14.0) counts the entries a backup's walk
+  or archiver couldn't read in `SnapshotSummary::error_count`, which is
+  saved in the snapshot when it isn't 0 (restic ignores the field; restic-bko
+  doesn't write it). The fork keeps it as upstream has it, and each error
+  counted there counts toward `items_incomplete` too (`archiver.rs`), which
+  also counts what upstream's doesn't (above). The walker's errors keep
+  upstream's message and path (`ignore.rs`); an entry that vanished below a
+  backed-up path is still only warned about, in neither count.
 - The version reads `X.Y.Z+backotter.N`.
 
 The system calls need `unsafe`, which the workspace lints now deny (not
@@ -1424,11 +1439,45 @@ Not handled, as no BackOtter build needs it: on Windows, which isn't a
 BackOtter platform, a marked file is restored without holes: NTFS needs
 `FSCTL_SET_SPARSE`, which rustic doesn't set.
 
-## Upstream fixes after 0.13.0
+## Base: rustic_core 0.14.0
+
+Since 2026-11-22 the branch is on rustic_core-v0.14.0 (bf1de63, #545;
+rustic_backend-v0.8.0 at the same commit, rustic_config 0.2.5 and
+rustic_testing 0.5.0 as in 0.13.0), version 0.14.0+backotter.1; it was on
+0.13.0 (0.13.0+backotter.1 to .22). The rebase kept every BackOtter
+commit but for these:
+
+- The cherry-picks below, all in 0.14.0, were dropped, with the
+  dependency pins (0.14.0's lock has the same or newer releases: zstd
+  0.14.3, zstd-safe 8.3.0, zstd-sys 2.1.3, still zstd 1.5.7, so the same
+  compressed bytes; rustls 0.23.46, rustls-webpki 0.103.17, ctutils 0.4.8,
+  chacha20 0.10.2; suppaftp 10.0.2 with opendal 0.59.5). Of #590's and
+  #634's picks, which had conflicts, the fork's own part stays, as its own
+  commit: the paths the fork's restore code touches are checked, and
+  `hard_link`'s note.
+- 9f88530, the chunker hashing all 64 bytes before a chunk's minimum
+  size: upstream's 43740bf (#638) does the same. Its test,
+  `chunk_like_restic`, stays (above).
+- The per-file zero-chunk IDs of 8955dee (`chunk_id`, `zero_ids`):
+  upstream's 0abb59f (#611) instead (above).
+
+The versions in the commits from before the rebase read
+0.14.0+backotter.N with their old N (their messages name 0.13.0's); the
+first version on 0.14.0 is 0.14.0+backotter.1.
+
+Upstream's changes that came with 0.14.0 and touch what the fork does:
+#561's `error_count` (above, beside `items_incomplete`); #563, backup
+paths no longer merged into their parents (rustic's `backup` has the
+consequences); #629's clippy fixes and API changes (the fork's code
+builds on them); #553, iOS beside macOS where a device ID is an `i32`
+(Haiku's too, the fork's); #637's chunk size bounds; #639's prune rewrite; #558's `http-` option names and
+#556, #598, #642's HTTP options, which rustic's own configuration takes.
+
+### Upstream fixes taken before 0.14.0
 
 Fixes from rustic_core's `main` after the 0.13.0 release, cherry-picked
 (`git cherry-pick -x`, upstream's author kept) in version
-0.13.0+backotter.4; a rebase onto a release that has them drops them:
+0.13.0+backotter.4, and dropped in the rebase onto 0.14.0, which has them:
 
 - 52a1839 (#544) the cache backend is guarded by locks (a file read and
   written by two threads at once).
@@ -1472,25 +1521,25 @@ Fixes from rustic_core's `main` after the 0.13.0 release, cherry-picked
   rustic-bko doesn't build (rustic takes rustic_backend 0.7.0 from
   crates.io), so rustic-bko is unchanged by it.
 
-Dependencies (Cargo.lock only, semver-compatible, each to its first
-release that RustSec lists as patched): zstd 0.13.4, zstd-safe 7.4.0,
-zstd-sys 2.1.2 (still zstd 1.5.7: the same compressed bytes), rustls
-0.23.46, rustls-webpki 0.103.16, ctutils 0.4.4. Also chacha20 0.10.2,
+Dependencies on 0.13.0 (Cargo.lock only, semver-compatible, each to its
+first release that RustSec lists as patched; dropped with the rebase,
+above): zstd 0.13.4, zstd-safe 7.4.0, zstd-sys 2.1.2 (still zstd 1.5.7:
+the same compressed bytes), rustls 0.23.46, rustls-webpki 0.103.16,
+ctutils 0.4.4. Also chacha20 0.10.2,
 as 0.10.1 is yanked: its SSE2 backend, the one picked when AVX2 is
 missing, runs SSE4.1's `_mm_extract_epi32` in the RNG that `rand::rng()`
 gives (each nonce, `Id::random`, key salts), so a CPU with neither (AMD
 K8/K10, Core 2 Merom/Conroe) can get SIGILL (RustCrypto/stream-ciphers
-#579, fixed by #580). Left: suppaftp 8 (FTP command injection,
-RUSTSEC-2026-0271), fixed only in suppaftp 10, which needs opendal 0.59
-(upstream's #629), and rustic takes opendal through crates.io's
-rustic_backend 0.7.0 (rustic_backend 0.8.0, with opendal 0.59.5 and
-suppaftp 10.0.2, needs rustic_core 0.14.0, so it comes with the rebase
-below); rsa 0.9 (RUSTSEC-2023-0071), which has no fix;
+#579, fixed by #580). Left on 0.13.0, and fixed in 0.14.0: suppaftp 8 (FTP
+command injection, RUSTSEC-2026-0271), fixed only in suppaftp 10, which
+needs opendal 0.59 (upstream's #629), in rustic_backend 0.8.0. Left on
+both: rsa 0.9 (RUSTSEC-2023-0071), which has no fix;
 quinn-proto, webpki-root-certs and h2, which rustic-bko doesn't build;
-quick-xml 0.38 (RUSTSEC-2026-0194, -0195), which only rustic's
-self-update takes (its `release` feature, not built).
+quick-xml (0.38 on 0.13.0: RUSTSEC-2026-0194, -0195; 0.42 on 0.14.0),
+which only rustic's self-update takes (its `release` feature, not
+built).
 
-Not ported:
+Not ported on 0.13.0, and in the fork since the rebase onto 0.14.0:
 
 - e01b17f (#553) iOS build: no BackOtter platform.
 - ca81cfe (#549), e574765 (#552) documentation only.
@@ -1511,19 +1560,20 @@ Not ported:
 - eb72c72 (#598) a read timeout for HTTP backends: a feature.
 - 18fa55c (#642) a connect timeout for HTTP backends: a feature.
 
-Not ported, from `main` after 2026-11-05, all released in rustic_core
-0.14.0 and rustic_backend 0.8.0 (bf1de63, #545, 2026-11-17), which
-rustic v0.12.0 takes:
+From `main` after 2026-11-05, released in rustic_core 0.14.0 and
+rustic_backend 0.8.0 (bf1de63, #545, 2026-11-17), which rustic v0.12.0
+takes; in the fork since the rebase:
 
 - 43740bf (#638) the chunker prefills the whole rolling hash window, so it
   cuts where restic does: breaking, as cuts move. 9f88530 here does the
-  same (all 64 bytes hashed, above); on a rebase ours can drop, and
+  same (all 64 bytes hashed, above); it was dropped in the rebase, and
   `chunk_like_restic` (`chunker/rabin.rs`), whose lengths come from
   restic's chunker, checks that upstream's cuts the same.
 - 0abb59f (#611) all-zero chunks aren't hashed: one ID per backup, at the
-  minimum chunk size. The hole reader's `chunk_id` and `zero_ids` (above)
-  keep one per file and length, the same IDs; on a rebase ours can drop once
-  upstream's is checked to cover the hole reader's chunks.
+  minimum chunk size. The hole reader's `chunk_id` and `zero_ids` kept one
+  per file and length, the same IDs; they were dropped in the rebase, as
+  the hole reader's zero runs are cut at the length upstream checks
+  (above).
 - d658ed9 (#637) a minimum chunk size under 4 KiB no longer underflows
   (one chunk past the maximum) and one under 64 bytes is refused, not a
   panic: a fix, which changes no cut at 4 KiB or more; restic's
@@ -1534,10 +1584,8 @@ rustic v0.12.0 takes:
 - 269f9dc (#653) dependency updates: newer releases of the pins above.
 - 40152f3 (#648) CI only.
 
-These come with a rebase onto rustic_core 0.14.0 and rustic v0.12.0, which
-is pending: the user's decision (ForkAudit1 F9-01). It would also drop
-the cherry-picks above and the dependency pins (0.14.0's lock has newer
-ones).
+The rebase onto 0.14.0 was the user's decision of 2026-11-22 (ForkAudit1
+F9-01); rustic's `backotter` branch moves to v0.12.0 with it.
 
 ## Moving to a new rustic_core release
 
