@@ -331,6 +331,15 @@ that either program restores what the other backed up.
   every round, so with one in `$TMPDIR` (on an ostree system, `/home` ->
   `var/home`) .16 to .20 reached half as deep (`ELOOP` at about 20
   links). Symbolic links in the long path's own first prefix count once.
+  `$TMPDIR` and each directory above it are trusted, as every user of
+  `mktemp` trusts them: the links' directory and its contents are the
+  process's alone, but its name isn't, and is used again for each link
+  and short path, so a user who could rename an entry in `$TMPDIR` (one
+  that owns it or a directory above it, or can write to one that isn't
+  sticky) could put a directory of their own in its place, whose links a
+  restore run as root would then follow (ForkAudit1 F7-01). Root's own
+  `$TMPDIR` is that: setuid `sudo` and `su` drop an inherited `TMPDIR` on
+  glibc, and BackOtter runs rustic-bko with `/tmp`.
   Since 0.14.0+backotter.2 a link is checked each time it is used
   (`readlink`): one that is gone or leads elsewhere is made again, and the
   links' directory too (new, mode 0700; one that is there must still be a

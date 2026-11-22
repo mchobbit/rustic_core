@@ -41,6 +41,16 @@
 // one halved the depth reached). Symbolic links in the long path's first
 // prefix count toward the 40 too, once.
 //
+// Trust: $TMPDIR and each directory above it are trusted, as every user of
+// mktemp(3) trusts them. The links' directory (mode 0700, new) and its
+// links are this process's alone, but not its name, which each link and
+// each short path goes through again: whoever could rename an entry of
+// $TMPDIR (its owner, the owner of a directory above it, or anyone where
+// one of them is writable by others and not sticky) could put a directory
+// of their own there, whose links a restore run as root would follow. Root's
+// $TMPDIR is root's own (glibc drops an inherited one in setuid sudo and su),
+// and BackOtter runs rustic-bko with /tmp.
+//
 // A link is checked each time it is used (readlink): one that is gone, or
 // leads elsewhere, is made again, and its directory too (new, mode 0700;
 // one there must still be this user's alone), so a short path never goes
@@ -440,6 +450,8 @@ mod imp {
     /// (another user's of the same name is passed over), in the temporary
     /// directory, by its canonical path (as it is if it has none): with no
     /// symbolic link in a link's path, which each round would follow again.
+    /// Its contents are this process's alone; its name is only as safe as
+    /// the temporary directory, which is trusted (see this module).
     pub(super) fn make_dir() -> io::Result<PathBuf> {
         use std::os::unix::fs::DirBuilderExt;
 
