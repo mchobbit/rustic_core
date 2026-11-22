@@ -261,6 +261,14 @@ impl LocalDestination {
     /// For this destination's own system calls; the restore's decisions
     /// (what is where, in which order) go by [`Self::path`].
     ///
+    /// Past `PATH_MAX`, the directories down to the deepest prefix cut must
+    /// exist already: a short path leads through a link to that prefix,
+    /// which dangles where it doesn't exist, so `create_dir_all` of it can't
+    /// make them, and fails with "File exists" (`mkdir` of the link,
+    /// `EEXIST`) instead. The restore makes each directory before what is
+    /// below it, so it gets that error only below one it failed to make,
+    /// in place of that one's own.
+    ///
     /// # Errors
     ///
     /// * As [`Self::path`].
@@ -328,6 +336,9 @@ impl LocalDestination {
     /// # Notes
     ///
     /// This will create the directory structure recursively.
+    ///
+    /// BackOtter: past `PATH_MAX`, only below the deepest prefix a short
+    /// path cuts, which must exist ([`Self::sys_path`]).
     pub(crate) fn create_dir(&self, item: impl AsRef<Path>) -> LocalDestinationResult<()> {
         // BackOtter: waits for the exit once XFS options are put back for it.
         let _making = crate::commands::restore::making_entries();
@@ -710,7 +721,9 @@ impl LocalDestination {
     ///
     /// BackOtter: a file restored sparse is emptied first, so that no hole
     /// it gets keeps old contents (it should be new, but may not be: a race);
-    /// any other is allocated in full, where the system can.
+    /// any other is allocated in full, where the system can. Past
+    /// `PATH_MAX`, its parent is made only below the deepest prefix a short
+    /// path cuts, as by [`Self::create_dir`].
     ///
     /// # Returns
     ///
@@ -1052,7 +1065,9 @@ impl LocalDestination {
     /// (another file, a symlink) is replaced, as the link can't be made over
     /// it (`EEXIST`); the same link, left by an earlier restore, is left as
     /// it is (upstream's #634), which also keeps the file when a symlinked
-    /// directory makes both names one. A directory there is an error.
+    /// directory makes both names one. A directory there is an error. Past
+    /// `PATH_MAX`, its parent is made only below the deepest prefix a short
+    /// path cuts, as by [`Self::create_dir`].
     pub(crate) fn hard_link(
         &self,
         source_item: impl AsRef<Path>,
