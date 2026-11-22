@@ -384,7 +384,8 @@ that either program restores what the other backed up.
   `SEEK_HOLE` gives the size, so a file there is read whole, holes and
   all. Each all-zero chunk (holes give many, all of the chunker's
   minimum size) is hashed once per file and length: the same bytes give
-  the same ID. The rolling hash isn't skipped over long zero
+  the same ID (upstream's #611, in 0.14.0, does it once per backup; see
+  "Not ported"). The rolling hash isn't skipped over long zero
   runs: all-zero data already gives a boundary at the minimum chunk size,
   with no rolling over its bytes.
 - A file is restored sparse if, and only if, it is marked `unix.sparse` (or
@@ -1482,7 +1483,9 @@ K8/K10, Core 2 Merom/Conroe) can get SIGILL (RustCrypto/stream-ciphers
 #579, fixed by #580). Left: suppaftp 8 (FTP command injection,
 RUSTSEC-2026-0271), fixed only in suppaftp 10, which needs opendal 0.59
 (upstream's #629), and rustic takes opendal through crates.io's
-rustic_backend 0.7.0; rsa 0.9 (RUSTSEC-2023-0071), which has no fix;
+rustic_backend 0.7.0 (rustic_backend 0.8.0, with opendal 0.59.5 and
+suppaftp 10.0.2, needs rustic_core 0.14.0, so it comes with the rebase
+below); rsa 0.9 (RUSTSEC-2023-0071), which has no fix;
 quinn-proto, webpki-root-certs and h2, which rustic-bko doesn't build;
 quick-xml 0.38 (RUSTSEC-2026-0194, -0195), which only rustic's
 self-update takes (its `release` feature, not built).
@@ -1507,6 +1510,34 @@ Not ported:
 - 9565d4f (#580) type parameters tidied in `commands/backup`: no fix.
 - eb72c72 (#598) a read timeout for HTTP backends: a feature.
 - 18fa55c (#642) a connect timeout for HTTP backends: a feature.
+
+Not ported, from `main` after 2026-11-05, all released in rustic_core
+0.14.0 and rustic_backend 0.8.0 (bf1de63, #545, 2026-11-17), which
+rustic v0.12.0 takes:
+
+- 43740bf (#638) the chunker prefills the whole rolling hash window, so it
+  cuts where restic does: breaking, as cuts move. 9f88530 here does the
+  same (all 64 bytes hashed, above); on a rebase ours can drop, and
+  `chunk_like_restic` (`chunker/rabin.rs`), whose lengths come from
+  restic's chunker, checks that upstream's cuts the same.
+- 0abb59f (#611) all-zero chunks aren't hashed: one ID per backup, at the
+  minimum chunk size. The hole reader's `chunk_id` and `zero_ids` (above)
+  keep one per file and length, the same IDs; on a rebase ours can drop once
+  upstream's is checked to cover the hole reader's chunks.
+- d658ed9 (#637) a minimum chunk size under 4 KiB no longer underflows
+  (one chunk past the maximum) and one under 64 bytes is refused, not a
+  panic: a fix, which changes no cut at 4 KiB or more; restic's
+  repositories and rustic's default have 512 KiB.
+- 8fe6703 (#639) prune with concurrent runs and recovered packs: a fix,
+  breaking (`keep-delete` becomes `keep-marked`), a rewrite of
+  `commands/prune.rs` (where only the cherry-picked #587 differs here).
+- 269f9dc (#653) dependency updates: newer releases of the pins above.
+- 40152f3 (#648) CI only.
+
+These come with a rebase onto rustic_core 0.14.0 and rustic v0.12.0, which
+is pending: the user's decision (ForkAudit1 F9-01). It would also drop
+the cherry-picks above and the dependency pins (0.14.0's lock has newer
+ones).
 
 ## Moving to a new rustic_core release
 
