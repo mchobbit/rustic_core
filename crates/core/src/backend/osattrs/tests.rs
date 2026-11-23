@@ -16,11 +16,17 @@ fn path_error_keeps_the_errno() {
     assert_eq!(err.raw_os_error(), None);
     assert_eq!(errno(&err), Some(libc::ENOTSUP));
     let source = std::error::Error::source(&err).and_then(|e| e.downcast_ref::<io::Error>());
-    assert_eq!(source.and_then(io::Error::raw_os_error), Some(libc::ENOTSUP));
+    assert_eq!(
+        source.and_then(io::Error::raw_os_error),
+        Some(libc::ENOTSUP)
+    );
     assert!(unsupported(&err) && xattr_unsupported(&err));
     // Wrapped again, and copied.
     let twice = path_error("restore", Path::new("c"), &err);
-    assert_eq!(twice.to_string(), format!("restore c: setxattr /a/b: {raw}"));
+    assert_eq!(
+        twice.to_string(),
+        format!("restore c: setxattr /a/b: {raw}")
+    );
     assert_eq!(errno(&twice), Some(libc::ENOTSUP));
     assert!(unsupported(&twice) && xattr_unsupported(&twice));
     assert_eq!(same_error(&err).to_string(), err.to_string());
@@ -33,7 +39,11 @@ fn path_error_keeps_the_errno() {
     assert_eq!(errno(&wrapped), None);
     assert!(!unsupported(&wrapped));
     // Nor does every errno say "unsupported".
-    let eperm = path_error("chflags", Path::new("e"), &io::Error::from_raw_os_error(libc::EPERM));
+    let eperm = path_error(
+        "chflags",
+        Path::new("e"),
+        &io::Error::from_raw_os_error(libc::EPERM),
+    );
     assert!(!unsupported(&eperm) && !xattr_unsupported(&eperm));
     assert!(permission_refused(&eperm));
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -66,7 +76,10 @@ fn acl_set_error_by_the_wrapped_errno() {
 // an ioctl's direction is asm-generic's. Its low 32 bits: musl's ioctl
 // takes an int and glibc's an unsigned long.
 #[test]
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn ficlone_is_the_headers() {
     assert_eq!(i128::from(FICLONE) & 0xffff_ffff, 0x4004_9409);
 }
@@ -81,7 +94,11 @@ fn restore_errors_counted_as_restic() {
     let eperm = || io::Error::from_raw_os_error(libc::EPERM);
     let eio = || io::Error::from_raw_os_error(libc::EIO);
     let unsupported = || Unsupported::error("linux.inode_flags", 0x10, eperm());
-    assert!(!restore_error_counts(&unsupported(), NotRoot::Counted, true));
+    assert!(!restore_error_counts(
+        &unsupported(),
+        NotRoot::Counted,
+        true
+    ));
     let kind = io::Error::new(io::ErrorKind::Unsupported, "no ACLs here");
     assert!(!restore_error_counts(&kind, NotRoot::Counted, true));
     let sid = SidUnmapped::error("illumos.owner_sid", "S-1-5-21-1", eio());
@@ -90,7 +107,11 @@ fn restore_errors_counted_as_restic() {
     let mixed = several(vec![unsupported(), eio()]);
     assert!(restore_error_counts(&mixed, NotRoot::Counted, true));
     let all_unsupported = several(vec![unsupported(), unsupported()]);
-    assert!(!restore_error_counts(&all_unsupported, NotRoot::Counted, true));
+    assert!(!restore_error_counts(
+        &all_unsupported,
+        NotRoot::Counted,
+        true
+    ));
     assert!(!restore_error_counts(&eperm(), NotRoot::Forgiven, false));
     assert!(restore_error_counts(&eperm(), NotRoot::Forgiven, true));
     assert!(restore_error_counts(&eperm(), NotRoot::Counted, false));
@@ -154,7 +175,12 @@ fn scan_skipped_only_for_real_atimes() {
     assert!(!scan_moves_saved_atimes(false, true));
 }
 
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+#[cfg(not(any(
+    windows,
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "haiku"
+)))]
 #[test]
 fn casefold_not_empty_is_bcachefs_casefold_refused() {
     let not_empty = io::Error::from(io::ErrorKind::DirectoryNotEmpty);
@@ -213,23 +239,37 @@ fn quarantined_node_without_contents() {
 
     // Other files, and a directory with the attribute, aren't.
     let mut other = Node::default();
-    other.meta.generic_attributes.set_u64(ILLUMOS_SYSTEM_ATTRIBUTES, 1 << 5);
+    other
+        .meta
+        .generic_attributes
+        .set_u64(ILLUMOS_SYSTEM_ATTRIBUTES, 1 << 5);
     assert!(!is_quarantined(&other));
-    let mut dir = Node::new_node(std::ffi::OsStr::new("d"), NodeType::Dir, Metadata::default());
-    dir.meta.generic_attributes.set_u64(ILLUMOS_SYSTEM_ATTRIBUTES, quarantined.into());
+    let mut dir = Node::new_node(
+        std::ffi::OsStr::new("d"),
+        NodeType::Dir,
+        Metadata::default(),
+    );
+    dir.meta
+        .generic_attributes
+        .set_u64(ILLUMOS_SYSTEM_ATTRIBUTES, quarantined.into());
     assert!(!is_quarantined(&dir));
     assert!(!open_refused(Path::new("/nonexistent/bko")));
 }
 
 fn file_flags_mask(node: &Node) -> Option<u64> {
-    node.meta.generic_attributes.number_u64(ILLUMOS_SYSTEM_ATTRIBUTES)
+    node.meta
+        .generic_attributes
+        .number_u64(ILLUMOS_SYSTEM_ATTRIBUTES)
 }
 
 #[test]
 fn xattr_errors_name_each() {
     let mut errors = XattrErrors::default();
     assert!(XattrErrors::default().into_result().is_ok());
-    errors.push("trusted.a", io::Error::from(io::ErrorKind::PermissionDenied));
+    errors.push(
+        "trusted.a",
+        io::Error::from(io::ErrorKind::PermissionDenied),
+    );
     errors.push("removing user.b", io::Error::other("busy"));
     let msg = errors.into_result().unwrap_err().to_string();
     assert_eq!(msg, "trusted.a: permission denied; removing user.b: busy");
@@ -249,7 +289,11 @@ fn birthtime_first_only_when_earlier() {
         (t(1_200_000_000, 222_222_222), false),
         (t(1_300_000_000, 0), false),
     ] {
-        assert_eq!(birthtime_first(&node, birth), first.then_some(birth), "{birth}");
+        assert_eq!(
+            birthtime_first(&node, birth),
+            first.then_some(birth),
+            "{birth}"
+        );
     }
     // Without an mtime, which the restore then doesn't set.
     node.meta.mtime = None;
@@ -265,7 +309,10 @@ fn restore_birthtime_without_attribute() {
 #[test]
 fn unix_time_rounds_down() {
     let t = |sec, nsec| Timestamp::new(sec, nsec).unwrap();
-    assert_eq!(unix_time(t(1_000_000_000, 123_456_789)), (1_000_000_000, 123_456_789));
+    assert_eq!(
+        unix_time(t(1_000_000_000, 123_456_789)),
+        (1_000_000_000, 123_456_789)
+    );
     assert_eq!(unix_time(t(0, 0)), (0, 0));
     assert_eq!(unix_time(t(0, -1)), (-1, 999_999_999));
     assert_eq!(unix_time(t(-2, 500_000_000)), (-2, 500_000_000));
@@ -293,13 +340,22 @@ fn set_flags_best_effort_sets_what_it_can() {
     // Unsupported: a warning once.
     let err = set_flags_best_effort("x.flags", path, "set", None, 0x15, &mut set).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-    let unsupported = err.get_ref().unwrap().downcast_ref::<Unsupported>().unwrap();
+    let unsupported = err
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<Unsupported>()
+        .unwrap();
     assert_eq!((unsupported.attr, unsupported.bits), ("x.flags", 0x4));
     assert_eq!(current.get(), 0x11);
 
     // Unsupported and not permitted: an error.
     let err = set_flags_best_effort("x.flags", path, "set", None, 0x1d, &mut set).unwrap_err();
-    assert!(err.get_ref().unwrap().downcast_ref::<Unsupported>().is_none());
+    assert!(
+        err.get_ref()
+            .unwrap()
+            .downcast_ref::<Unsupported>()
+            .is_none()
+    );
     assert!(err.to_string().contains("0xc of 0x1d"), "{err}");
     assert_eq!(current.get(), 0x11);
 }
@@ -321,16 +377,25 @@ fn set_flags_best_effort_64_bits() {
         current.set(f);
         Ok(())
     };
-    let err = set_flags_best_effort("x.flags", path, "set", None, hidden | sparse, &mut set)
-        .unwrap_err();
-    let unsupported = err.get_ref().unwrap().downcast_ref::<Unsupported>().unwrap();
+    let err =
+        set_flags_best_effort("x.flags", path, "set", None, hidden | sparse, &mut set).unwrap_err();
+    let unsupported = err
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<Unsupported>()
+        .unwrap();
     assert_eq!(unsupported.bits, sparse);
     assert_eq!(unsupported.kind(), "x.flags 0x200000000000");
     assert_eq!(current.get(), hidden);
 
     let all = readonly | hidden | sparse;
     let err = set_flags_best_effort("x.flags", path, "set", None, all, &mut set).unwrap_err();
-    assert!(err.get_ref().unwrap().downcast_ref::<Unsupported>().is_none());
+    assert!(
+        err.get_ref()
+            .unwrap()
+            .downcast_ref::<Unsupported>()
+            .is_none()
+    );
     assert!(
         err.to_string().contains("0x200100000000 of 0x200300000000"),
         "{err}"
@@ -361,31 +426,50 @@ fn set_flags_best_effort_from_current() {
     let want = 0x1 | archive | immutable | av_modified;
     let err = set_flags_best_effort("x.flags", path, "set", Some(current.get()), want, &mut set)
         .unwrap_err();
-    assert!(err.to_string().contains("file flags 0x20 of 0x229 not set:"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("file flags 0x20 of 0x229 not set:"),
+        "{err}"
+    );
     assert_eq!(current.get(), 0x1 | archive | av_modified);
 
     // archive cleared beside av_modified, which can't be.
     current.set(archive | av_modified);
     let err = set_flags_best_effort("x.flags", path, "set", Some(current.get()), 0, &mut set)
         .unwrap_err();
-    assert!(err.to_string().contains("file flags 0x200 not cleared:"), "{err}");
+    assert!(
+        err.to_string().contains("file flags 0x200 not cleared:"),
+        "{err}"
+    );
     assert_eq!(current.get(), av_modified);
 
     // Both at once.
     current.set(archive | av_modified);
-    let err =
-        set_flags_best_effort("x.flags", path, "set", Some(current.get()), immutable, &mut set)
-            .unwrap_err();
+    let err = set_flags_best_effort(
+        "x.flags",
+        path,
+        "set",
+        Some(current.get()),
+        immutable,
+        &mut set,
+    )
+    .unwrap_err();
     assert!(
-        err.to_string().contains("file flags 0x20 of 0x20 not set, 0x200 not cleared:"),
+        err.to_string()
+            .contains("file flags 0x20 of 0x20 not set, 0x200 not cleared:"),
         "{err}"
     );
     assert_eq!(current.get(), av_modified);
 
     // Nothing to change: whatever set says, the file has the flags.
-    set_flags_best_effort("x.flags", path, "set", Some(av_modified), av_modified, |_| {
-        Err(io::Error::from_raw_os_error(libc::EPERM))
-    })
+    set_flags_best_effort(
+        "x.flags",
+        path,
+        "set",
+        Some(av_modified),
+        av_modified,
+        |_| Err(io::Error::from_raw_os_error(libc::EPERM)),
+    )
     .unwrap();
 }
 
@@ -399,12 +483,21 @@ fn set_flags_best_effort_0_fails_with_set() {
     })
     .unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-    assert!(err.get_ref().unwrap().downcast_ref::<Unsupported>().is_none());
+    assert!(
+        err.get_ref()
+            .unwrap()
+            .downcast_ref::<Unsupported>()
+            .is_none()
+    );
     let err = set_flags_best_effort("x.flags", path, "set", None, 0_u32, |_| {
         Err(io::Error::from_raw_os_error(libc::ENOTTY))
     })
     .unwrap_err();
-    let unsupported = err.get_ref().unwrap().downcast_ref::<Unsupported>().unwrap();
+    let unsupported = err
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<Unsupported>()
+        .unwrap();
     assert_eq!(unsupported.kind(), "x.flags");
 }
 

@@ -177,9 +177,7 @@ impl GenericAttributes {
 
     /// Decodes the attribute `name`, if there is one.
     pub fn get<T: DeserializeOwned>(&self, name: &str) -> Option<serde_json::Result<T>> {
-        self.0
-            .get(name)
-            .map(|v| serde_json::from_value(v.clone()))
+        self.0.get(name).map(|v| serde_json::from_value(v.clone()))
     }
 
     /// Stores `value` as the attribute `name`.
@@ -188,7 +186,9 @@ impl GenericAttributes {
     ///
     /// * If `value` can't be encoded as JSON.
     pub fn set<T: Serialize>(&mut self, name: &str, value: &T) -> serde_json::Result<()> {
-        _ = self.0.insert(name.to_string(), serde_json::to_value(value)?);
+        _ = self
+            .0
+            .insert(name.to_string(), serde_json::to_value(value)?);
         Ok(())
     }
 
@@ -303,7 +303,9 @@ impl GenericAttributes {
 /// BackOtter's restic does: a snapshot could have it on every file.
 fn warn_malformed(name: &str, err: &serde_json::Error) {
     static WARNED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
-    let mut warned = WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if warned.insert(name.to_string()) {
         log::warn!("ignoring generic attribute {name}: {err}");
     }
@@ -319,7 +321,11 @@ impl PartialOrd for GenericAttributes {
 
 impl Ord for GenericAttributes {
     fn cmp(&self, other: &Self) -> Ordering {
-        let text = |a: &Self| a.0.iter().map(|(k, v)| (k.clone(), v.to_string())).collect::<Vec<_>>();
+        let text = |a: &Self| {
+            a.0.iter()
+                .map(|(k, v)| (k.clone(), v.to_string()))
+                .collect::<Vec<_>>()
+        };
         text(self).cmp(&text(other))
     }
 }
@@ -357,7 +363,11 @@ mod tests {
         assert!(attrs.is_empty());
         assert!(!attrs.is_true(UNIX_SPARSE));
         let node = Node::default();
-        assert!(!serde_json::to_string(&node).unwrap().contains("generic_attributes"));
+        assert!(
+            !serde_json::to_string(&node)
+                .unwrap()
+                .contains("generic_attributes")
+        );
     }
 
     // FreeBSD's flags of a file on ZFS with archive cleared: a 0 that is
@@ -369,7 +379,10 @@ mod tests {
         let json = serde_json::to_string(&node).unwrap();
         assert!(json.contains(r#""freebsd.file_flags":0"#), "{json}");
         let again: Node = serde_json::from_str(&json).unwrap();
-        assert_eq!(again.meta.generic_attributes.number(FREEBSD_FILE_FLAGS), Some(0));
+        assert_eq!(
+            again.meta.generic_attributes.number(FREEBSD_FILE_FLAGS),
+            Some(0)
+        );
     }
 
     // FAT attributes, 0 too, and XFS options in the form BackOtter's restic
@@ -379,15 +392,30 @@ mod tests {
         let mut node = Node::default();
         node.meta.generic_attributes.set_u64(LINUX_FAT_ATTRS, 0);
         let json = serde_json::to_string(&node).unwrap();
-        assert!(json.contains(r#""generic_attributes":{"linux.fat_attrs":0}"#), "{json}");
+        assert!(
+            json.contains(r#""generic_attributes":{"linux.fat_attrs":0}"#),
+            "{json}"
+        );
 
         let mut attrs = GenericAttributes::default();
-        attrs.set(LINUX_XFS_OPTIONS, &XfsOptions { xflags: 0x2000, ..XfsOptions::default() }).unwrap();
+        attrs
+            .set(
+                LINUX_XFS_OPTIONS,
+                &XfsOptions {
+                    xflags: 0x2000,
+                    ..XfsOptions::default()
+                },
+            )
+            .unwrap();
         assert_eq!(
             serde_json::to_string(&attrs).unwrap(),
             r#"{"linux.xfs_options":{"xflags":8192}}"#
         );
-        let opts = XfsOptions { cowextsize: 2 << 20, extsize: 1 << 20, xflags: 0x10800 };
+        let opts = XfsOptions {
+            cowextsize: 2 << 20,
+            extsize: 1 << 20,
+            xflags: 0x10800,
+        };
         attrs.set(LINUX_XFS_OPTIONS, &opts).unwrap();
         let json = serde_json::to_string(&attrs).unwrap();
         assert_eq!(
@@ -399,7 +427,11 @@ mod tests {
         for bad in ["8192", r#"{"xflags":-1}"#, r#"{"extsize":"x"}"#] {
             let attrs: GenericAttributes =
                 serde_json::from_str(&format!(r#"{{"linux.xfs_options":{bad}}}"#)).unwrap();
-            assert_eq!(attrs.decoded::<XfsOptions>(LINUX_XFS_OPTIONS), None, "{bad}");
+            assert_eq!(
+                attrs.decoded::<XfsOptions>(LINUX_XFS_OPTIONS),
+                None,
+                "{bad}"
+            );
         }
     }
 
@@ -407,7 +439,9 @@ mod tests {
     fn malformed_values_are_skipped() {
         let attrs = |json: &str| -> GenericAttributes { serde_json::from_str(json).unwrap() };
         for bad in ["-1", "1.5", r#""x""#, "4294967296", "true"] {
-            let a = attrs(&format!(r#"{{"linux.project_id":{bad},"unix.sparse":{bad}}}"#));
+            let a = attrs(&format!(
+                r#"{{"linux.project_id":{bad},"unix.sparse":{bad}}}"#
+            ));
             assert_eq!(a.number(LINUX_PROJECT_ID), None, "{bad}");
             assert!(!a.is_true(UNIX_SPARSE) || bad == "true", "{bad}");
         }
@@ -422,13 +456,22 @@ mod tests {
         let mut node = Node::default();
         node.meta.generic_attributes.set_u64(LINUX_ZFS_DOS_FLAGS, 0);
         let json = serde_json::to_string(&node).unwrap();
-        assert!(json.contains(r#""generic_attributes":{"linux.zfs_dos_flags":0}"#), "{json}");
+        assert!(
+            json.contains(r#""generic_attributes":{"linux.zfs_dos_flags":0}"#),
+            "{json}"
+        );
         let node: Node = serde_json::from_str(&json).unwrap();
-        assert_eq!(node.meta.generic_attributes.number_u64(LINUX_ZFS_DOS_FLAGS), Some(0));
+        assert_eq!(
+            node.meta.generic_attributes.number_u64(LINUX_ZFS_DOS_FLAGS),
+            Some(0)
+        );
 
         let attrs: GenericAttributes =
             serde_json::from_str(r#"{"linux.zfs_dos_flags":52978421596160}"#).unwrap();
-        assert_eq!(attrs.number_u64(LINUX_ZFS_DOS_FLAGS), Some(0x0000_302f_0000_0000));
+        assert_eq!(
+            attrs.number_u64(LINUX_ZFS_DOS_FLAGS),
+            Some(0x0000_302f_0000_0000)
+        );
         for bad in ["-1", "1.5", r#""x""#, "18446744073709551616", "true"] {
             let attrs: GenericAttributes =
                 serde_json::from_str(&format!(r#"{{"linux.zfs_dos_flags":{bad}}}"#)).unwrap();
@@ -447,14 +490,21 @@ mod tests {
         ] {
             let mut node = Node::default();
             let t = Timestamp::new(sec, nsec).unwrap();
-            node.meta.generic_attributes.set_timestamp(UNIX_BIRTHTIME, t);
+            node.meta
+                .generic_attributes
+                .set_timestamp(UNIX_BIRTHTIME, t);
             let text = serde_json::to_string(&node).unwrap();
             assert!(
-                text.contains(&format!(r#""generic_attributes":{{"unix.birthtime":"{json}"}}"#)),
+                text.contains(&format!(
+                    r#""generic_attributes":{{"unix.birthtime":"{json}"}}"#
+                )),
                 "{text}"
             );
             let node: Node = serde_json::from_str(&text).unwrap();
-            assert_eq!(node.meta.generic_attributes.timestamp(UNIX_BIRTHTIME), Some(t));
+            assert_eq!(
+                node.meta.generic_attributes.timestamp(UNIX_BIRTHTIME),
+                Some(t)
+            );
         }
 
         let attrs: GenericAttributes =
@@ -466,7 +516,13 @@ mod tests {
 
         // tv_sec 0 and -1, whatever the nanoseconds, and a year Go can't read.
         let mut attrs = GenericAttributes::default();
-        for (sec, nsec) in [(0, 0), (0, 999_999_999), (-1, 0), (0, -1), (-62_167_219_201, 0)] {
+        for (sec, nsec) in [
+            (0, 0),
+            (0, 999_999_999),
+            (-1, 0),
+            (0, -1),
+            (-62_167_219_201, 0),
+        ] {
             attrs.set_timestamp(UNIX_BIRTHTIME, Timestamp::new(sec, nsec).unwrap());
         }
         assert!(attrs.is_empty());
@@ -484,7 +540,9 @@ mod tests {
     #[test]
     fn unread_size_json() {
         let mut node = Node::default();
-        node.meta.generic_attributes.set_u64(ILLUMOS_UNREAD_SIZE, 5_000_000_000);
+        node.meta
+            .generic_attributes
+            .set_u64(ILLUMOS_UNREAD_SIZE, 5_000_000_000);
         let json = serde_json::to_string(&node).unwrap();
         assert!(
             json.contains(r#""generic_attributes":{"illumos.unread_size":5000000000}"#),
@@ -506,7 +564,9 @@ mod tests {
         attrs.set_number(LINUX_PROJECT_ID, 4_000_000_000);
         let json = serde_json::to_string(&node).unwrap();
         assert!(
-            json.contains(r#""generic_attributes":{"linux.project_id":4000000000,"unix.sparse":true}"#),
+            json.contains(
+                r#""generic_attributes":{"linux.project_id":4000000000,"unix.sparse":true}"#
+            ),
             "{json}"
         );
 
@@ -515,9 +575,10 @@ mod tests {
         assert!(attrs.is_true(UNIX_SPARSE));
         assert_eq!(attrs.number(LINUX_PROJECT_ID), Some(4_000_000_000));
 
-        let node: Node =
-            serde_json::from_str(r#"{"name":"f","type":"file","generic_attributes":{"unix.sparse":false}}"#)
-                .unwrap();
+        let node: Node = serde_json::from_str(
+            r#"{"name":"f","type":"file","generic_attributes":{"unix.sparse":false}}"#,
+        )
+        .unwrap();
         assert!(!node.meta.generic_attributes.is_true(UNIX_SPARSE));
     }
 

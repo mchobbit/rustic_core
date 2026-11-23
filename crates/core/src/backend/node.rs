@@ -21,8 +21,8 @@ use serde_with::{
 };
 
 use crate::blob::{DataId, tree::TreeId};
-use generic_attributes::GenericAttributes;
 use crate::repofile::RusticTime;
+use generic_attributes::GenericAttributes;
 
 #[cfg(not(windows))]
 /// [`NodeErrorKind`] describes the errors that can be returned by an action utilizing a node in Backends

@@ -15,16 +15,20 @@ fn step(n: usize) -> usize {
 
 /// `buf` cut short at every length from 0 to one short of its own.
 pub(crate) fn truncations(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
-    (0..buf.len()).step_by(step(buf.len())).map(move |n| &buf[..n])
+    (0..buf.len())
+        .step_by(step(buf.len()))
+        .map(move |n| &buf[..n])
 }
 
 /// `buf` with one of its bits flipped, for each bit in turn.
 pub(crate) fn bit_flips(buf: &[u8]) -> impl Iterator<Item = Vec<u8>> + '_ {
-    (0..buf.len() * 8).step_by(step(buf.len() * 8)).map(move |bit| {
-        let mut b = buf.to_vec();
-        b[bit / 8] ^= 1 << (bit % 8);
-        b
-    })
+    (0..buf.len() * 8)
+        .step_by(step(buf.len() * 8))
+        .map(move |bit| {
+            let mut b = buf.to_vec();
+            b[bit / 8] ^= 1 << (bit % 8);
+            b
+        })
 }
 
 /// What a check of one malformed input found.

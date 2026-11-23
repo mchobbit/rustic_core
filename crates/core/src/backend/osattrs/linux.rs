@@ -173,7 +173,11 @@ const XFS_KEPT: u32 = 0x0000_0400 // FS_XFLAG_NOSYMLINKS n
 /// takes on a directory with or without a realtime device and on no regular
 /// file.
 const fn xfs_kept(dir: bool) -> u32 {
-    if dir { XFS_KEPT | FS_XFLAG_RTINHERIT } else { XFS_KEPT }
+    if dir {
+        XFS_KEPT | FS_XFLAG_RTINHERIT
+    } else {
+        XFS_KEPT
+    }
 }
 
 /// Opens a regular file or directory for `FS_IOC_GETFLAGS` and
@@ -198,12 +202,17 @@ fn open_for_flags(path: &Path, typ: &NodeType, listed: Option<&Metadata>) -> io:
         .custom_flags(how)
         .open(path)
         .map_err(|err| path_error("open", path, &err))?;
-    let m = f.metadata().map_err(|err| path_error("fstat", path, &err))?;
+    let m = f
+        .metadata()
+        .map_err(|err| path_error("fstat", path, &err))?;
     // BackOtter (RustAudit1 R2-11): which of the two it is; a restore gives
     // no `listed`, and read nothing.
     if if dir { !m.is_dir() } else { !m.is_file() } {
         let what = if dir { "directory" } else { "regular file" };
-        return Err(io::Error::other(format!("{} is not a {what}", path.display())));
+        return Err(io::Error::other(format!(
+            "{} is not a {what}",
+            path.display()
+        )));
     }
     if listed.is_some_and(|l| (l.dev(), l.ino()) != (m.dev(), m.ino())) {
         return Err(io::Error::other(format!(
@@ -313,8 +322,15 @@ fn set_dos_flags(f: &File, flags: u64) -> io::Result<()> {
 fn set_xattr(f: &File, name: &str, value: &[u8]) -> io::Result<()> {
     let name = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::from)?;
     // SAFETY: name is a C string, value a buffer of its length.
-    if unsafe { libc::fsetxattr(f.as_raw_fd(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) }
-        < 0
+    if unsafe {
+        libc::fsetxattr(
+            f.as_raw_fd(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    } < 0
     {
         return Err(io::Error::last_os_error());
     }
@@ -327,7 +343,10 @@ const fn wanted_flags(current: u32, flags: u32) -> u32 {
     (current & !KEPT_LATE) | (flags & KEPT_LATE)
 }
 
-#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature every system's module has"
+)]
 pub(super) fn file_flags(
     path: &Path,
     _typ: &NodeType,
@@ -359,7 +378,9 @@ pub(super) fn fill_attributes(path: &Path, node: &mut Node, f: Option<&File>) ->
     fill_fat_attrs(path, node, f);
     match get_fsxattr(f) {
         Ok(attr) => {
-            node.meta.generic_attributes.set_number(LINUX_PROJECT_ID, file_projid(f, &attr));
+            node.meta
+                .generic_attributes
+                .set_number(LINUX_PROJECT_ID, file_projid(f, &attr));
             if is_on(f, XFS_SUPER_MAGIC).unwrap_or(false)
                 && let Some(opts) = xfs_options(&attr, node.is_dir())
             {
@@ -384,7 +405,9 @@ fn fill_fat_attrs(path: &Path, node: &mut Node, f: &File) {
     match get_u32(f, FAT_IOCTL_GET_ATTRIBUTES) {
         Ok(attrs) => {
             if let Some(kept) = fat_attrs_attribute(attrs, node.is_dir()) {
-                node.meta.generic_attributes.set_u64(LINUX_FAT_ATTRS, kept.into());
+                node.meta
+                    .generic_attributes
+                    .set_u64(LINUX_FAT_ATTRS, kept.into());
             }
         }
         Err(err) => debug!("no FAT attributes for {}: {err}", path.display()),
@@ -399,7 +422,11 @@ fn fill_fat_attrs(path: &Path, node: &mut Node, f: &File) {
 /// ordinary files on FAT gets no attribute. As in BackOtter's restic.
 const fn fat_attrs_attribute(attrs: u32, dir: bool) -> Option<u32> {
     let kept = attrs & FAT_KEPT;
-    let plain = if dir { kept == 0 } else { kept & !FAT_READONLY == FAT_ARCHIVE };
+    let plain = if dir {
+        kept == 0
+    } else {
+        kept & !FAT_READONLY == FAT_ARCHIVE
+    };
     if plain { None } else { Some(kept) }
 }
 
@@ -420,8 +447,16 @@ const fn xfs_options(attr: &FsXattr, dir: bool) -> Option<XfsOptions> {
     }
     Some(XfsOptions {
         xflags,
-        extsize: if xflags & (FS_XFLAG_EXTSIZE | FS_XFLAG_EXTSZINHERIT) == 0 { 0 } else { attr.extsize },
-        cowextsize: if xflags & FS_XFLAG_COWEXTSIZE == 0 { 0 } else { attr.cowextsize },
+        extsize: if xflags & (FS_XFLAG_EXTSIZE | FS_XFLAG_EXTSZINHERIT) == 0 {
+            0
+        } else {
+            attr.extsize
+        },
+        cowextsize: if xflags & FS_XFLAG_COWEXTSIZE == 0 {
+            0
+        } else {
+            attr.cowextsize
+        },
     })
 }
 
@@ -433,8 +468,16 @@ const fn wanted_fsxattr(cur: &FsXattr, opts: &XfsOptions, dir: bool) -> FsXattr 
     let kept = xfs_kept(dir);
     let mut want = *cur;
     want.xflags = (cur.xflags & !kept) | (opts.xflags & kept);
-    want.extsize = if want.xflags & (FS_XFLAG_EXTSIZE | FS_XFLAG_EXTSZINHERIT) == 0 { 0 } else { opts.extsize };
-    want.cowextsize = if want.xflags & FS_XFLAG_COWEXTSIZE == 0 { 0 } else { opts.cowextsize };
+    want.extsize = if want.xflags & (FS_XFLAG_EXTSIZE | FS_XFLAG_EXTSZINHERIT) == 0 {
+        0
+    } else {
+        opts.extsize
+    };
+    want.cowextsize = if want.xflags & FS_XFLAG_COWEXTSIZE == 0 {
+        0
+    } else {
+        opts.cowextsize
+    };
     want
 }
 
@@ -470,7 +513,10 @@ pub(super) fn restore_fat_attrs(path: &Path, typ: &NodeType, attrs: u32) -> io::
     let f = open_for_flags(path, typ, None)?;
     let unsupported_err = |err: io::Error| Unsupported::error(LINUX_FAT_ATTRS, 0, err);
     if !is_on(&f, MSDOS_SUPER_MAGIC).map_err(|err| path_error("fstatfs", path, &err))? {
-        return Err(unsupported_err(io::Error::new(io::ErrorKind::Unsupported, "not FAT")));
+        return Err(unsupported_err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "not FAT",
+        )));
     }
     let current = get_u32(&f, FAT_IOCTL_GET_ATTRIBUTES).map_err(|err| {
         if unsupported(&err) {
@@ -479,7 +525,9 @@ pub(super) fn restore_fat_attrs(path: &Path, typ: &NodeType, attrs: u32) -> io::
             path_error("FAT_IOCTL_GET_ATTRIBUTES", path, &err)
         }
     })?;
-    restore_fat_attrs_with(path, current, attrs, |a| set_u32(&f, FAT_IOCTL_SET_ATTRIBUTES, a))
+    restore_fat_attrs_with(path, current, attrs, |a| {
+        set_u32(&f, FAT_IOCTL_SET_ATTRIBUTES, a)
+    })
 }
 
 /// [`restore_fat_attrs`] for a file that has the FAT attributes `current`,
@@ -496,7 +544,11 @@ fn restore_fat_attrs_with(
     }
     set(want).map_err(|err| {
         if unsupported(&err) {
-            Unsupported::error(LINUX_FAT_ATTRS, 0, path_error("FAT_IOCTL_SET_ATTRIBUTES", path, &err))
+            Unsupported::error(
+                LINUX_FAT_ATTRS,
+                0,
+                path_error("FAT_IOCTL_SET_ATTRIBUTES", path, &err),
+            )
         } else {
             path_error("FAT_IOCTL_SET_ATTRIBUTES", path, &err)
         }
@@ -525,7 +577,8 @@ fn set_xfs_options(f: &File, path: &Path, opts: &XfsOptions, dir: bool) -> io::R
     // (xfs_ioctl_setattr_check_extsize): the directory then gets the rest,
     // and only realtime inheritance is unsupported. As in BackOtter's restic.
     set_fsxattr(f, &want).map_err(|err| {
-        if dir && err.raw_os_error() == Some(libc::EINVAL) && want.xflags & FS_XFLAG_RTINHERIT != 0 {
+        if dir && err.raw_os_error() == Some(libc::EINVAL) && want.xflags & FS_XFLAG_RTINHERIT != 0
+        {
             let mut rest = want;
             rest.xflags &= !FS_XFLAG_RTINHERIT;
             if set_fsxattr(f, &rest).is_ok() {
@@ -568,7 +621,11 @@ pub(super) fn clear_dir_xfs_options(path: &Path) -> Option<XfsOptions> {
 /// Gives the regular file or directory at `path` the XFS options `opts`
 /// (`linux.xfs_options`), on XFS, before its inode flags, leaving its other
 /// flags and project ID as they are.
-pub(super) fn restore_xfs_options(path: &Path, typ: &NodeType, opts: &XfsOptions) -> io::Result<()> {
+pub(super) fn restore_xfs_options(
+    path: &Path,
+    typ: &NodeType,
+    opts: &XfsOptions,
+) -> io::Result<()> {
     let f = open_for_flags(path, typ, None)?;
     if !is_on(&f, XFS_SUPER_MAGIC).map_err(|err| path_error("fstatfs", path, &err))? {
         return Err(Unsupported::error(
@@ -622,7 +679,9 @@ fn fill_dos_flags(path: &Path, node: &mut Node, f: &File) -> io::Result<()> {
     match get_dos_flags(f) {
         Ok(flags) => {
             if let Some(flags) = dos_flags_attribute(flags) {
-                node.meta.generic_attributes.set_u64(LINUX_ZFS_DOS_FLAGS, flags);
+                node.meta
+                    .generic_attributes
+                    .set_u64(LINUX_ZFS_DOS_FLAGS, flags);
             }
         }
         Err(err) if unsupported(&err) => {
@@ -639,7 +698,11 @@ fn fill_dos_flags(path: &Path, node: &mut Node, f: &File) -> io::Result<()> {
 /// anyway when it is written.
 const fn dos_flags_attribute(flags: u64) -> Option<u64> {
     let kept = flags & ZFS_DOS_KEPT;
-    if kept == ZFS_ARCHIVE { None } else { Some(kept) }
+    if kept == ZFS_ARCHIVE {
+        None
+    } else {
+        Some(kept)
+    }
 }
 
 pub(super) fn restore_file_flags(
@@ -743,7 +806,11 @@ fn clear_restricting_open(path: &Path) -> io::Result<Option<(File, u32)>> {
 /// go back on it, wherever its other names are ([`put_back_restricting_flags`]).
 pub(super) fn clear_restricting_flags_held(path: &Path) -> io::Result<HeldFlags> {
     Ok(match clear_restricting_open(path)? {
-        Some((file, cleared)) => HeldFlags::Held { file, cleared, path: path.to_path_buf() },
+        Some((file, cleared)) => HeldFlags::Held {
+            file,
+            cleared,
+            path: path.to_path_buf(),
+        },
         None => HeldFlags::Nothing,
     })
 }
@@ -950,7 +1017,11 @@ fn restore_flags_with(
         );
         match set_compression(compression) {
             Err(err) if !xattr_unsupported(&err) => {
-                errors.push(path_error(&format!("set {BTRFS_COMPRESSION} of"), path, &err));
+                errors.push(path_error(
+                    &format!("set {BTRFS_COMPRESSION} of"),
+                    path,
+                    &err,
+                ));
             }
             _ => {}
         }
@@ -1058,7 +1129,10 @@ fn prepare_dir_with(
 }
 
 /// The numeric owner the restore gives is all there is.
-#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature every system's module has"
+)]
 pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
@@ -1076,8 +1150,8 @@ pub(super) fn restore_attributes(path: &Path, node: &Node, known_bko: bool) -> i
         None | Some(0) => {
             if matches!(node.node_type, NodeType::File | NodeType::Dir)
                 && is_bcachefs_path(path)
-                && let Err(err) =
-                    open_for_flags(path, &node.node_type, None).and_then(|f| set_projid(path, &f, 0))
+                && let Err(err) = open_for_flags(path, &node.node_type, None)
+                    .and_then(|f| set_projid(path, &f, 0))
             {
                 debug!("project ID 0 not restored on {}: {err}", path.display());
             }
@@ -1160,19 +1234,28 @@ pub(super) fn prepare_dir_for_options(path: &Path, node: &Node, known_bko: bool)
     }
 }
 
-#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature every system's module has"
+)]
 pub(super) fn restore_acls(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
 
-#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature every system's module has"
+)]
 pub(super) fn restore_symlink_mode(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
 
 /// Linux reads birth times (`statx(2)`), but has no call that sets one.
 pub(super) fn restore_birthtime(_path: &Path, _node: &Node, _birth: Timestamp) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "Linux can't set birth times"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Linux can't set birth times",
+    ))
 }
 
 /// Extended attributes have no metadata of their own here.
@@ -1180,12 +1263,19 @@ pub(super) fn fill_xattr_meta(_path: &Path, _node: &mut Node) {}
 
 /// Extended attributes go through the xattr crate here.
 pub(super) fn xattrs(_path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "extended attributes go through xattr",
+    ))
 }
 
 /// Extended attributes go through the xattr crate here.
 pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr").into())
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "extended attributes go through xattr",
+    )
+    .into())
 }
 
 /// Reads what `getxattr(2)`-like `call` gives into a buffer of the size it
@@ -1233,9 +1323,8 @@ pub(super) fn xattr_get(path: &Path, name: &std::ffi::OsStr) -> io::Result<Optio
     let n = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::from)?;
     // SAFETY: p and n are C strings, and value has room for size bytes, or
     // is null with size 0 (read_whole's contract).
-    let value = read_whole(|value, size| unsafe {
-        libc::lgetxattr(p.as_ptr(), n.as_ptr(), value, size)
-    });
+    let value =
+        read_whole(|value, size| unsafe { libc::lgetxattr(p.as_ptr(), n.as_ptr(), value, size) });
     match value {
         Err(err) if err.raw_os_error() == Some(libc::ENODATA) => Ok(None),
         result => result.map(Some),
@@ -1316,7 +1405,10 @@ mod tests {
         assert_eq!(dos_flags_attribute(ZFS_ARCHIVE), None);
         // Archive cleared: an attribute of 0.
         assert_eq!(dos_flags_attribute(0), Some(0));
-        assert_eq!(dos_flags_attribute(ZFS_ARCHIVE | ZFS_HIDDEN), Some(ZFS_ARCHIVE | ZFS_HIDDEN));
+        assert_eq!(
+            dos_flags_attribute(ZFS_ARCHIVE | ZFS_HIDDEN),
+            Some(ZFS_ARCHIVE | ZFS_HIDDEN)
+        );
         // Immutable, append-only and nodump are inode flags, reparse can't
         // be set: never stored.
         let others = ZFS_IMMUTABLE | ZFS_APPENDONLY | ZFS_NODUMP | ZFS_REPARSE;
@@ -1328,7 +1420,10 @@ mod tests {
     #[test]
     fn wanted_dos_flags_keep_the_inode_flags() {
         let iad = ZFS_IMMUTABLE | ZFS_APPENDONLY | ZFS_NODUMP;
-        assert_eq!(wanted_dos_flags(iad | ZFS_ARCHIVE, ZFS_HIDDEN), iad | ZFS_HIDDEN);
+        assert_eq!(
+            wanted_dos_flags(iad | ZFS_ARCHIVE, ZFS_HIDDEN),
+            iad | ZFS_HIDDEN
+        );
         assert_eq!(wanted_dos_flags(ZFS_REPARSE | ZFS_ARCHIVE, 0), ZFS_REPARSE);
         // Not even from a snapshot that has them.
         assert_eq!(wanted_dos_flags(ZFS_ARCHIVE, iad | ZFS_SYSTEM), ZFS_SYSTEM);
@@ -1377,14 +1472,24 @@ mod tests {
         let (result, calls) =
             restore_dos_flags_calls(ZFS_ARCHIVE, ZFS_READONLY | ZFS_HIDDEN, ZFS_READONLY);
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("0x100000000 of 0x300000000"), "{err}");
+        assert!(
+            err.to_string().contains("0x100000000 of 0x300000000"),
+            "{err}"
+        );
         assert_eq!(calls.last(), Some(&ZFS_HIDDEN));
         // Sparse not supported: a warning once.
         let (result, calls) =
             restore_dos_flags_calls(ZFS_NODUMP, ZFS_SPARSE | ZFS_SYSTEM, ZFS_SPARSE);
         let err = result.unwrap_err();
-        let unsupported = err.get_ref().unwrap().downcast_ref::<Unsupported>().unwrap();
-        assert_eq!((unsupported.attr, unsupported.bits), (LINUX_ZFS_DOS_FLAGS, ZFS_SPARSE));
+        let unsupported = err
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<Unsupported>()
+            .unwrap();
+        assert_eq!(
+            (unsupported.attr, unsupported.bits),
+            (LINUX_ZFS_DOS_FLAGS, ZFS_SPARSE)
+        );
         assert_eq!(
             calls,
             [
@@ -1407,7 +1512,10 @@ mod tests {
             // Not ZFS: no attribute, and a restore says so.
             let mut node = Node::default();
             fill_attributes(&path, &mut node, Some(&f)).unwrap();
-            assert_eq!(node.meta.generic_attributes.number_u64(LINUX_ZFS_DOS_FLAGS), None);
+            assert_eq!(
+                node.meta.generic_attributes.number_u64(LINUX_ZFS_DOS_FLAGS),
+                None
+            );
             let err = restore_zfs_dos_flags(&path, &NodeType::File, ZFS_HIDDEN).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::Unsupported);
             return;
@@ -1423,7 +1531,10 @@ mod tests {
         assert_eq!(get_dos_flags(&f).unwrap(), ZFS_ARCHIVE);
         assert_eq!(attribute(&path, &NodeType::File), None);
         restore_zfs_dos_flags(&path, &NodeType::File, ZFS_HIDDEN | ZFS_SYSTEM).unwrap();
-        assert_eq!(attribute(&path, &NodeType::File), Some(ZFS_HIDDEN | ZFS_SYSTEM));
+        assert_eq!(
+            attribute(&path, &NodeType::File),
+            Some(ZFS_HIDDEN | ZFS_SYSTEM)
+        );
         restore_zfs_dos_flags(&path, &NodeType::File, 0).unwrap();
         assert_eq!(attribute(&path, &NodeType::File), Some(0));
         // A write sets archive again.
@@ -1458,7 +1569,11 @@ mod tests {
             (0x30, true, Some(0x20)),  // a directory with archive
             (0x28, false, None),       // volume label: never kept
         ] {
-            assert_eq!(fat_attrs_attribute(attrs, dir), want, "{attrs:#x} dir {dir}");
+            assert_eq!(
+                fat_attrs_attribute(attrs, dir),
+                want,
+                "{attrs:#x} dir {dir}"
+            );
         }
         assert_eq!(wanted_fat_attrs(0x30, 0x06), 0x16);
         assert_eq!(wanted_fat_attrs(0x2f, 0), 0x08);
@@ -1492,21 +1607,41 @@ mod tests {
 
     #[test]
     fn xfs_options_kept_as_restic_keeps_them() {
-        let fsx = |xflags, extsize, cowextsize| FsXattr { xflags, extsize, cowextsize, ..FsXattr::default() };
+        let fsx = |xflags, extsize, cowextsize| FsXattr {
+            xflags,
+            extsize,
+            cowextsize,
+            ..FsXattr::default()
+        };
         // hasattr, prealloc, immutable, projinherit: none of them.
         for dir in [false, true] {
-            assert_eq!(xfs_options(&fsx(0x8000_0002 | 0x8 | 0x200, 0, 0), dir), None);
+            assert_eq!(
+                xfs_options(&fsx(0x8000_0002 | 0x8 | 0x200, 0, 0), dir),
+                None
+            );
             assert_eq!(
                 xfs_options(&fsx(0x8000_0802, 1 << 20, 0), dir),
-                Some(XfsOptions { xflags: 0x800, extsize: 1 << 20, cowextsize: 0 })
+                Some(XfsOptions {
+                    xflags: 0x800,
+                    extsize: 1 << 20,
+                    cowextsize: 0
+                })
             );
             assert_eq!(
                 xfs_options(&fsx(0x1000 | 0x4000 | 0x1_0000, 2 << 20, 4 << 20), dir),
-                Some(XfsOptions { xflags: 0x1_5000, extsize: 2 << 20, cowextsize: 4 << 20 })
+                Some(XfsOptions {
+                    xflags: 0x1_5000,
+                    extsize: 2 << 20,
+                    cowextsize: 4 << 20
+                })
             );
             assert_eq!(
                 xfs_options(&fsx(0x2000, 4096, 0), dir),
-                Some(XfsOptions { xflags: 0x2000, extsize: 0, cowextsize: 0 })
+                Some(XfsOptions {
+                    xflags: 0x2000,
+                    extsize: 0,
+                    cowextsize: 0
+                })
             );
         }
         // Realtime (r) never; realtime inheritance (t) on a directory only.
@@ -1515,13 +1650,25 @@ mod tests {
         assert_eq!(xfs_options(&fsx(0x100, 0, 0), false), None);
         assert_eq!(
             xfs_options(&fsx(0x1 | 0x100 | 0x1000, 1 << 20, 0), true),
-            Some(XfsOptions { xflags: 0x1100, extsize: 1 << 20, cowextsize: 0 })
+            Some(XfsOptions {
+                xflags: 0x1100,
+                extsize: 1 << 20,
+                cowextsize: 0
+            })
         );
         // The kept flags and sizes replaced; prealloc, immutable and the
         // project ID left as they are.
         let mut cur = fsx(0x8000_0002 | 0x8 | 0x2000, 0, 0);
         cur.projid = 7;
-        let want = wanted_fsxattr(&cur, &XfsOptions { xflags: 0x800, extsize: 1 << 20, cowextsize: 0 }, false);
+        let want = wanted_fsxattr(
+            &cur,
+            &XfsOptions {
+                xflags: 0x800,
+                extsize: 1 << 20,
+                cowextsize: 0,
+            },
+            false,
+        );
         assert_eq!(
             (want.xflags, want.extsize, want.cowextsize, want.projid),
             (0x8000_0002 | 0x8 | 0x800, 1 << 20, 0, 7)
@@ -1530,13 +1677,29 @@ mod tests {
         let want = wanted_fsxattr(&fsx(0x800, 1 << 20, 0), &XfsOptions::default(), false);
         assert_eq!((want.xflags, want.extsize, want.cowextsize), (0, 0, 0));
         let cur = fsx(0x2000, 0, 0);
-        assert!(same_xfs_options(&cur, &wanted_fsxattr(&cur, &XfsOptions { xflags: 0x2000, ..XfsOptions::default() }, false)));
+        assert!(same_xfs_options(
+            &cur,
+            &wanted_fsxattr(
+                &cur,
+                &XfsOptions {
+                    xflags: 0x2000,
+                    ..XfsOptions::default()
+                },
+                false
+            )
+        ));
         // Realtime inheritance goes on and off a directory, and never on a
         // regular file; realtime on neither.
-        let rt = XfsOptions { xflags: 0x1 | 0x100 | 0x2000, ..XfsOptions::default() };
+        let rt = XfsOptions {
+            xflags: 0x1 | 0x100 | 0x2000,
+            ..XfsOptions::default()
+        };
         assert_eq!(wanted_fsxattr(&fsx(0, 0, 0), &rt, true).xflags, 0x2100);
         assert_eq!(wanted_fsxattr(&fsx(0, 0, 0), &rt, false).xflags, 0x2000);
-        assert_eq!(wanted_fsxattr(&fsx(0x100, 0, 0), &XfsOptions::default(), true).xflags, 0);
+        assert_eq!(
+            wanted_fsxattr(&fsx(0x100, 0, 0), &XfsOptions::default(), true).xflags,
+            0
+        );
     }
 
     #[test]
@@ -1550,12 +1713,30 @@ mod tests {
         }
         let err = restore_fat_attrs(&path, &NodeType::File, 0x22).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-        assert!(err.to_string().contains("linux.fat_attrs not supported by the file system: not FAT"), "{err}");
-        let opts = XfsOptions { xflags: 0x2000, ..XfsOptions::default() };
+        assert!(
+            err.to_string()
+                .contains("linux.fat_attrs not supported by the file system: not FAT"),
+            "{err}"
+        );
+        let opts = XfsOptions {
+            xflags: 0x2000,
+            ..XfsOptions::default()
+        };
         let err = restore_xfs_options(dir.path(), &NodeType::Dir, &opts).unwrap_err();
-        assert!(err.to_string().contains("linux.xfs_options not supported by the file system: not XFS"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("linux.xfs_options not supported by the file system: not XFS"),
+            "{err}"
+        );
         // Early, nothing happens: the file is left as it is.
-        prepare_file_for_xfs(&path, &XfsOptions { xflags: 0x800, extsize: 1 << 20, cowextsize: 0 });
+        prepare_file_for_xfs(
+            &path,
+            &XfsOptions {
+                xflags: 0x800,
+                extsize: 1 << 20,
+                cowextsize: 0,
+            },
+        );
         assert_eq!(std::fs::read(&path).unwrap(), b"x");
     }
 
@@ -1577,12 +1758,17 @@ mod tests {
             let img = dir.path().join("fs.img");
             File::create(&img).unwrap().set_len(size).unwrap();
             std::fs::create_dir(dir.path().join("mnt")).unwrap();
-            let ok = |cmd: &mut std::process::Command| cmd.output().is_ok_and(|o| o.status.success());
+            let ok =
+                |cmd: &mut std::process::Command| cmd.output().is_ok_and(|o| o.status.success());
             if !ok(std::process::Command::new(mkfs).args(args).arg(&img)) {
                 eprintln!("skipped: no {mkfs}");
                 return None;
             }
-            if !ok(std::process::Command::new("mount").args(["-o", "loop"]).arg(&img).arg(dir.path().join("mnt"))) {
+            if !ok(std::process::Command::new("mount")
+                .args(["-o", "loop"])
+                .arg(&img)
+                .arg(dir.path().join("mnt")))
+            {
                 eprintln!("skipped: mount failed");
                 return None;
             }
@@ -1596,7 +1782,9 @@ mod tests {
 
     impl Drop for LoopMount {
         fn drop(&mut self) {
-            _ = std::process::Command::new("umount").arg(self.path()).status();
+            _ = std::process::Command::new("umount")
+                .arg(self.path())
+                .status();
         }
     }
 
@@ -1617,7 +1805,8 @@ mod tests {
         };
         let mnt = mnt.path();
         let get = |p: &Path| get_u32(&File::open(p).unwrap(), FAT_IOCTL_GET_ATTRIBUTES).unwrap();
-        let set = |p: &Path, a| set_u32(&File::open(p).unwrap(), FAT_IOCTL_SET_ATTRIBUTES, a).unwrap();
+        let set =
+            |p: &Path, a| set_u32(&File::open(p).unwrap(), FAT_IOCTL_SET_ATTRIBUTES, a).unwrap();
         for (name, dir, attrs, kept) in [
             ("plain", false, 0x20, false),
             ("hidden", false, 0x22, true),
@@ -1638,14 +1827,23 @@ mod tests {
                 NodeType::File
             };
             set(&src, attrs);
-            let got = filled(&src, &typ).meta.generic_attributes.number(LINUX_FAT_ATTRS);
+            let got = filled(&src, &typ)
+                .meta
+                .generic_attributes
+                .number(LINUX_FAT_ATTRS);
             assert_eq!(got.is_some(), kept, "{name}: {got:?}");
             if let Some(a) = got {
                 restore_fat_attrs(&dst, &typ, a).unwrap();
                 assert_eq!(get(&src), get(&dst), "{name}");
             }
         }
-        assert_eq!(filled(&mnt, &NodeType::Dir).meta.generic_attributes.number(LINUX_FAT_ATTRS), None);
+        assert_eq!(
+            filled(&mnt, &NodeType::Dir)
+                .meta
+                .generic_attributes
+                .number(LINUX_FAT_ATTRS),
+            None
+        );
         let err = restore_fat_attrs(&mnt, &NodeType::Dir, 0x02).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
     }
@@ -1659,23 +1857,55 @@ mod tests {
         };
         let mnt = mnt.path();
         let xfs_io = |args: &[&str]| {
-            let st = std::process::Command::new("xfs_io").args(args).status().unwrap();
+            let st = std::process::Command::new("xfs_io")
+                .args(args)
+                .status()
+                .unwrap();
             assert!(st.success(), "xfs_io {args:?}");
         };
         let (file, dir) = (mnt.join("extsize"), mnt.join("dir"));
         std::fs::write(&file, b"").unwrap();
         std::fs::create_dir(&dir).unwrap();
-        xfs_io(&["-c", "extsize 1m", "-c", "chattr +f", file.to_str().unwrap()]);
-        xfs_io(&["-c", "extsize 2m", "-c", "chattr +St", dir.to_str().unwrap()]);
+        xfs_io(&[
+            "-c",
+            "extsize 1m",
+            "-c",
+            "chattr +f",
+            file.to_str().unwrap(),
+        ]);
+        xfs_io(&[
+            "-c",
+            "extsize 2m",
+            "-c",
+            "chattr +St",
+            dir.to_str().unwrap(),
+        ]);
         std::fs::write(&file, vec![0_u8; 65536]).unwrap();
         let opts = |p: &Path, typ: NodeType| {
-            filled(p, &typ).meta.generic_attributes.decoded::<XfsOptions>(LINUX_XFS_OPTIONS)
+            filled(p, &typ)
+                .meta
+                .generic_attributes
+                .decoded::<XfsOptions>(LINUX_XFS_OPTIONS)
         };
         let fopts = opts(&file, NodeType::File).expect("file's XFS options not kept");
-        assert_eq!(fopts, XfsOptions { xflags: 0x2800, extsize: 1 << 20, cowextsize: 0 });
+        assert_eq!(
+            fopts,
+            XfsOptions {
+                xflags: 0x2800,
+                extsize: 1 << 20,
+                cowextsize: 0
+            }
+        );
         let dopts = opts(&dir, NodeType::Dir).expect("directory's XFS options not kept");
         // Realtime inheritance (t) too, without a realtime device.
-        assert_eq!(dopts, XfsOptions { xflags: 0x5100, extsize: 2 << 20, cowextsize: 0 });
+        assert_eq!(
+            dopts,
+            XfsOptions {
+                xflags: 0x5100,
+                extsize: 2 << 20,
+                cowextsize: 0
+            }
+        );
         let plain = mnt.join("plain");
         {
             let mut f = File::create(&plain).unwrap();
@@ -1695,10 +1925,19 @@ mod tests {
         assert_eq!(opts(&rdir, NodeType::Dir), Some(dopts));
         // A regular file takes no realtime inheritance: left out, no error.
         let tfile = mnt.join("tfile");
-        let topts = XfsOptions { xflags: 0x2100, ..XfsOptions::default() };
+        let topts = XfsOptions {
+            xflags: 0x2100,
+            ..XfsOptions::default()
+        };
         prepare_file_for_xfs(&tfile, &topts);
         restore_xfs_options(&tfile, &NodeType::File, &topts).unwrap();
-        assert_eq!(opts(&tfile, NodeType::File), Some(XfsOptions { xflags: 0x2000, ..topts }));
+        assert_eq!(
+            opts(&tfile, NodeType::File),
+            Some(XfsOptions {
+                xflags: 0x2000,
+                ..topts
+            })
+        );
         // Too late for a file with data: unsupported (EINVAL).
         let err = restore_xfs_options(&plain, &NodeType::File, &fopts).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
@@ -1724,18 +1963,37 @@ mod tests {
     // realtime inheritance is unsupported. As in BackOtter's restic.
     #[test]
     fn xfs_rtinherit_refused_alone() {
-        let Some(mnt) = LoopMount::new(320 << 20, "mkfs.xfs", &["-q", "-f", "-r", "extsize=64k"]) else {
+        let Some(mnt) = LoopMount::new(320 << 20, "mkfs.xfs", &["-q", "-f", "-r", "extsize=64k"])
+        else {
             return;
         };
         let dir = mnt.path().join("dir");
         std::fs::create_dir(&dir).unwrap();
-        let mut want = XfsOptions { xflags: 0x100 | 0x1000 | 0x2000, extsize: 12 << 10, cowextsize: 0 };
+        let mut want = XfsOptions {
+            xflags: 0x100 | 0x1000 | 0x2000,
+            extsize: 12 << 10,
+            cowextsize: 0,
+        };
         let err = restore_xfs_options(&dir, &NodeType::Dir, &want).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
-        let refused = err.get_ref().and_then(|e| e.downcast_ref::<Unsupported>()).map(|u| u.bits);
+        let refused = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<Unsupported>())
+            .map(|u| u.bits);
         assert_eq!(refused, Some(0x100), "{err}");
-        let opts = |p: &Path| filled(p, &NodeType::Dir).meta.generic_attributes.decoded::<XfsOptions>(LINUX_XFS_OPTIONS);
-        assert_eq!(opts(&dir), Some(XfsOptions { xflags: 0x3000, ..want }));
+        let opts = |p: &Path| {
+            filled(p, &NodeType::Dir)
+                .meta
+                .generic_attributes
+                .decoded::<XfsOptions>(LINUX_XFS_OPTIONS)
+        };
+        assert_eq!(
+            opts(&dir),
+            Some(XfsOptions {
+                xflags: 0x3000,
+                ..want
+            })
+        );
         // A hint that is a multiple goes on with it.
         want.extsize = 128 << 10;
         restore_xfs_options(&dir, &NodeType::Dir, &want).unwrap();
@@ -1755,33 +2013,58 @@ mod tests {
         _ = open_for_flags(dir.path(), &NodeType::Dir, None).unwrap();
         // A directory where the node is a file (a restore gives no lstat).
         let err = open_for_flags(dir.path(), &NodeType::File, None).unwrap_err();
-        assert_eq!(err.to_string(), format!("{} is not a regular file", dir.path().display()));
+        assert_eq!(
+            err.to_string(),
+            format!("{} is not a regular file", dir.path().display())
+        );
         // A file where the node is a directory: O_DIRECTORY refuses it.
         let err = open_for_flags(&a, &NodeType::Dir, None).unwrap_err();
-        assert_eq!(err.raw_os_error().or_else(|| super::super::errno(&err)), Some(libc::ENOTDIR));
+        assert_eq!(
+            err.raw_os_error().or_else(|| super::super::errno(&err)),
+            Some(libc::ENOTDIR)
+        );
         // Another file than the backup listed under that name.
         let err = open_for_flags(&b, &NodeType::File, Some(&listed)).unwrap_err();
-        assert_eq!(err.to_string(), format!("{} was replaced since it was listed", b.display()));
+        assert_eq!(
+            err.to_string(),
+            format!("{} was replaced since it was listed", b.display())
+        );
     }
 
     #[test]
     fn wanted_flags_keep_the_file_systems_own_and_casefolding() {
-        assert_eq!(wanted_flags(EXTENTS | FS_IMMUTABLE_FL, FS_IMMUTABLE_FL), EXTENTS | FS_IMMUTABLE_FL);
-        assert_eq!(wanted_flags(EXTENTS, FS_IMMUTABLE_FL | EXTENTS), EXTENTS | FS_IMMUTABLE_FL);
-        assert_eq!(wanted_flags(EXTENTS | NOCOW, FS_IMMUTABLE_FL), EXTENTS | FS_IMMUTABLE_FL);
+        assert_eq!(
+            wanted_flags(EXTENTS | FS_IMMUTABLE_FL, FS_IMMUTABLE_FL),
+            EXTENTS | FS_IMMUTABLE_FL
+        );
+        assert_eq!(
+            wanted_flags(EXTENTS, FS_IMMUTABLE_FL | EXTENTS),
+            EXTENTS | FS_IMMUTABLE_FL
+        );
+        assert_eq!(
+            wanted_flags(EXTENTS | NOCOW, FS_IMMUTABLE_FL),
+            EXTENTS | FS_IMMUTABLE_FL
+        );
         // Casefolding stays as the directory has it, both ways.
         assert_eq!(
             wanted_flags(FS_CASEFOLD_FL, FS_IMMUTABLE_FL),
             FS_CASEFOLD_FL | FS_IMMUTABLE_FL
         );
-        assert_eq!(wanted_flags(0, FS_CASEFOLD_FL | FS_IMMUTABLE_FL), FS_IMMUTABLE_FL);
+        assert_eq!(
+            wanted_flags(0, FS_CASEFOLD_FL | FS_IMMUTABLE_FL),
+            FS_IMMUTABLE_FL
+        );
     }
 
     #[test]
     fn casefold_differs_on_directories() {
         assert!(casefold_differs(&NodeType::Dir, 0, FS_CASEFOLD_FL));
         assert!(casefold_differs(&NodeType::Dir, FS_CASEFOLD_FL, NODUMP));
-        assert!(!casefold_differs(&NodeType::Dir, FS_CASEFOLD_FL | EXTENTS, FS_CASEFOLD_FL));
+        assert!(!casefold_differs(
+            &NodeType::Dir,
+            FS_CASEFOLD_FL | EXTENTS,
+            FS_CASEFOLD_FL
+        ));
         assert!(!casefold_differs(&NodeType::Dir, EXTENTS, NODUMP));
         assert!(!casefold_differs(&NodeType::File, 0, FS_CASEFOLD_FL));
     }
@@ -1835,7 +2118,10 @@ mod tests {
             restore_flags_calls(FS_CASEFOLD_FL | EXTENTS, NODUMP, None),
             ["set 0x40080040"]
         );
-        assert_eq!(restore_flags_calls(EXTENTS, FS_CASEFOLD_FL | NODUMP, None), ["set 0x80040"]);
+        assert_eq!(
+            restore_flags_calls(EXTENTS, FS_CASEFOLD_FL | NODUMP, None),
+            ["set 0x80040"]
+        );
     }
 
     #[test]
@@ -1858,7 +2144,10 @@ mod tests {
             ["set 0x44", "compression zstd", "xflags 0x10"]
         );
         // Without the property, as on any other file system.
-        assert_eq!(restore_flags_calls(COMPR, COMPR | FS_IMMUTABLE_FL, None), ["set 0x14"]);
+        assert_eq!(
+            restore_flags_calls(COMPR, COMPR | FS_IMMUTABLE_FL, None),
+            ["set 0x14"]
+        );
     }
 
     // A btrfs file's compression property and i/a, restored onto a file
@@ -1978,23 +2267,41 @@ mod tests {
         )
         .unwrap_err();
         let text = err.to_string();
-        assert!(text.contains("linux.inode_flags 0x4 not supported"), "{text}");
+        assert!(
+            text.contains("linux.inode_flags 0x4 not supported"),
+            "{text}"
+        );
         assert!(text.contains("FS_IOC_FSSETXATTR f: "), "{text}");
         assert!(!text.contains(BTRFS_COMPRESSION), "{text}");
-        assert!(restore_error_counts(&err, NotRoot::Counted, false), "{text}");
+        assert!(
+            restore_error_counts(&err, NotRoot::Counted, false),
+            "{text}"
+        );
         // The unsupported flag alone doesn't count.
         let err = restore_flags_failing(EXTENTS, COMPR | FS_IMMUTABLE_FL, libc::EOPNOTSUPP, 0, 0)
             .unwrap_err();
-        assert!(!restore_error_counts(&err, NotRoot::Counted, false), "{err}");
+        assert!(
+            !restore_error_counts(&err, NotRoot::Counted, false),
+            "{err}"
+        );
 
         // The property refused for another reason is an error of its own,
         // beside the flags'.
-        let err = restore_flags_failing(EXTENTS, COMPR | NODUMP | FS_APPEND_FL, 0, libc::EIO, libc::EPERM)
-            .unwrap_err();
+        let err = restore_flags_failing(
+            EXTENTS,
+            COMPR | NODUMP | FS_APPEND_FL,
+            0,
+            libc::EIO,
+            libc::EPERM,
+        )
+        .unwrap_err();
         let text = err.to_string();
         assert!(text.contains("set btrfs.compression of f: "), "{text}");
         assert!(text.contains("FS_IOC_FSSETXATTR f: "), "{text}");
-        assert!(restore_error_counts(&err, NotRoot::Counted, false), "{text}");
+        assert!(
+            restore_error_counts(&err, NotRoot::Counted, false),
+            "{text}"
+        );
         // No such property (ENOTSUP, or ENODATA from an SMB mount): nothing.
         for errno in [libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENODATA] {
             restore_flags_failing(EXTENTS, COMPR | NODUMP, 0, errno, 0).unwrap();
@@ -2029,8 +2336,10 @@ mod tests {
         assert_eq!(prepare_dir_sets(Ok(FS_CASEFOLD_FL), FS_CASEFOLD_FL).1, None);
         assert_eq!(prepare_dir_sets(Ok(EXTENTS), NODUMP).1, None);
         // A file system without inode flags: nothing, and no error.
-        let (result, set) =
-            prepare_dir_sets(Err(io::Error::from_raw_os_error(libc::ENOTTY)), FS_CASEFOLD_FL);
+        let (result, set) = prepare_dir_sets(
+            Err(io::Error::from_raw_os_error(libc::ENOTTY)),
+            FS_CASEFOLD_FL,
+        );
         assert!(result.is_ok());
         assert_eq!(set, None);
     }
@@ -2043,7 +2352,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let m = std::fs::symlink_metadata(dir.path()).unwrap();
         let f = open_for_attrs(dir.path(), &NodeType::Dir, &m);
-        if f.as_ref().and_then(|f| get_fsxattr(f).ok()).is_some_and(|attr| attr.projid != 0) {
+        if f.as_ref()
+            .and_then(|f| get_fsxattr(f).ok())
+            .is_some_and(|attr| attr.projid != 0)
+        {
             return;
         }
         let path = dir.path().join("f");
@@ -2070,7 +2382,10 @@ mod tests {
     fn project_id_0_is_left_alone() {
         // Not even opened: a path that doesn't exist is no error.
         let mut node = Node::default();
-        node.meta.generic_attributes.set(LINUX_PROJECT_ID, &0).unwrap();
+        node.meta
+            .generic_attributes
+            .set(LINUX_PROJECT_ID, &0)
+            .unwrap();
         restore_attributes(Path::new("/nonexistent/bko"), &node, true).unwrap();
     }
 
@@ -2188,10 +2503,23 @@ mod tests {
             return;
         }
         let held = clear_restricting_flags_held(&a).unwrap();
-        assert!(matches!(held, HeldFlags::Held { cleared: FS_IMMUTABLE_FL, .. }), "{held:?}");
+        assert!(
+            matches!(
+                held,
+                HeldFlags::Held {
+                    cleared: FS_IMMUTABLE_FL,
+                    ..
+                }
+            ),
+            "{held:?}"
+        );
         std::fs::remove_file(&a).unwrap();
         held.put_back().unwrap();
-        assert_ne!(get_flags(&f).unwrap() & FS_IMMUTABLE_FL, 0, "b lost immutable");
+        assert_ne!(
+            get_flags(&f).unwrap() & FS_IMMUTABLE_FL,
+            0,
+            "b lost immutable"
+        );
         assert!(OpenOptions::new().write(true).open(&b).is_err());
         let held = clear_restricting_flags_held(&b).unwrap();
         std::fs::remove_file(&b).unwrap();
@@ -2252,7 +2580,10 @@ mod tests {
         assert!(!is_bcachefs_option("bcachefs.project"));
         assert!(!is_bcachefs_option("bcachefs_effective.compression"));
         assert!(!is_bcachefs_option("user.bcachefs.compression"));
-        assert_eq!(super::super::xattr_node_name("bcachefs.project".as_ref()), None);
+        assert_eq!(
+            super::super::xattr_node_name("bcachefs.project".as_ref()),
+            None
+        );
         assert_eq!(
             super::super::xattr_node_name("bcachefs.projectx".as_ref()).as_deref(),
             Some("bcachefs.projectx")
@@ -2272,8 +2603,10 @@ mod tests {
             return;
         }
         let mut node = Node::new_node(OsStr::new("d"), NodeType::Dir, NodeMetadata::default());
-        node.meta.extended_attributes =
-            vec![ExtendedAttribute { name: "user.backotter".into(), value: Some(b"x".to_vec()) }];
+        node.meta.extended_attributes = vec![ExtendedAttribute {
+            name: "user.backotter".into(),
+            value: Some(b"x".to_vec()),
+        }];
         prepare_dir_for_options(dir.path(), &node, true);
         assert!(xattr::get(dir.path(), "user.backotter").unwrap().is_none());
         let path = dir.path().join("f");
@@ -2305,8 +2638,14 @@ mod tests {
         assert!(is_bcachefs_path(&d), "{} is not on bcachefs", d.display());
         let mut dir = Node::new_node(OsStr::new("d"), NodeType::Dir, NodeMetadata::default());
         dir.meta.extended_attributes = vec![
-            ExtendedAttribute { name: "bcachefs.compression".into(), value: Some(b"zstd".to_vec()) },
-            ExtendedAttribute { name: "bcachefs.project".into(), value: Some(b"43".to_vec()) },
+            ExtendedAttribute {
+                name: "bcachefs.compression".into(),
+                value: Some(b"zstd".to_vec()),
+            },
+            ExtendedAttribute {
+                name: "bcachefs.project".into(),
+                value: Some(b"43".to_vec()),
+            },
         ];
         dir.meta.generic_attributes.set_number(LINUX_PROJECT_ID, 43);
         prepare_dir_for_options(&d, &dir, true);
@@ -2318,11 +2657,17 @@ mod tests {
         std::fs::write(&zero, b"data").unwrap();
         let stock = d.join("stock");
         std::fs::write(&stock, b"data").unwrap();
-        let compression = xattr::get(&kid, "bcachefs_effective.compression").unwrap().unwrap();
+        let compression = xattr::get(&kid, "bcachefs_effective.compression")
+            .unwrap()
+            .unwrap();
         assert!(compression.starts_with(b"zstd"), "{compression:?}");
 
-        let mut kid_node = Node::new_node(OsStr::new("kid"), NodeType::File, NodeMetadata::default());
-        kid_node.meta.generic_attributes.set_number(LINUX_PROJECT_ID, 43);
+        let mut kid_node =
+            Node::new_node(OsStr::new("kid"), NodeType::File, NodeMetadata::default());
+        kid_node
+            .meta
+            .generic_attributes
+            .set_number(LINUX_PROJECT_ID, 43);
         restore_attributes(&kid, &kid_node, true).unwrap();
         let zero_node = Node::new_node(OsStr::new("zero"), NodeType::File, NodeMetadata::default());
         restore_attributes(&zero, &zero_node, true).unwrap();
@@ -2335,8 +2680,14 @@ mod tests {
         assert_eq!(effective_projid(&stock), 43);
         let names: Vec<_> = xattr::list(&kid).unwrap().collect();
         assert!(!names.iter().any(|n| n == "bcachefs.project"), "{names:?}");
-        assert!(!names.iter().any(|n| n == "bcachefs.compression"), "{names:?}");
-        assert_eq!(xattr::get(&d, "bcachefs.compression").unwrap().as_deref(), Some(&b"zstd"[..]));
+        assert!(
+            !names.iter().any(|n| n == "bcachefs.compression"),
+            "{names:?}"
+        );
+        assert_eq!(
+            xattr::get(&d, "bcachefs.compression").unwrap().as_deref(),
+            Some(&b"zstd"[..])
+        );
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -2353,21 +2704,33 @@ mod tests {
         if xattr::set(&path, "user.small", &small).is_err() {
             return; // no user.* attributes here
         }
-        assert_eq!(xattr_get(&path, "user.small".as_ref()).unwrap(), Some(small));
+        assert_eq!(
+            xattr_get(&path, "user.small".as_ref()).unwrap(),
+            Some(small)
+        );
         assert_eq!(xattr_get(&path, "user.empty".as_ref()).unwrap(), None);
         xattr::set(&path, "user.empty", b"").unwrap();
-        assert_eq!(xattr_get(&path, "user.empty".as_ref()).unwrap(), Some(Vec::new()));
+        assert_eq!(
+            xattr_get(&path, "user.empty".as_ref()).unwrap(),
+            Some(Vec::new())
+        );
         let mut names = xattr_list(&path).unwrap();
         names.sort();
         assert_eq!(names, ["user.empty", "user.small"]);
         // ext4 without ea_inode holds a block's worth; XFS, btrfs and tmpfs
         // more.
         for size in [4095, 4096, 4097, 15000, 60000] {
-            let big: Vec<u8> = (0..size).map(|i| u8::try_from(i % 251 + 1).unwrap()).collect();
+            let big: Vec<u8> = (0..size)
+                .map(|i| u8::try_from(i % 251 + 1).unwrap())
+                .collect();
             if xattr::set(&path, "user.big", &big).is_err() {
                 continue;
             }
-            assert_eq!(xattr_get(&path, "user.big".as_ref()).unwrap(), Some(big), "{size}");
+            assert_eq!(
+                xattr_get(&path, "user.big".as_ref()).unwrap(),
+                Some(big),
+                "{size}"
+            );
         }
     }
 }

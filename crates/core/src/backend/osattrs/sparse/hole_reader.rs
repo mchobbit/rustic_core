@@ -206,7 +206,8 @@ pub(super) mod tests {
                 Change::Append(data) => self.data.extend(data),
                 Change::AppendHole(n) => {
                     let len = self.len();
-                    self.data.resize(self.data.len() + usize::try_from(n).unwrap(), 0);
+                    self.data
+                        .resize(self.data.len() + usize::try_from(n).unwrap(), 0);
                     self.holes.push(len..len + n);
                 }
                 Change::Truncate(len) => {
@@ -280,7 +281,10 @@ pub(super) mod tests {
             if self.interrupt && self.calls.is_multiple_of(2) {
                 return Err(io::ErrorKind::Interrupted.into());
             }
-            let Some(rest) = usize::try_from(off).ok().and_then(|off| self.data.get(off..)) else {
+            let Some(rest) = usize::try_from(off)
+                .ok()
+                .and_then(|off| self.data.get(off..))
+            else {
                 return Ok(0);
             };
             let n = rest.len().min(buf.len()).min(self.short);
@@ -334,11 +338,18 @@ pub(super) mod tests {
 
     /// Reads all of `r`, `sizes` bytes at a time in turn, as the chunker
     /// asks for various amounts.
-    pub(in crate::backend::osattrs::sparse) fn read_all(mut r: impl io::Read, sizes: &[usize]) -> Vec<u8> {
+    pub(in crate::backend::osattrs::sparse) fn read_all(
+        mut r: impl io::Read,
+        sizes: &[usize],
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         let mut buf = vec![0xaa; sizes.iter().copied().max().unwrap_or(1).max(1)];
         for i in 0.. {
-            let size = sizes.get(i % sizes.len().max(1)).copied().unwrap_or(4096).max(1);
+            let size = sizes
+                .get(i % sizes.len().max(1))
+                .copied()
+                .unwrap_or(4096)
+                .max(1);
             match r.read(&mut buf[..size]) {
                 Ok(0) => break,
                 Ok(n) => out.extend_from_slice(&buf[..n]),
@@ -351,7 +362,9 @@ pub(super) mod tests {
 
     /// The chunks (length, ID) the chunker makes of `r`, with small chunks
     /// (the minimum no smaller than the chunker's buffer).
-    pub(in crate::backend::osattrs::sparse) fn chunks(r: impl io::Read + Send) -> Vec<(usize, crate::id::Id)> {
+    pub(in crate::backend::osattrs::sparse) fn chunks(
+        r: impl io::Read + Send,
+    ) -> Vec<(usize, crate::id::Id)> {
         use rustic_cdc::Rabin64;
 
         let rabin = Rabin64::new_with_polynom(6, &0x003D_A335_8B4D_C173);
@@ -378,10 +391,16 @@ pub(super) mod tests {
             ("hole in the middle", vec![(0, K + 1), (1, 5 * K), (0, 7)]),
             ("hole at end", vec![(0, 10), (1, 9 * K)]),
             ("whole-file hole", vec![(1, 8 * K)]),
-            ("hole shorter than a block", vec![(0, 100), (1, 100), (0, 100)]),
+            (
+                "hole shorter than a block",
+                vec![(0, 100), (1, 100), (0, 100)],
+            ),
             ("zeros written", vec![(0, 10), (2, 8 * K), (0, 10)]),
             ("data at EOF", vec![(1, 3 * K), (0, 1)]),
-            ("holes back to back", vec![(1, 2 * K), (1, 2 * K), (2, K), (1, K)]),
+            (
+                "holes back to back",
+                vec![(1, 2 * K), (1, 2 * K), (2, K), (1, K)],
+            ),
         ] {
             let f = sim_file(&runs, K as u64, 7);
             let want = f.data.clone();
@@ -428,7 +447,11 @@ pub(super) mod tests {
     #[test]
     fn hole_reader_seek_fails() {
         const K: usize = 4096;
-        let f = sim_file(&[(0, K), (1, 4 * K), (0, K), (1, 4 * K), (0, 3)], K as u64, 3);
+        let f = sim_file(
+            &[(0, K), (1, 4 * K), (0, K), (1, 4 * K), (0, 3)],
+            K as u64,
+            3,
+        );
         for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::EIO, libc::ENXIO] {
             for at in 0..12 {
                 let mut f = f.clone();
@@ -446,7 +469,11 @@ pub(super) mod tests {
         for runs in [vec![(0, K), (1, 4 * K)], vec![(1, 4 * K)], vec![(0, 3)]] {
             let mut f = sim_file(&runs, K as u64, 4);
             f.data_past_eof = true;
-            assert_eq!(read_all(HoleReader::new(f.clone()), &[K]), f.data, "{runs:?}");
+            assert_eq!(
+                read_all(HoleReader::new(f.clone()), &[K]),
+                f.data,
+                "{runs:?}"
+            );
         }
     }
 
@@ -463,7 +490,10 @@ pub(super) mod tests {
         const K: usize = 4096;
         let f = sim_file(&[(0, K), (1, 4 * K), (0, K), (1, 4 * K)], K as u64, 5);
         let len = f.len();
-        for (by_reads, at) in (0..24).map(|at| (false, at)).chain((0..12).map(|at| (true, at))) {
+        for (by_reads, at) in (0..24)
+            .map(|at| (false, at))
+            .chain((0..12).map(|at| (true, at)))
+        {
             for change in [
                 Change::Append(vec![9; 3 * K]),
                 Change::AppendHole(3 * K as u64),
@@ -532,7 +562,15 @@ pub(super) mod tests {
         const K: usize = 4096;
         let f = sim_file(&[(0, K), (1, 16 * K), (0, K)], K as u64, 6);
         let at = 2 * K as u64;
-        for cut in [at + 1, 5 * K as u64, 10 * K as u64 + 7, 17 * K as u64, at, K as u64, 0] {
+        for cut in [
+            at + 1,
+            5 * K as u64,
+            10 * K as u64 + 7,
+            17 * K as u64,
+            at,
+            K as u64,
+            0,
+        ] {
             for sizes in [&[K][..], &[100], &[1 << 20]] {
                 let mut r = HoleReader::new(f.clone());
                 let mut out = vec![0; 2 * K];

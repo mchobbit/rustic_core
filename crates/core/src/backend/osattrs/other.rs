@@ -13,7 +13,11 @@ pub(super) const FLAGS_BEFORE_ENTRIES: u32 = 0;
 pub(super) const FLAGS_XATTRS: &[&str] = &[];
 pub(super) const ZFS_DOS_FLAGS: Option<&str> = None;
 
-pub(super) fn open_for_attrs(_path: &Path, _typ: &NodeType, _m: &std::fs::Metadata) -> Option<File> {
+pub(super) fn open_for_attrs(
+    _path: &Path,
+    _typ: &NodeType,
+    _m: &std::fs::Metadata,
+) -> Option<File> {
     None
 }
 
@@ -73,7 +77,10 @@ pub(super) fn restore_symlink_mode(_path: &Path, _node: &Node) -> io::Result<()>
 }
 
 pub(super) fn restore_birthtime(_path: &Path, _node: &Node, _birth: Timestamp) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "no birth times on this system"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no birth times on this system",
+    ))
 }
 
 /// Extended attributes have no metadata of their own here.
@@ -81,10 +88,17 @@ pub(super) fn fill_xattr_meta(_path: &Path, _node: &mut Node) {}
 
 /// Extended attributes go through the xattr crate here.
 pub(super) fn xattrs(_path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "extended attributes go through xattr",
+    ))
 }
 
 /// Extended attributes go through the xattr crate here.
 pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr").into())
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "extended attributes go through xattr",
+    )
+    .into())
 }

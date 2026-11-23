@@ -129,7 +129,9 @@ fn generic_seek_hole(f: &File) -> bool {
 /// if that fails.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn fs_type(f: &File) -> Option<u32> {
-    statfs_type(f).inspect_err(|err| debug!("fstatfs: {err}")).ok()
+    statfs_type(f)
+        .inspect_err(|err| debug!("fstatfs: {err}"))
+        .ok()
 }
 
 /// A file system's magic number (`ZFS_SUPER_MAGIC` and the like) from
@@ -452,7 +454,9 @@ fn fill_holes_with(path: &Path, len: u64, done: &mut super::FilledHoles) -> io::
     let filled = allocate_holes(&f, len);
     // Looked at again whether or not it failed: a file system out of space
     // may have allocated some.
-    done.changed = f.metadata().is_ok_and(|after| after.blocks() > before.blocks());
+    done.changed = f
+        .metadata()
+        .is_ok_and(|after| after.blocks() > before.blocks());
     filled
 }
 
@@ -515,7 +519,10 @@ mod tests {
             return;
         };
         if !fills_holes_on(&File::open(&path).unwrap()) {
-            eprintln!("ZFS, btrfs or bcachefs: no holes filled in {}", dir.path().display());
+            eprintln!(
+                "ZFS, btrfs or bcachefs: no holes filled in {}",
+                dir.path().display()
+            );
             assert!(!holes_to_fill(&path, len));
             return;
         }
@@ -532,7 +539,14 @@ mod tests {
         assert!(filled.changed);
         let m = std::fs::metadata(&path).unwrap();
         assert!(!maybe_sparse(len, m.blocks()), "{} blocks", m.blocks());
-        assert_eq!(std::fs::read(&path).unwrap().iter().filter(|&&b| b != 0).count(), 1);
+        assert_eq!(
+            std::fs::read(&path)
+                .unwrap()
+                .iter()
+                .filter(|&&b| b != 0)
+                .count(),
+            1
+        );
 
         // Filled already: nothing to do, read-only or not.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
@@ -593,15 +607,51 @@ mod tests {
             ("empty", 0, 0, must_not_seek(), false),
             ("dense", 4096, 8, must_not_seek(), false),
             ("last block part used", 4000, 8, must_not_seek(), false),
-            ("preallocated beyond its size", 4096, 64, must_not_seek(), false),
+            (
+                "preallocated beyond its size",
+                4096,
+                64,
+                must_not_seek(),
+                false,
+            ),
             ("all hole", 1 << 30, 0, hole(0), true),
             ("hole in the middle", 1 << 20, 8, hole(4096), true),
             ("compressed, no holes", 1 << 20, 8, hole(1 << 20), false),
-            ("SEEK_HOLE fails with EINVAL", 1 << 20, 8, fails(libc::EINVAL), true),
-            ("SEEK_HOLE fails with EOPNOTSUPP", 1 << 20, 8, fails(libc::EOPNOTSUPP), true),
-            ("SEEK_HOLE fails with ENOTTY", 1 << 20, 8, fails(libc::ENOTTY), true),
-            ("SEEK_HOLE fails with ENXIO", 1 << 20, 8, fails(libc::ENXIO), false),
-            ("SEEK_HOLE fails with EACCES", 1 << 20, 8, fails(libc::EACCES), false),
+            (
+                "SEEK_HOLE fails with EINVAL",
+                1 << 20,
+                8,
+                fails(libc::EINVAL),
+                true,
+            ),
+            (
+                "SEEK_HOLE fails with EOPNOTSUPP",
+                1 << 20,
+                8,
+                fails(libc::EOPNOTSUPP),
+                true,
+            ),
+            (
+                "SEEK_HOLE fails with ENOTTY",
+                1 << 20,
+                8,
+                fails(libc::ENOTTY),
+                true,
+            ),
+            (
+                "SEEK_HOLE fails with ENXIO",
+                1 << 20,
+                8,
+                fails(libc::ENXIO),
+                false,
+            ),
+            (
+                "SEEK_HOLE fails with EACCES",
+                1 << 20,
+                8,
+                fails(libc::EACCES),
+                false,
+            ),
             ("no SEEK_HOLE", 1 << 20, 8, None, true),
             ("no SEEK_HOLE, dense", 1 << 20, 2048, None, false),
         ] {
@@ -632,7 +682,8 @@ mod tests {
         f.sync_all().unwrap();
         drop(f);
         let m = std::fs::symlink_metadata(&full).unwrap();
-        let made_holes = maybe_sparse(m.len(), m.blocks()) && seek::tests::finds_hole(&full, m.len());
+        let made_holes =
+            maybe_sparse(m.len(), m.blocks()) && seek::tests::finds_hole(&full, m.len());
         assert_eq!(has_holes(&full, &m, opened(&full).as_ref()), made_holes);
 
         let sparse = dir.path().join("sparse");
@@ -693,7 +744,11 @@ mod tests {
         ] {
             assert_eq!(magic(i128::from(want.cast_signed())), want, "{name}: i32");
             assert_eq!(magic(i128::from(i64::from(want))), want, "{name}: i64");
-            assert_eq!(magic(i128::from(u64::from(want))), want, "{name}: unsigned long");
+            assert_eq!(
+                magic(i128::from(u64::from(want))),
+                want,
+                "{name}: unsigned long"
+            );
         }
         assert!(BCACHEFS_SUPER_MAGIC.cast_signed() < 0 && BTRFS_SUPER_MAGIC.cast_signed() < 0);
     }
@@ -730,7 +785,11 @@ mod tests {
             (libc::ENOSPC, false),
             (libc::EIO, false),
         ] {
-            assert_eq!(cannot_allocate(&io::Error::from_raw_os_error(errno)), want, "{errno}");
+            assert_eq!(
+                cannot_allocate(&io::Error::from_raw_os_error(errno)),
+                want,
+                "{errno}"
+            );
         }
     }
 
@@ -769,10 +828,18 @@ mod tests {
         let len = 8 << 20;
         std::fs::write(&path, vec![0_u8; 8 << 20]).unwrap();
         File::open(&path).unwrap().sync_all().unwrap();
-        assert_eq!(fs_type(&File::open(&path).unwrap()), Some(ZFS_SUPER_MAGIC), "not ZFS");
+        assert_eq!(
+            fs_type(&File::open(&path).unwrap()),
+            Some(ZFS_SUPER_MAGIC),
+            "not ZFS"
+        );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
         let m = std::fs::metadata(&path).unwrap();
-        assert!(maybe_sparse(len, m.blocks()), "no compression: {} blocks", m.blocks());
+        assert!(
+            maybe_sparse(len, m.blocks()),
+            "no compression: {} blocks",
+            m.blocks()
+        );
         assert!(!holes_to_fill(&path, len));
         let filled = fill_holes(&path, len);
         assert!(filled.error.is_none(), "{:?}", filled.error);
@@ -795,7 +862,11 @@ mod tests {
             let path = dir.path().join(name);
             let f = File::create_new(&path).unwrap();
             if nocow {
-                let out = std::process::Command::new("chattr").arg("+C").arg(&path).output().unwrap();
+                let out = std::process::Command::new("chattr")
+                    .arg("+C")
+                    .arg(&path)
+                    .output()
+                    .unwrap();
                 assert!(out.status.success(), "chattr +C: {out:?}");
             }
             f.set_len(len).unwrap();
@@ -812,7 +883,10 @@ mod tests {
         let filled = fill_holes(&plain, len);
         assert!(filled.error.is_none(), "{:?}", filled.error);
         assert!(!filled.changed);
-        assert!(maybe_sparse(len, blocks(&plain)), "plain file's holes filled");
+        assert!(
+            maybe_sparse(len, blocks(&plain)),
+            "plain file's holes filled"
+        );
 
         let (nocow, f) = create("nocow", true);
         assert!(allocates_on(&f));
@@ -820,11 +894,17 @@ mod tests {
         let filled = fill_holes(&nocow, len);
         assert!(filled.error.is_none(), "{:?}", filled.error);
         assert!(filled.changed);
-        assert!(!maybe_sparse(len, blocks(&nocow)), "NOCOW file's holes not filled");
+        assert!(
+            !maybe_sparse(len, blocks(&nocow)),
+            "NOCOW file's holes not filled"
+        );
 
         let (pre, f) = create("nocow-preallocated", true);
         super::super::preallocate(&f, len);
-        assert!(!maybe_sparse(len, blocks(&pre)), "NOCOW file not preallocated");
+        assert!(
+            !maybe_sparse(len, blocks(&pre)),
+            "NOCOW file not preallocated"
+        );
     }
 
     // On JFS and nilfs2, SEEK_HOLE finds no hole before the size, so the
@@ -852,7 +932,10 @@ mod tests {
             eprintln!("BKO_TEST_GENERIC_SEEK_HOLE_DIR not set");
             return;
         };
-        let dir = tempfile::Builder::new().prefix("bko-").tempdir_in(dir).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("bko-")
+            .tempdir_in(dir)
+            .unwrap();
         let fill = |name: &str, off: u64, data: &[u8]| {
             let path = dir.path().join(name);
             let mut f = File::create(&path).unwrap();
@@ -866,8 +949,16 @@ mod tests {
         let (path, m) = fill("holes", 32 << 20, b"y");
         let f = File::open(&path).unwrap();
         assert!(generic_seek_hole(&f), "not on JFS or nilfs2");
-        assert_eq!(seek::seek_hole(&f).unwrap(), m.len(), "not a generic SEEK_HOLE");
-        assert!(maybe_sparse(m.len(), m.blocks()), "no holes: {} blocks", m.blocks());
+        assert_eq!(
+            seek::seek_hole(&f).unwrap(),
+            m.len(),
+            "not a generic SEEK_HOLE"
+        );
+        assert!(
+            maybe_sparse(m.len(), m.blocks()),
+            "no holes: {} blocks",
+            m.blocks()
+        );
         assert!(has_holes(&path, &m, Some(&File::open(&path).unwrap())));
         assert!(!seek::holes_now(&f));
 

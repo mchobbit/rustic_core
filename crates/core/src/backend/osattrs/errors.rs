@@ -32,7 +32,12 @@ pub(crate) struct Unsupported {
 
 impl fmt::Display for Unsupported {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} not supported by the file system: {}", self.kind(), self.source)
+        write!(
+            f,
+            "{} not supported by the file system: {}",
+            self.kind(),
+            self.source
+        )
     }
 }
 
@@ -386,14 +391,22 @@ pub(crate) fn warn_restore(path: &Path, err: &io::Error) {
         return;
     }
     let (kind, msg) = if let Some(e) = inner.and_then(|e| e.downcast_ref::<Unsupported>()) {
-        (format!("{} not supported by the file system", e.kind()), e.to_string())
+        (
+            format!("{} not supported by the file system", e.kind()),
+            e.to_string(),
+        )
     } else if let Some(e) = inner.and_then(|e| e.downcast_ref::<SidUnmapped>()) {
-        (format!("{}: SIDs not mapped by idmap, nobody (60001) used", e.attr), e.to_string())
+        (
+            format!("{}: SIDs not mapped by idmap, nobody (60001) used", e.attr),
+            e.to_string(),
+        )
     } else {
         warn!("restore {}: {err}", path.display());
         return;
     };
-    let mut seen = UNSUPPORTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut seen = UNSUPPORTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_, n) = seen.entry(kind).or_insert_with(|| (path.to_path_buf(), 0));
     *n += 1;
     let first = *n == 1;
@@ -408,7 +421,9 @@ pub(crate) fn warn_restore(path: &Path, err: &io::Error) {
 /// again.
 pub(crate) fn report_unsupported() {
     let seen = std::mem::take(
-        &mut *UNSUPPORTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        &mut *UNSUPPORTED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
     for (kind, (first, n)) in seen {
         if n > 1 {

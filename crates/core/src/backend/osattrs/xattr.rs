@@ -105,7 +105,12 @@ pub(crate) fn set_native_xattrs(
 /// # Errors
 ///
 /// * If they can't be listed.
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+#[cfg(not(any(
+    windows,
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "haiku"
+)))]
 pub(crate) fn xattr_list(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
     // BackOtter: past PATH_MAX, through a short path to it.
     let path = &*walkdir::short_path(path);
@@ -126,7 +131,12 @@ pub(crate) fn xattr_list(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
 /// # Errors
 ///
 /// * If it can't be read.
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+#[cfg(not(any(
+    windows,
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "haiku"
+)))]
 pub(crate) fn xattr_get(path: &Path, name: &std::ffi::OsStr) -> io::Result<Option<Vec<u8>>> {
     // BackOtter: past PATH_MAX, through a short path to it.
     let path = &*walkdir::short_path(path);
@@ -148,7 +158,12 @@ pub(crate) fn xattr_get(path: &Path, name: &std::ffi::OsStr) -> io::Result<Optio
 /// doesn't), which `linux.project_id` carries and bcachefs won't have set to
 /// anything but 0 (`EINVAL`). A restore neither sets nor removes them,
 /// whatever a snapshot holds, as in BackOtter's restic.
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+#[cfg(not(any(
+    windows,
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "haiku"
+)))]
 pub(crate) fn xattr_node_name(name: &std::ffi::OsStr) -> Option<String> {
     let name = name.to_string_lossy();
     if cfg!(any(target_os = "freebsd", target_os = "netbsd")) {
@@ -173,7 +188,12 @@ pub(crate) const SELINUX_LABEL: &str = "security.selinux";
 /// above the backed-up path in an older rustic-bko snapshot) keeps the label
 /// the restored file got, as in BackOtter's restic. A node with one sets it.
 #[cfg_attr(
-    any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku"),
+    any(
+        windows,
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "haiku"
+    ),
     allow(dead_code)
 )]
 pub(crate) fn xattr_never_removed(name: &str) -> bool {
@@ -193,7 +213,12 @@ static LABELS_KEPT: Mutex<Option<(PathBuf, io::Error, u64)>> = Mutex::new(None);
 /// file's. Any other failure (`EPERM` too) is the file's. As in BackOtter's
 /// restic (`removeLabel`).
 #[cfg_attr(
-    any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku"),
+    any(
+        windows,
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "haiku"
+    ),
     allow(dead_code)
 )]
 pub(crate) fn label_refused(name: &str, path: &Path, err: &io::Error) -> bool {
@@ -202,7 +227,9 @@ pub(crate) fn label_refused(name: &str, path: &Path, err: &io::Error) -> bool {
     #[cfg(not(unix))]
     let refused = false;
     if refused {
-        let mut kept = LABELS_KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut kept = LABELS_KEPT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match kept.as_mut() {
             Some((_, _, n)) => *n += 1,
             None => *kept = Some((path.to_path_buf(), same_error(err), 1)),
@@ -215,7 +242,10 @@ pub(crate) fn label_refused(name: &str, path: &Path, err: &io::Error) -> bool {
 /// one warning naming the first file and how many there were, and whether
 /// there were: one error for the whole restore, as root or not.
 pub(crate) fn report_labels_kept() -> bool {
-    let kept = LABELS_KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    let kept = LABELS_KEPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
     let Some((first, err, n)) = kept else {
         return false;
     };
@@ -228,12 +258,22 @@ pub(crate) fn report_labels_kept() -> bool {
 
 /// The prefix of bcachefs' extended attributes that show a file's options as
 /// they apply to it, whether its own or inherited ([`xattr_node_name`]).
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+#[cfg(not(any(
+    windows,
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "haiku"
+)))]
 pub(crate) const BCACHEFS_EFFECTIVE: &str = "bcachefs_effective.";
 
 /// The extended attribute in which bcachefs shows a project ID a file was
 /// given, not inherited ([`xattr_node_name`]).
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+#[cfg(not(any(
+    windows,
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "haiku"
+)))]
 pub(crate) const BCACHEFS_OWN_PROJECT: &str = "bcachefs.project";
 
 /// bcachefs' casefolding option of a directory, which bcachefs sets, clears
@@ -241,7 +281,12 @@ pub(crate) const BCACHEFS_OWN_PROJECT: &str = "bcachefs.project";
 /// empty (`ENOTEMPTY`). A restore gives it to each directory it creates, or
 /// finds empty, before anything goes in, and later leaves it alone where it
 /// is right, as every extended attribute.
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+#[cfg(not(any(
+    windows,
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "haiku"
+)))]
 pub(crate) const BCACHEFS_CASEFOLD: &str = "bcachefs.casefold";
 
 /// Whether `err`, from setting or removing the extended attribute `name` (a
@@ -249,14 +294,24 @@ pub(crate) const BCACHEFS_CASEFOLD: &str = "bcachefs.casefold";
 /// directory with entries: a warning, "casefolding (bcachefs.casefold) not
 /// restored on PATH: directory not empty", as for chattr's F, and not one
 /// of the file's errors, as in BackOtter's restic.
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+#[cfg(not(any(
+    windows,
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "haiku"
+)))]
 pub(crate) fn casefold_not_empty(name: &str, err: &io::Error) -> bool {
     name == BCACHEFS_CASEFOLD && err.kind() == io::ErrorKind::DirectoryNotEmpty
 }
 
 /// The name the xattr crate takes for a node's extended attribute; see
 /// [`xattr_node_name`].
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+#[cfg(not(any(
+    windows,
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "haiku"
+)))]
 pub(crate) fn xattr_os_name(name: &str) -> String {
     if cfg!(any(target_os = "freebsd", target_os = "netbsd")) {
         format!("user.{name}")

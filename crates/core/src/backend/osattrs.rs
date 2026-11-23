@@ -146,7 +146,9 @@ use other as os;
 /// For a backup's source and a restore's destination.
 pub(crate) fn warn_on_short_path_errors() {
     walkdir::report_short_path_errors(|err| {
-        warn!("paths of PATH_MAX bytes or more can't be reached, and fail as \"File name too long\": {err}");
+        warn!(
+            "paths of PATH_MAX bytes or more can't be reached, and fail as \"File name too long\": {err}"
+        );
     });
 }
 
@@ -195,7 +197,9 @@ pub(crate) fn fill(path: &Path, node: &mut Node, m: &std::fs::Metadata, xattrs: 
     // DragonFly, which keep none.
     #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     if let Some(birth) = m.created().ok().and_then(|t| Timestamp::try_from(t).ok()) {
-        node.meta.generic_attributes.set_timestamp(UNIX_BIRTHTIME, birth);
+        node.meta
+            .generic_attributes
+            .set_timestamp(UNIX_BIRTHTIME, birth);
     }
     // A regular file, not a block device saved as one.
     #[cfg(unix)]
@@ -310,7 +314,9 @@ pub(crate) fn keep_unread(path: &Path, node: &mut Node) {
     node.content = Some(Vec::new());
     node.meta.size = 0;
     node.meta.extended_attributes.clear();
-    node.meta.generic_attributes.set_u64(ILLUMOS_UNREAD_SIZE, size);
+    node.meta
+        .generic_attributes
+        .set_u64(ILLUMOS_UNREAD_SIZE, size);
     warn!(
         "{}: av_quarantined: contents not backed up ({size} bytes)",
         path.display()
@@ -552,7 +558,11 @@ impl HeldFlags {
         match self {
             Self::Nothing => Ok(()),
             #[cfg(unix)]
-            Self::Held { file, cleared, path } => {
+            Self::Held {
+                file,
+                cleared,
+                path,
+            } => {
                 use std::os::unix::fs::MetadataExt;
                 if file.metadata()?.nlink() == 0 {
                     return Ok(());
@@ -573,7 +583,13 @@ impl HeldFlags {
                 }
             }
             #[cfg(unix)]
-            Self::ByPath { path, dev, ino, linked, cleared } => {
+            Self::ByPath {
+                path,
+                dev,
+                ino,
+                linked,
+                cleared,
+            } => {
                 use std::os::unix::fs::MetadataExt;
                 match std::fs::symlink_metadata(&path) {
                     Ok(m) if (m.dev(), m.ino()) == (dev, ino) => {
@@ -1066,7 +1082,10 @@ pub(crate) fn restore_birthtime(path: &Path, node: &Node) -> io::Result<()> {
     allow(dead_code)
 )]
 fn birthtime_first(node: &Node, birth: Timestamp) -> Option<Timestamp> {
-    node.meta.mtime.filter(|&mtime| birth < mtime).map(|_| birth)
+    node.meta
+        .mtime
+        .filter(|&mtime| birth < mtime)
+        .map(|_| birth)
 }
 
 /// Sets `node`'s birth time `birth`, when it is earlier than its mtime, as
@@ -1156,7 +1175,12 @@ fn utimensat_nofollow(
     let times = [spec(atime), spec(mtime)];
     // SAFETY: p is a C string, times two timespecs.
     let r = unsafe {
-        libc::utimensat(libc::AT_FDCWD, p.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+        libc::utimensat(
+            libc::AT_FDCWD,
+            p.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
     };
     check(r).map(drop)
 }
@@ -1202,7 +1226,9 @@ fn warn_unknown(node: &Node) {
         if KNOWN.contains(&name) {
             continue;
         }
-        let mut warned = WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut warned = WARNED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if warned.insert(name.to_string()) {
             warn!("ignoring unknown generic attribute {name}, maybe from a newer version");
         }

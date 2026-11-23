@@ -102,7 +102,10 @@ pub(super) fn holes_now(f: &File) -> bool {
     match (f.metadata(), seek_hole(f)) {
         (Ok(m), Ok(hole)) => hole < m.len(),
         (m, hole) => {
-            debug!("no hole found as opened ({:?}, {hole:?}); reading plainly", m.err());
+            debug!(
+                "no hole found as opened ({:?}, {hole:?}); reading plainly",
+                m.err()
+            );
             false
         }
     }
@@ -133,6 +136,8 @@ impl Extents for File {
 /// `fstatfs(2)` with their struct, the 64-bit ones there too: the plain
 /// ones can fail with `EOVERFLOW` on a large file system.
 pub(in crate::backend::osattrs) mod lfs {
+    #[cfg(all(target_os = "linux", not(any(target_env = "gnu", target_env = "musl"))))]
+    pub(in crate::backend::osattrs) use libc::{fallocate, fstatfs, statfs};
     #[cfg(any(
         target_os = "android",
         all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))
@@ -141,11 +146,6 @@ pub(in crate::backend::osattrs) mod lfs {
         fallocate64 as fallocate, fstatfs64 as fstatfs, lseek64 as lseek, off64_t as off_t,
         statfs64 as statfs,
     };
-    #[cfg(all(
-        target_os = "linux",
-        not(any(target_env = "gnu", target_env = "musl"))
-    ))]
-    pub(in crate::backend::osattrs) use libc::{fallocate, fstatfs, statfs};
     #[cfg(not(any(
         target_os = "android",
         all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))
@@ -153,10 +153,7 @@ pub(in crate::backend::osattrs) mod lfs {
     pub(in crate::backend::osattrs) use libc::{lseek, off_t};
 
     // Every system but 32-bit uClibc Linux has 64-bit offsets here.
-    #[cfg(not(all(
-        target_os = "linux",
-        not(any(target_env = "gnu", target_env = "musl"))
-    )))]
+    #[cfg(not(all(target_os = "linux", not(any(target_env = "gnu", target_env = "musl")))))]
     const _: () = assert!(size_of::<off_t>() == 8);
 }
 
@@ -202,7 +199,11 @@ pub(super) mod tests {
         // (offset, length) of the data written, and the size.
         for (name, writes, size) in [
             ("hole at start", vec![(4 * M, 3 * K)], 4 * M + 3 * K),
-            ("hole in the middle", vec![(0, M + 1), (5 * M, 7)], 5 * M + 7),
+            (
+                "hole in the middle",
+                vec![(0, M + 1), (5 * M, 7)],
+                5 * M + 7,
+            ),
             ("hole at end", vec![(0, 10)], 9 * M),
             ("whole-file hole", vec![], 8 * M),
             ("hole shorter than a page", vec![(0, 100), (200, 100)], 300),
@@ -217,8 +218,11 @@ pub(super) mod tests {
             let mut f = File::create(&path).unwrap();
             for (i, &(off, len)) in writes.iter().enumerate() {
                 _ = f.seek(SeekFrom::Start(off)).unwrap();
-                f.write_all(&vec![u8::try_from(i % 250).unwrap() + 1; usize::try_from(len).unwrap()])
-                    .unwrap();
+                f.write_all(&vec![
+                    u8::try_from(i % 250).unwrap() + 1;
+                    usize::try_from(len).unwrap()
+                ])
+                .unwrap();
             }
             f.set_len(size).unwrap();
             drop(f);
@@ -232,7 +236,10 @@ pub(super) mod tests {
                 assert_eq!(r.zeros, size, "{name}");
             }
             assert_eq!(
-                read_all(backup_reader(File::open(&path).unwrap(), true), &[4096, 1 << 19]),
+                read_all(
+                    backup_reader(File::open(&path).unwrap(), true),
+                    &[4096, 1 << 19]
+                ),
                 want,
                 "{name}"
             );
@@ -282,10 +289,15 @@ pub(super) mod tests {
             if n == 0 {
                 let mut rest = Vec::new();
                 _ = b.read_to_end(&mut rest).unwrap();
-                assert!(rest.is_empty(), "{what}: {} bytes more read plainly", rest.len());
+                assert!(
+                    rest.is_empty(),
+                    "{what}: {} bytes more read plainly",
+                    rest.len()
+                );
                 break;
             }
-            b.read_exact(&mut bb[..n]).unwrap_or_else(|err| panic!("{what}: at {total}: {err}"));
+            b.read_exact(&mut bb[..n])
+                .unwrap_or_else(|err| panic!("{what}: at {total}: {err}"));
             assert!(ba[..n] == bb[..n], "{what}: differ in {total}..+{n}");
             total += n as u64;
         }
@@ -388,7 +400,10 @@ pub(super) mod tests {
         let mut r = HoleReader::new(f);
         assert_eq!(digest(&mut r), plain);
         assert!(r.zeros > 5 * G, "{} bytes of holes", r.zeros);
-        assert_eq!(digest(backup_reader(File::open(&path).unwrap(), true)), plain);
+        assert_eq!(
+            digest(backup_reader(File::open(&path).unwrap(), true)),
+            plain
+        );
     }
 
     /// Another thread writes into the holes, appends and truncates while a
