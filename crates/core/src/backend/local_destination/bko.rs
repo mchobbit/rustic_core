@@ -412,14 +412,15 @@ mod sparse_tests {
         const B: u64 = 4096;
         const K: usize = 4096;
         let zeros = vec![0_u8; 4 * K];
+        let none: Vec<std::ops::Range<usize>> = Vec::new();
         // All zeros, aligned or not, longer or shorter than a block:
         // nothing written.
-        assert!(check(0, &zeros, B).is_empty());
-        assert!(check(8192, &zeros, B).is_empty());
-        assert!(check(100, &zeros, B).is_empty());
-        assert!(check(0, &zeros[..4095], B).is_empty());
-        assert!(check(1, &zeros[..4096], B).is_empty());
-        assert!(check(0, &[], B).is_empty());
+        assert_eq!(check(0, &zeros, B), none);
+        assert_eq!(check(8192, &zeros, B), none);
+        assert_eq!(check(100, &zeros, B), none);
+        assert_eq!(check(0, &zeros[..4095], B), none);
+        assert_eq!(check(1, &zeros[..4096], B), none);
+        assert_eq!(check(0, &[], B), none);
         // Data in the second block: that block.
         let mut data = zeros.clone();
         data[5000] = 1;
@@ -447,7 +448,7 @@ mod sparse_tests {
         data[K] = 1;
         assert_eq!(check(0, &data, B), vec![0..2 * K]);
         // Larger blocks (ZFS's records).
-        assert!(check(0, &vec![0; 300 << 10], 128 << 10).is_empty());
+        assert_eq!(check(0, &vec![0; 300 << 10], 128 << 10), none);
         let mut data = vec![0; 300 << 10];
         data[260 << 10] = 1;
         assert_eq!(check(0, &data, 128 << 10), vec![256 << 10..300 << 10]);
@@ -477,6 +478,181 @@ mod sparse_tests {
     }
 }
 
+/// BackOtter: the tests of the extended attribute sync with a fake system
+/// ([`set_xattrs_with`]), on every system that has it, so that FreeBSD's
+/// and NetBSD's stock names (`bsd_stock`) are tested where they apply.
+#[cfg(all(
+    test,
+    not(any(
+        windows,
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "haiku"
+    ))
+))]
+mod xattr_tests {
+    use nix::errno::Errno;
+
+    use super::super::{LocalDestination, LocalDestinationErrorKind};
+    use super::*;
+
+    pub(super) fn xattr(name: &str, value: &[u8]) -> ExtendedAttribute {
+        ExtendedAttribute {
+            name: name.to_string(),
+            value: Some(value.to_vec()),
+        }
+    }
+
+    /// BackOtter: extended attribute calls on one file, kept in a map: those
+    /// in `not_empty` are refused, set or removed, with `ENOTEMPTY`, as
+    /// bcachefs refuses `bcachefs.casefold` on a directory with entries.
+    /// Names are the system's, as the xattr crate takes them
+    /// ([`osattrs::xattr_os_name`]).
+    #[derive(Default)]
+    pub(super) struct FakeXattrs {
+        attrs: std::cell::RefCell<std::collections::BTreeMap<String, Vec<u8>>>,
+        not_empty: Vec<String>,
+        pub(super) warned: std::cell::RefCell<Vec<String>>,
+        /// The error those in `not_empty` are refused with, if not
+        /// `ENOTEMPTY`.
+        pub(super) errno: Option<i32>,
+        /// The names `set` was called with, in order.
+        pub(super) sets: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl FakeXattrs {
+        pub(super) fn with(attrs: &[(&str, &[u8])], not_empty: &[&str]) -> Self {
+            Self {
+                attrs: std::cell::RefCell::new(
+                    attrs
+                        .iter()
+                        .map(|(n, v)| ((*n).to_string(), v.to_vec()))
+                        .collect(),
+                ),
+                not_empty: not_empty.iter().map(|n| (*n).to_string()).collect(),
+                warned: std::cell::RefCell::default(),
+                errno: None,
+                sets: std::cell::RefCell::default(),
+            }
+        }
+
+        fn refuse(&self, name: &str) -> std::io::Result<()> {
+            if self.not_empty.iter().any(|n| n == name) {
+                return Err(std::io::Error::from_raw_os_error(
+                    self.errno.unwrap_or(libc::ENOTEMPTY),
+                ));
+            }
+            Ok(())
+        }
+
+        pub(super) fn names(&self) -> Vec<String> {
+            self.attrs.borrow().keys().cloned().collect()
+        }
+    }
+
+    impl XattrCalls for FakeXattrs {
+        fn list(&self, _path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+            Ok(self.attrs.borrow().keys().map(Into::into).collect())
+        }
+        fn get(&self, _path: &Path, name: &std::ffi::OsStr) -> std::io::Result<Option<Vec<u8>>> {
+            Ok(self.attrs.borrow().get(&*name.to_string_lossy()).cloned())
+        }
+        fn set(&self, _path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
+            self.sets.borrow_mut().push(name.to_string());
+            self.refuse(name)?;
+            _ = self
+                .attrs
+                .borrow_mut()
+                .insert(name.to_string(), value.to_vec());
+            Ok(())
+        }
+        fn remove(&self, _path: &Path, name: &std::ffi::OsStr) -> std::io::Result<()> {
+            let name = name.to_string_lossy();
+            self.refuse(&name)?;
+            _ = self.attrs.borrow_mut().remove(&*name);
+            Ok(())
+        }
+        fn warn_casefold(&self, name: &str, path: &Path) {
+            self.warned
+                .borrow_mut()
+                .push(format!("{name} {}", path.display()));
+        }
+    }
+
+    /// BackOtter: an extended attribute the file system doesn't support
+    /// (`EOPNOTSUPP`) isn't counted as an error under `--strict-exit`, as
+    /// root or not; one that couldn't be set for another reason (`EIO`) is.
+    #[test]
+    fn xattrs_not_set_count_unless_unsupported() {
+        let file = Path::new("/r/f");
+        let os_name = osattrs::xattr_os_name("user.a");
+        for (errno, counts) in [(libc::EOPNOTSUPP, false), (libc::EIO, true)] {
+            let mut calls = FakeXattrs::with(&[], &[&os_name]);
+            calls.errno = Some(errno);
+            let errors =
+                set_xattrs_with(&calls, file, &[xattr("user.a", b"1")], false).unwrap_err();
+            let err = LocalDestinationErrorKind::XattrsNotSet(errors);
+            assert_eq!(
+                LocalDestination::error_counts(&err, true),
+                counts,
+                "{errno}"
+            );
+            assert_eq!(
+                LocalDestination::error_counts(&err, false),
+                counts,
+                "{errno}"
+            );
+        }
+        // A change of owner refused counts as root only.
+        let err = LocalDestinationErrorKind::FromErrnoError(Errno::EPERM);
+        assert!(LocalDestination::error_counts(&err, true));
+        assert!(!LocalDestination::error_counts(&err, false));
+    }
+
+    /// BackOtter: stock rustic's names on FreeBSD and NetBSD (`user.NAME`,
+    /// `system.NAME`) are restored under their namespace in a snapshot not
+    /// BackOtter's, and a `user.` one matches the bare name listed; in
+    /// BackOtter's snapshots (and elsewhere) a node's name is the name.
+    #[test]
+    fn xattr_stock_bsd_names() {
+        let own = |name: &str| (Some(name.to_string()), osattrs::xattr_os_name(name));
+        assert_eq!(
+            xattr_restore_names("user.comment", true),
+            (Some("comment".to_string()), "user.comment".to_string())
+        );
+        assert_eq!(
+            xattr_restore_names("system.mac", true),
+            (None, "system.mac".to_string())
+        );
+        assert_eq!(xattr_restore_names("comment", true), own("comment"));
+        assert_eq!(
+            xattr_restore_names("user.comment", false),
+            own("user.comment")
+        );
+        assert_eq!(xattr_restore_names("system.mac", false), own("system.mac"));
+    }
+
+    /// BackOtter: a stock name of the user namespace that the file has with
+    /// the right value is left, one of the system namespace is set (never
+    /// listed, nor removed), with `bsd_stock`.
+    #[test]
+    fn xattr_stock_bsd_names_synced() {
+        let dir = Path::new("/r/f");
+        // The file has user.comment (the system's name: "user.comment" on
+        // FreeBSD and NetBSD, whose node name is "comment"; "comment"
+        // elsewhere).
+        let comment = osattrs::xattr_os_name("comment");
+        let calls = FakeXattrs::with(&[(&comment, b"c")], &[]);
+        let attrs = [xattr("user.comment", b"c"), xattr("system.mac", b"m")];
+        // The fake's set takes the name as given: one already right isn't set.
+        set_xattrs_with(&calls, dir, &attrs, true).unwrap();
+        let mut want = vec![comment, "system.mac".to_string()];
+        want.sort();
+        assert_eq!(calls.names(), want);
+        assert_eq!(*calls.sets.borrow(), ["system.mac"]);
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::fs;
@@ -486,15 +662,9 @@ mod tests {
     use nix::errno::Errno;
 
     use super::super::{LocalDestination, LocalDestinationErrorKind};
+    use super::xattr_tests::{FakeXattrs, xattr};
     use super::*;
     use crate::backend::node::Metadata;
-
-    fn xattr(name: &str, value: &[u8]) -> ExtendedAttribute {
-        ExtendedAttribute {
-            name: name.to_string(),
-            value: Some(value.to_vec()),
-        }
-    }
 
     /// BackOtter: a change of owner refused to a restore not running as root
     /// is quiet (as in restic); any other failure, and every failure as
@@ -576,76 +746,6 @@ mod tests {
         assert_eq!(xattr::list(&file).unwrap().count(), 0);
     }
 
-    /// BackOtter: extended attribute calls on one file, kept in a map: those
-    /// in `not_empty` are refused, set or removed, with `ENOTEMPTY`, as
-    /// bcachefs refuses `bcachefs.casefold` on a directory with entries.
-    #[derive(Default)]
-    struct FakeXattrs {
-        attrs: std::cell::RefCell<std::collections::BTreeMap<String, Vec<u8>>>,
-        not_empty: Vec<&'static str>,
-        warned: std::cell::RefCell<Vec<String>>,
-        /// The error those in `not_empty` are refused with, if not
-        /// `ENOTEMPTY`.
-        errno: Option<i32>,
-    }
-
-    impl FakeXattrs {
-        fn with(attrs: &[(&str, &[u8])], not_empty: &[&'static str]) -> Self {
-            Self {
-                attrs: std::cell::RefCell::new(
-                    attrs
-                        .iter()
-                        .map(|(n, v)| ((*n).to_string(), v.to_vec()))
-                        .collect(),
-                ),
-                not_empty: not_empty.to_vec(),
-                warned: std::cell::RefCell::default(),
-                errno: None,
-            }
-        }
-
-        fn refuse(&self, name: &str) -> std::io::Result<()> {
-            if self.not_empty.contains(&name) {
-                return Err(std::io::Error::from_raw_os_error(
-                    self.errno.unwrap_or(libc::ENOTEMPTY),
-                ));
-            }
-            Ok(())
-        }
-
-        fn names(&self) -> Vec<String> {
-            self.attrs.borrow().keys().cloned().collect()
-        }
-    }
-
-    impl XattrCalls for FakeXattrs {
-        fn list(&self, _path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
-            Ok(self.attrs.borrow().keys().map(Into::into).collect())
-        }
-        fn get(&self, _path: &Path, name: &std::ffi::OsStr) -> std::io::Result<Option<Vec<u8>>> {
-            Ok(self.attrs.borrow().get(&*name.to_string_lossy()).cloned())
-        }
-        fn set(&self, _path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
-            self.refuse(name)?;
-            _ = self
-                .attrs
-                .borrow_mut()
-                .insert(name.to_string(), value.to_vec());
-            Ok(())
-        }
-        fn remove(&self, _path: &Path, name: &std::ffi::OsStr) -> std::io::Result<()> {
-            let name = name.to_string_lossy();
-            self.refuse(&name)?;
-            _ = self.attrs.borrow_mut().remove(&*name);
-            Ok(())
-        }
-        fn warn_casefold(&self, name: &str, path: &Path) {
-            self.warned
-                .borrow_mut()
-                .push(format!("{name} {}", path.display()));
-        }
-    }
-
     /// BackOtter: bcachefs refusing to set `bcachefs.casefold` on a directory
     /// with entries (`ENOTEMPTY`) is a warning, not an error, and the
     /// directory's other attributes are still set and removed; `ENOTEMPTY`
@@ -674,35 +774,6 @@ mod tests {
         assert!(err.starts_with("user.notempty: "), "{err}");
         assert_eq!(calls.names(), ["user.b"]);
         assert!(calls.warned.borrow().is_empty());
-    }
-
-    /// BackOtter: an extended attribute the file system doesn't support
-    /// (`EOPNOTSUPP`) isn't counted as an error under `--strict-exit`, as
-    /// root or not; one that couldn't be set for another reason (`EIO`) is.
-    #[test]
-    fn xattrs_not_set_count_unless_unsupported() {
-        let file = Path::new("/r/f");
-        for (errno, counts) in [(libc::EOPNOTSUPP, false), (libc::EIO, true)] {
-            let mut calls = FakeXattrs::with(&[], &["user.a"]);
-            calls.errno = Some(errno);
-            let errors =
-                set_xattrs_with(&calls, file, &[xattr("user.a", b"1")], false).unwrap_err();
-            let err = LocalDestinationErrorKind::XattrsNotSet(errors);
-            assert_eq!(
-                LocalDestination::error_counts(&err, true),
-                counts,
-                "{errno}"
-            );
-            assert_eq!(
-                LocalDestination::error_counts(&err, false),
-                counts,
-                "{errno}"
-            );
-        }
-        // A change of owner refused counts as root only.
-        let err = LocalDestinationErrorKind::FromErrnoError(Errno::EPERM);
-        assert!(LocalDestination::error_counts(&err, true));
-        assert!(!LocalDestination::error_counts(&err, false));
     }
 
     /// BackOtter: the same for removing `bcachefs.casefold` from a
@@ -734,7 +805,6 @@ mod tests {
     /// `O_NOATIME`, which its owner may ask for), however `relatime` would
     /// move it; a symlink to a file isn't followed.
     #[test]
-    #[cfg(target_os = "linux")]
     fn verify_read_keeps_atime() {
         use std::io::Read;
         let dir = tempfile::tempdir().unwrap();
@@ -759,7 +829,6 @@ mod tests {
     /// (`osattrs::report_labels_kept`); any other refusal (`EPERM`) is the
     /// file's.
     #[test]
-    #[cfg(target_os = "linux")]
     fn selinux_label_refusals_folded() {
         _ = osattrs::report_labels_kept();
         for _ in 0..3 {
@@ -776,44 +845,6 @@ mod tests {
             .to_string();
         assert!(err.starts_with("removing security.selinux: "), "{err}");
         assert!(!osattrs::report_labels_kept());
-    }
-
-    /// BackOtter: stock rustic's names on FreeBSD and NetBSD (`user.NAME`,
-    /// `system.NAME`) are restored under their namespace in a snapshot not
-    /// BackOtter's, and a `user.` one matches the bare name listed; in
-    /// BackOtter's snapshots (and elsewhere) a node's name is the name.
-    #[test]
-    fn xattr_stock_bsd_names() {
-        let own = |name: &str| (Some(name.to_string()), osattrs::xattr_os_name(name));
-        assert_eq!(
-            xattr_restore_names("user.comment", true),
-            (Some("comment".to_string()), "user.comment".to_string())
-        );
-        assert_eq!(
-            xattr_restore_names("system.mac", true),
-            (None, "system.mac".to_string())
-        );
-        assert_eq!(xattr_restore_names("comment", true), own("comment"));
-        assert_eq!(
-            xattr_restore_names("user.comment", false),
-            own("user.comment")
-        );
-        assert_eq!(xattr_restore_names("system.mac", false), own("system.mac"));
-    }
-
-    /// BackOtter: a stock name of the user namespace that the file has with
-    /// the right value is left, one of the system namespace is set (never
-    /// listed, nor removed), with `bsd_stock`.
-    #[test]
-    fn xattr_stock_bsd_names_synced() {
-        let dir = Path::new("/r/f");
-        // On FreeBSD and NetBSD the system lists user.comment as "comment";
-        // here the fake lists its keys, so they are the node's names.
-        let calls = FakeXattrs::with(&[("comment", b"c")], &[]);
-        let attrs = [xattr("user.comment", b"c"), xattr("system.mac", b"m")];
-        // The fake's set takes the name as given: one already right isn't set.
-        set_xattrs_with(&calls, dir, &attrs, true).unwrap();
-        assert_eq!(calls.names(), ["comment", "system.mac"]);
     }
 
     /// BackOtter: a node without an SELinux label leaves the file's alone,
