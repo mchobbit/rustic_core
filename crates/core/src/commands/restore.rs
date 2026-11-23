@@ -630,6 +630,16 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                 return Ok(next_entry(walker));
             }
 
+            // BackOtter: this process's own links' directory (paths past
+            // PATH_MAX), there when $TMPDIR is in the destination, is no
+            // entry of it: not counted, and never removed (--delete removed
+            // it, and the files past PATH_MAX were then written inside
+            // $TMPDIR and lost: ForkAudit1 G7-01).
+            if entry.file_type().is_dir() && walkdir::is_short_path_dir(entry.path()) {
+                walker.skip_current_dir();
+                return Ok(next_entry(walker));
+            }
+
             debug!("additional {}", entry.path().display());
             let is_dir = entry.file_type().is_dir();
             if is_dir {
@@ -2544,7 +2554,11 @@ fn remove_unexpected(
 fn remove_tree(dir: &Path, replaced: &RefCell<Replaced>) -> std::io::Result<()> {
     let (mut removed, mut failed) = (0_u64, 0_u64);
     let mut first = None;
-    for entry in WalkDir::new(dir).follow_links(false).contents_first(true) {
+    // BackOtter: all but this process's own links' directory (paths past
+    // PATH_MAX), there when $TMPDIR is in `dir`: it stays, and so do the
+    // directories above it, each an error (ForkAudit1 G7-01).
+    let entries = WalkDir::new(dir).follow_links(false).contents_first(true).into_iter();
+    for entry in entries.filter_entry(|e| !walkdir::is_short_path_dir(e.path())) {
         let result = match &entry {
             Err(err) => Err(std::io::Error::other(err.to_string())),
             Ok(entry) if entry.file_type().is_dir() => {

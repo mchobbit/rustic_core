@@ -25,6 +25,9 @@
 mod integration {
     mod append_only;
     mod backup;
+    // BackOtter: $TMPDIR in the tree backed up or restored to.
+    #[cfg(target_os = "linux")]
+    mod bko_tmpdir;
     mod check;
     mod chunker;
     mod copy;

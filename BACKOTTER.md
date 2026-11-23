@@ -321,6 +321,22 @@ that either program restores what the other backed up.
   every round, so with one in `$TMPDIR` (on an ostree system, `/home` ->
   `var/home`) .16 to .20 reached half as deep (`ELOOP` at about 20
   links). Symbolic links in the long path's own first prefix count once.
+  Since 0.14.0+backotter.2 a link is checked each time it is used
+  (`readlink`): one that is gone or leads elsewhere is made again, and the
+  links' directory too (new, mode 0700; one that is there must still be a
+  directory of the user's alone, or the path fails, saying so), and a
+  restore's walk of a destination that holds `$TMPDIR` takes the links'
+  directory for no entry of it (`walkdir::is_short_path_dir`, by device and
+  inode): not counted as additional, and never removed. From .16 to
+  0.14.0+backotter.1 `restore --delete` (and `--exact`) with `$TMPDIR` in
+  the destination removed it as an extra entry; `create_dir_all` of the next
+  short path then made the links' directory and the rest of the path again,
+  as real directories in `$TMPDIR`, the files past `PATH_MAX` were written
+  there and removed at exit, and the restore said "restore done." (exit 0)
+  without them (ForkAudit1 G7-01). Where `$TMPDIR` itself is an extra
+  entry, `--delete` removes what is in it but the links' directory and
+  reports `$TMPDIR` as not removed ("Directory not empty", an error); the
+  links go at exit, and the next run removes it.
   Where a link can't be made, a long path fails as before
   (`ENAMETOOLONG`): no usable temporary directory for the links (none, not
   writable, not absolute, or of over 1024 bytes, or of over 500 where the
@@ -367,8 +383,9 @@ that either program restores what the other backed up.
   more) ...") and counts it as incomplete (exit 3 with `--strict-exit`).
   Tested by `test_backup_restore_past_path_max` (a tree of 4.9 KB paths:
   modes, mtimes, an extended attribute, contents and a symlink, restored,
-  restored again, and with `--delete`), `test_backup_past_path_max_ignorefile`
-  and walkdir's `longpath` tests.
+  restored again, and with `--delete`), `test_backup_past_path_max_ignorefile`,
+  `tests/integration/bko_tmpdir.rs` (`$TMPDIR` in the tree, each test in a
+  child process of its own) and walkdir's `longpath` tests.
 - A restore looks the owners up by user and group name, falling back to
   the saved uid and gid, as stock rustic does (`--by-name`, or
   `--ownership-by-name`, restic's name for it, says so explicitly);
