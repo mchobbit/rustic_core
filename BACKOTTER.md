@@ -115,6 +115,13 @@ that either program restores what the other backed up.
     with BackOtter's restic. For this the backup reads every file's
     extended attributes after its other metadata (stock rustic reads them
     first).
+    Read before the values, it has the entry of an attribute whose value
+    the backup then left out (one it couldn't read, or one too large for a
+    repository) as well. A restore sets nothing for an attribute the node
+    has no value for, and `--exact` compares the entries of those it has
+    one for alone (0.14.0+backotter.2; before, a file a restore had taken
+    such an attribute off, or a new one, never matched its node, and
+    every `--exact` run set its metadata again).
   - `illumos.zfs_project`: a file's ZFS project ID and whether it hands it
     down (`zfs project -p 77 -s`), as `{"id":77,"inherit":true}`
     (`"inherit"` left out when false), when it has either; regular files

@@ -9,6 +9,7 @@
 //! instead of written.
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     ffi::OsStr,
     io,
@@ -543,19 +544,31 @@ fn same_mode(now: &Node, node: &Node, origin: SnapshotOrigin) -> bool {
 /// extended attributes, which a node may lack in a snapshot of BackOtter's
 /// too without saying the file had none ([`osattrs::absent_is_unknown`]).
 /// Without `ownership`, nor the owners of illumos' extended attributes
-/// ([`osattrs::same_generic_attribute`]).
+/// ([`osattrs::same_generic_attribute`]). Each is compared as a restore of
+/// its node sets it ([`osattrs::generic_attribute_as_restored`]): illumos'
+/// extended attributes' metadata only for the attributes the node has
+/// values for.
 fn same_generic_attributes(now: &Node, node: &Node, ownership: bool, known_bko: bool) -> bool {
+    /// The generic attribute `name` of `of`, as a restore of it sets it.
+    fn restored<'a>(of: &'a Node, name: &str) -> Option<Cow<'a, serde_json::Value>> {
+        let value = of.meta.generic_attributes.value(name)?;
+        osattrs::generic_attribute_as_restored(name, value, &of.meta.extended_attributes)
+    }
     let (a, b) = (&now.meta.generic_attributes, &node.meta.generic_attributes);
     let skipped = |name: &str| name == UNIX_SPARSE || name == UNIX_BIRTHTIME;
-    b.names()
-        .all(|name| skipped(name) || a.value(name).is_some())
+    let wanted_is_there = |name: &str| {
+        skipped(name) || restored(node, name).is_none() || restored(now, name).is_some()
+    };
+    b.names().all(wanted_is_there)
         && a.names().filter(|name| !skipped(name)).all(|name| {
+            let Some(have) = restored(now, name) else {
+                return true;
+            };
             // BackOtter: nor one a missing attribute says nothing of even
             // then (FreeBSD's system extended attributes).
             let unknown = !known_bko || osattrs::absent_is_unknown(name);
-            b.value(name).map_or(unknown, |want| {
-                a.value(name)
-                    .is_some_and(|now| osattrs::same_generic_attribute(name, now, want, ownership))
+            restored(node, name).map_or(unknown, |want| {
+                osattrs::same_generic_attribute(name, &have, &want, ownership)
             })
         })
         && same_birth_time(now, node, BIRTH_TIME_LOWERED)
@@ -816,7 +829,7 @@ mod tests {
             }})
         };
         let with = |id, mode| {
-            let mut n = node(0o644, &[]);
+            let mut n = node(0o644, &[("note", b"n")]);
             n.meta
                 .generic_attributes
                 .set("illumos.xattr_meta", &meta(id, mode))
@@ -829,6 +842,54 @@ mod tests {
         assert!(same_metadata(&want, &want, how(true, true)));
         // Anything else of an attribute's still counts.
         assert!(!same_metadata(&with(0, 0o644), &want, how(false, true)));
+    }
+
+    /// The review of ForkAudit1 G5-07's fix: `illumos.xattr_meta` is
+    /// compared for the attributes a node has values for, as a restore sets
+    /// it. A node has the metadata of an attribute the backup left out too
+    /// (one it couldn't read, or too large for a repository), which a
+    /// restored file hasn't got: such a file never matched, and every
+    /// `--exact` run set its metadata again.
+    #[test]
+    fn xattr_meta_only_of_the_attributes_a_node_holds() {
+        let meta = |mode: u32| {
+            serde_json::json!({
+                "uid": 0, "gid": 0, "mode": mode,
+                "mtime": "2001-09-09T01:46:40Z", "atime": "2001-09-09T01:46:40Z",
+            })
+        };
+        let with = |xattrs: &[(&str, &[u8])], metas: Option<serde_json::Value>| {
+            let mut n = node(0o644, xattrs);
+            if let Some(metas) = metas {
+                n.meta
+                    .generic_attributes
+                    .set("illumos.xattr_meta", &metas)
+                    .unwrap();
+            }
+            n
+        };
+        let note: &[(&str, &[u8])] = &[("note", b"n")];
+        let both = serde_json::json!({"big": meta(0o600), "note": meta(0o644)});
+        // The node of a file whose attribute big the backup left out.
+        let want = with(note, Some(both.clone()));
+        // Restored: the file has note alone.
+        let restored = with(note, Some(serde_json::json!({"note": meta(0o644)})));
+        assert!(same_metadata(&restored, &want, how(true, true)));
+        // The file it was backed up from, big still there and left out again.
+        assert!(same_metadata(&want, &want, how(true, true)));
+        // What the node has a value for still counts, both ways.
+        let other = with(note, Some(serde_json::json!({"note": meta(0o600)})));
+        assert!(!same_metadata(&other, &want, how(true, true)));
+        assert!(!same_metadata(&with(note, None), &want, how(true, true)));
+        // A file with an attribute the node hasn't got doesn't match by
+        // its attributes; nor does its metadata.
+        let more: &[(&str, &[u8])] = &[("big", b"b"), ("note", b"n")];
+        let file = with(more, Some(both));
+        assert!(!same_metadata(&file, &want, how(true, true)));
+        // Left out, and the node's only one: a file without any matches.
+        let want = with(&[], Some(serde_json::json!({"big": meta(0o600)})));
+        assert!(same_metadata(&with(&[], None), &want, how(true, true)));
+        assert!(same_metadata(&want, &with(&[], None), how(true, true)));
     }
 
     /// D9: where a restore can only lower a birth time (FreeBSD, NetBSD),

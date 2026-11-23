@@ -7,7 +7,7 @@
 
 #![cfg_attr(not(target_os = "illumos"), allow(dead_code))]
 
-use std::{collections::BTreeMap, io};
+use std::{borrow::Cow, collections::BTreeMap, io};
 
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -105,6 +105,28 @@ pub(super) fn same_but_owners(now: &Value, want: &Value) -> bool {
             .is_some_and(|(now, want)| now == want)
 }
 
+/// `metas`, a value of `illumos.xattr_meta`, as a restore of its node sets
+/// it: without the attributes that `held` says the node has no value for,
+/// which the restore leaves as they are (`restore_xattr_meta`). A node has
+/// the metadata of an attribute a backup left out (one it couldn't read, or
+/// too large for a repository) all the same: it is read before the values.
+/// None when nothing is left, as when the node has none; a value that
+/// isn't a JSON object as it is.
+pub(super) fn held_only(metas: &Value, held: impl Fn(&str) -> bool) -> Option<Cow<'_, Value>> {
+    let Value::Object(map) = metas else {
+        return Some(Cow::Borrowed(metas));
+    };
+    if map.keys().all(|name| held(name)) {
+        return (!map.is_empty()).then_some(Cow::Borrowed(metas));
+    }
+    let kept: serde_json::Map<_, _> = map
+        .iter()
+        .filter(|(name, _)| held(name))
+        .map(|(name, meta)| (name.clone(), meta.clone()))
+        .collect();
+    (!kept.is_empty()).then_some(Cow::Owned(Value::Object(kept)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +140,25 @@ mod tests {
             atime: Timestamp::new(1_000_000_000, 0).unwrap(),
             ..XattrMeta::default()
         }
+    }
+
+    /// The review of ForkAudit1 G5-07's fix: the metadata of an attribute
+    /// the node has no value for isn't what a restore sets.
+    #[test]
+    fn held_only_drops_what_a_restore_leaves() {
+        let metas = serde_json::to_value(BTreeMap::from([
+            ("big", meta(1001, 10)),
+            ("note", meta(0, 0)),
+        ]))
+        .unwrap();
+        let note = serde_json::to_value(BTreeMap::from([("note", meta(0, 0))])).unwrap();
+        assert_eq!(held_only(&metas, |_| true).as_deref(), Some(&metas));
+        let held = held_only(&metas, |name| name == "note");
+        assert_eq!(held.as_deref(), Some(&note));
+        assert_eq!(held_only(&metas, |_| false), None);
+        assert_eq!(held_only(&serde_json::json!({}), |_| true), None);
+        let odd = serde_json::json!(["not", "an", "object"]);
+        assert_eq!(held_only(&odd, |_| false).as_deref(), Some(&odd));
     }
 
     /// BackOtter: an attribute its file's owner (group) owned follows the

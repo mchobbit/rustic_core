@@ -30,6 +30,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 use std::{
+    borrow::Cow,
     collections::BTreeSet,
     fs::File,
     io,
@@ -993,6 +994,27 @@ pub(crate) fn same_generic_attribute(
         || (!ownership
             && name == ILLUMOS_XATTR_META
             && illumos_xattrmeta::same_but_owners(now, want))
+}
+
+/// BackOtter: `value`, the generic attribute `name` of a node whose
+/// extended attributes are `xattrs`, as a restore of that node sets it, or
+/// none where it sets nothing for it. That is `value` itself, but for
+/// illumos' extended attributes' metadata, which a restore sets only for
+/// the attributes the node has values for
+/// ([`illumos_xattrmeta::held_only`]): a node has that of one a backup left
+/// out as well, and a file the restore took that attribute off (or a new
+/// one, which never had it) then never matched its node, so that every
+/// `--exact` run set its metadata again (the review of ForkAudit1 G5-07's
+/// fix).
+pub(crate) fn generic_attribute_as_restored<'a>(
+    name: &str,
+    value: &'a serde_json::Value,
+    xattrs: &[ExtendedAttribute],
+) -> Option<Cow<'a, serde_json::Value>> {
+    if name != ILLUMOS_XATTR_META {
+        return Some(Cow::Borrowed(value));
+    }
+    illumos_xattrmeta::held_only(value, |name| xattrs.iter().any(|a| a.name == name))
 }
 
 /// Restores the ACLs. This goes after the mode: `chmod(2)` rewrites an
