@@ -54,22 +54,20 @@ pub(super) fn prepare_dir_for_flags(_path: &Path, _flags: u32) -> io::Result<()>
     Ok(())
 }
 
+/// Sets the flags without following a symlink, whatever the node's type,
+/// as `lchflags(2)` does on the other BSDs: a path replaced by a symlink
+/// since it was made doesn't pass them on to its target.
 pub(super) fn restore_file_flags(
     path: &Path,
-    typ: &NodeType,
+    _typ: &NodeType,
     flags: u32,
     _xattrs: &[ExtendedAttribute],
 ) -> io::Result<()> {
     let p = c_path(path)?;
-    let symlink = matches!(typ, NodeType::Symlink { .. });
     set_flags_best_effort(OPENBSD_FILE_FLAGS, path, "chflags", None, flags & KEPT_FLAGS, |bits| {
         // SAFETY: p is a C string.
         let r = unsafe {
-            if symlink {
-                libc::chflagsat(libc::AT_FDCWD, p.as_ptr(), bits, libc::AT_SYMLINK_NOFOLLOW)
-            } else {
-                libc::chflags(p.as_ptr(), bits)
-            }
+            libc::chflagsat(libc::AT_FDCWD, p.as_ptr(), bits, libc::AT_SYMLINK_NOFOLLOW)
         };
         check(r).map(drop)
     })
