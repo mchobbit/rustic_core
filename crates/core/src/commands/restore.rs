@@ -1440,19 +1440,19 @@ fn restore_metadata(
         finish(&mut late, &mut dirs, &mut tally, &path, &node);
     }
 
-    for (path, node_type, late, xattrs) in late.file_flags {
+    for (path, node_type, late_attrs, xattrs) in late.file_flags {
         // set_metadata made it, so its path is in the destination.
         let Ok(target) = dest.path(&path) else {
             continue;
         };
         // BackOtter: these count as errors as root and not (restic's late
         // flags pass), unless the file system doesn't support them.
-        if let Some(attrs) = late.fat_attrs {
+        if let Some(attrs) = late_attrs.fat_attrs {
             osattrs::restore_fat_attrs(&target, &node_type, attrs)
                 .unwrap_or_else(|err| tally.io(&path, &err, false));
         }
-        if let Some(opts) = &late.xfs_options {
-            osattrs::restore_xfs_options(&target, &node_type, opts)
+        if let Some(xfs) = &late_attrs.xfs_options {
+            osattrs::restore_xfs_options(&target, &node_type, xfs)
                 .unwrap_or_else(|err| tally.io(&path, &err, false));
             // BackOtter: a directory's options, cleared before its entries
             // went in or not, are its node's or those it had now.
@@ -1460,7 +1460,7 @@ fn restore_metadata(
                 dirs.xfs.take(&path);
             }
         }
-        let (flags, dos_flags) = (late.flags, late.dos_flags);
+        let (flags, dos_flags) = (late_attrs.flags, late_attrs.dos_flags);
         if let Some(dos_flags) = dos_flags {
             osattrs::restore_zfs_dos_flags(&target, &node_type, dos_flags)
                 .unwrap_or_else(|err| tally.io(&path, &err, false));
