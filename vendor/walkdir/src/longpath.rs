@@ -19,7 +19,11 @@
 // a block less its NUL, 1023 bytes on 1 KiB blocks and 2047 on 2 KiB ones
 // (symlink(2) ENAMETOOLONG). Which one is decided
 // once per process, by a link made in the new directory before any other
-// (`probe`), so a prefix is always cut at the same place.
+// (`probe`), so a prefix is always cut at the same place. `probe` first
+// makes a link to the directory itself and follows it: where none can be
+// made (vfat and exFAT have no symbolic links, a read-only file system) or
+// one isn't followed (a mount with `nosymfollow`), no path is shortened,
+// and the error says that, naming the directory.
 //
 // Depth: a system call follows at most 40 symbolic links in a path (Linux's
 // MAXSYMLINKS; ELOOP past it), and a short path made in k rounds follows k
@@ -90,10 +94,10 @@ pub fn short_path(path: &Path) -> Cow<'_, Path> {
 /// For a path of `PATH_MAX` bytes or more (Linux and Android), if a link to
 /// shorten it with couldn't be made: no directory for the links in the
 /// temporary directory (none, not writable, not absolute, or over 1024
-/// bytes, or over 500 where links lead to 1000-byte prefixes), a link
-/// refused (`symlink(2)`: no space, a quota, a file system without
-/// symbolic links), or a path that can't be cut (no '/' to cut it at); or,
-/// for a relative one, no current directory.
+/// bytes, or over 500 where links lead to 1000-byte prefixes; or one whose
+/// file system takes no symbolic link, or doesn't follow one: `nosymfollow`),
+/// a link refused (`symlink(2)`: no space, a quota), or a path that can't be
+/// cut (no '/' to cut it at); or, for a relative one, no current directory.
 /// The error says what failed, and where. A directory for the links that
 /// couldn't be made is the process's for good: each later call gives that
 /// error again, without trying again.
@@ -263,7 +267,9 @@ mod imp {
         /// its file system takes. Called with `LINKS` held, so made once.
         fn for_process() -> io::Result<Links> {
             let dir = make_dir()?;
-            let chunk = probe(&dir);
+            let chunk = probe(&dir).inspect_err(|_| {
+                let _ = std::fs::remove_dir_all(&dir);
+            })?;
             // A temporary directory within the bound for its chunk (tmp_max):
             // make_dir takes one within LONG's.
             let tmp = dir.parent().unwrap_or(&dir);
@@ -396,23 +402,38 @@ mod imp {
 
     /// LONG if a link in `dir` (new, and only this process's) takes a
     /// target of LONG bytes and keeps it whole, else SHORT: symlink(2)
-    /// ENAMETOOLONG (XFS, ext2/3/4 and minix on 1 or 2 KiB blocks), or any other
-    /// failure, where SHORT does as well as LONG. The link, `probe` (the
-    /// others are numbers), is removed again.
-    fn probe(dir: &Path) -> usize {
+    /// ENAMETOOLONG (XFS, ext2/3/4 and minix on 1 or 2 KiB blocks), or any
+    /// other failure of that link, where SHORT does as well as LONG. The
+    /// link, `probe` (the others are numbers), is removed again.
+    ///
+    /// First, that `dir` takes links at all: one to `dir` itself is made
+    /// and followed. Without that, a `dir` where symlink(2) fails for
+    /// another reason (EPERM on vfat and exFAT, EROFS) was taken for one
+    /// with short targets, and a temporary directory of 501 to 1024 bytes
+    /// was then refused as "over 500 bytes", which shortening it didn't
+    /// cure; and on a mount with `nosymfollow` the link was made and read
+    /// back, and every short path then failed with ELOOP, with no warning
+    /// and nothing that named the mount (ForkAudit1 G7-08, F7-06).
+    ///
+    /// # Errors
+    ///
+    /// If no link can be made in `dir`, or one made there isn't followed:
+    /// what failed, in which directory.
+    pub(super) fn probe(dir: &Path) -> io::Result<usize> {
         let link = dir.join("probe");
+        std::os::unix::fs::symlink(dir, &link)
+            .map_err(|err| failed(format!("no link made in {}", dir.display()), err))?;
+        let followed = std::fs::metadata(&link);
+        let _ = std::fs::remove_file(&link);
+        let _ = followed.map_err(|err| failed(format!("a link in {} isn't followed", dir.display()), err))?;
         let target = vec![b'p'; LONG];
         let target = Path::new(OsStr::from_bytes(&target));
         if std::os::unix::fs::symlink(target, &link).is_err() {
-            return SHORT;
+            return Ok(SHORT);
         }
         let kept = std::fs::read_link(&link).is_ok_and(|t| t == target);
         let _ = std::fs::remove_file(&link);
-        if kept {
-            LONG
-        } else {
-            SHORT
-        }
+        Ok(if kept { LONG } else { SHORT })
     }
 
     /// Makes a directory for links, a new one only this process can enter
@@ -838,6 +859,30 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{}", err);
         assert!(err.to_string().contains("made for links again"), "{}", err);
         let _ = std::process::Command::new("rm").arg("-rf").arg(&top).status();
+    }
+
+    /// ForkAudit1 G7-08: a directory that takes no link is an error that
+    /// says so and names it (0.14.0+backotter.1 took it for one with short
+    /// targets); one that takes them gives the chunk its file system
+    /// serves, and nothing is left in it.
+    #[test]
+    fn a_directory_without_links_is_an_error() {
+        let top = top("nolinks");
+        let chunk = imp::probe(&top).unwrap();
+        assert_eq!(chunk, if takes_long_targets() { imp::LONG } else { imp::SHORT });
+        assert_eq!(fs::read_dir(&top).unwrap().count(), 0);
+        // Not writable: symlink(2) fails with EACCES (not for root, who
+        // writes anywhere).
+        fs::set_permissions(&top, std::os::unix::fs::PermissionsExt::from_mode(0o500)).unwrap();
+        // SAFETY: geteuid takes nothing and always succeeds.
+        if unsafe { libc::geteuid() } != 0 {
+            let err = imp::probe(&top).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{}", err);
+            let said = err.to_string();
+            assert!(said.starts_with(&format!("no link made in {}: ", top.display())), "{}", said);
+        }
+        fs::set_permissions(&top, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(&top).unwrap();
     }
 
     /// ForkAudit1 G7-01, G7-02: the process's links' directory is known

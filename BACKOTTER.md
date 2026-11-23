@@ -304,7 +304,17 @@ that either program restores what the other backed up.
   directory takes them: a process decides once, before its first link, by
   making a link to a 2048-byte target there (`probe`), and takes 1000-byte
   prefixes where that fails (`ENAMETOOLONG`, or anything else) or doesn't
-  read back whole. Depth limit: a system call follows at most 40 symbolic
+  read back whole. Since 0.14.0+backotter.2 `probe` first makes a link to
+  the links' directory itself and follows it: a `$TMPDIR` whose file system
+  takes no symbolic link (vfat, exFAT: `EPERM`; read-only: `EROFS`) or
+  doesn't follow one (mounted `nosymfollow`: `ELOOP`) shortens no path, and
+  the one warning says so, naming the directory ("no link made in
+  /tmp/.bko-longpath-...: Operation not permitted", "a link in ... isn't
+  followed: Too many levels of symbolic links"). Before, the first was
+  taken for a file system with short link targets, so a `$TMPDIR` of 501
+  to 1024 bytes was refused as "over 500 bytes", and the second chose
+  2048-byte prefixes and failed each long path with `ELOOP`, without the
+  warning (ForkAudit1 G7-08, F7-06). Depth limit: a system call follows at most 40 symbolic
   links in a path (Linux's `MAXSYMLINKS`, `ELOOP` past it), and each link
   leads to the one before, so a path that takes more than 40 links gets a
   short path all the same, which fails with `ELOOP` ("Too many levels of
