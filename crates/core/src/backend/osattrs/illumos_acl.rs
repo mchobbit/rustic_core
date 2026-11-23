@@ -83,10 +83,15 @@ pub(super) const fn is_group(e: &AceEntry) -> bool {
 }
 
 /// Splits a SID, such as `S-1-5-21-1111-2222-3333-1001`, at its last dash
-/// into what idmap calls its prefix and its RID.
+/// into what idmap calls its prefix and its RID. The prefix itself is `S-`
+/// and a digit at least (`S-1`, the revision): `S-1` alone, or `S--1`, is
+/// no SID, and libidmap isn't asked about the prefix `S` or `S-`.
 pub(super) fn split_sid(sid: &str) -> Option<(&str, u32)> {
     let (prefix, rid) = sid.rsplit_once('-')?;
-    if prefix.is_empty() || !sid.starts_with("S-") || !rid.bytes().all(|b| b.is_ascii_digit()) {
+    let revision = prefix.strip_prefix("S-")?;
+    if !revision.starts_with(|c: char| c.is_ascii_digit())
+        || !rid.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
     Some((prefix, rid.parse().ok()?))
@@ -374,7 +379,17 @@ mod tests {
             "S-1-5-21-+5",
             "S-1-5-21-4294967296",
             "X-1-5-1",
+            // ForkAudit1 G5-09: the prefix must be a SID's too, not `S` or
+            // `S-` (these split as ("S", 1) and ("S-", 1)).
+            "S-1",
+            "S--1",
+            "S-x-1",
+            "-S-1-5",
         ] {
+            assert_eq!(split_sid(sid), None, "malformed SID {sid:?} split");
+        }
+        assert_eq!(split_sid("S-1-5"), Some(("S-1", 5)));
+        for sid in [] as [&str; 0] {
             assert_eq!(split_sid(sid), None, "malformed SID {sid:?} split");
         }
     }
