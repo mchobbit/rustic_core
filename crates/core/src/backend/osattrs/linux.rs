@@ -1911,7 +1911,7 @@ mod tests {
     // restic joins them (setLateFlags), where only the first was.
     #[test]
     fn restore_flags_keep_every_error() {
-        use crate::backend::osattrs::restore_error_counts;
+        use crate::backend::osattrs::{NotRoot, restore_error_counts};
 
         // A c+i file restored onto XFS, not as root: FS_IOC_SETFLAGS has no
         // FS_COMPR_FL there (unsupported: warned once, never counted), there
@@ -1929,11 +1929,11 @@ mod tests {
         assert!(text.contains("linux.inode_flags 0x4 not supported"), "{text}");
         assert!(text.contains("FS_IOC_FSSETXATTR f: "), "{text}");
         assert!(!text.contains(BTRFS_COMPRESSION), "{text}");
-        assert!(restore_error_counts(&err, false, false), "{text}");
+        assert!(restore_error_counts(&err, NotRoot::Counted, false), "{text}");
         // The unsupported flag alone doesn't count.
         let err = restore_flags_failing(EXTENTS, COMPR | FS_IMMUTABLE_FL, libc::EOPNOTSUPP, 0, 0)
             .unwrap_err();
-        assert!(!restore_error_counts(&err, false, false), "{err}");
+        assert!(!restore_error_counts(&err, NotRoot::Counted, false), "{err}");
 
         // The property refused for another reason is an error of its own,
         // beside the flags'.
@@ -1942,7 +1942,7 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("set btrfs.compression of f: "), "{text}");
         assert!(text.contains("FS_IOC_FSSETXATTR f: "), "{text}");
-        assert!(restore_error_counts(&err, false, false), "{text}");
+        assert!(restore_error_counts(&err, NotRoot::Counted, false), "{text}");
         // No such property (ENOTSUP, or ENODATA from an SMB mount): nothing.
         for errno in [libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENODATA] {
             restore_flags_failing(EXTENTS, COMPR | NODUMP, 0, errno, 0).unwrap();

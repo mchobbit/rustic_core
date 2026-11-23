@@ -532,11 +532,11 @@ impl LocalDestination {
             #[cfg(not(any(windows, target_os = "openbsd")))]
             LocalDestinationErrorKind::XattrsNotSet(errors) => errors.counts(root),
             LocalDestinationErrorKind::SettingTimeMetadataFailed(err) => {
-                osattrs::restore_error_counts(err, true, root)
+                osattrs::restore_error_counts(err, osattrs::NotRoot::Forgiven, root)
             }
             #[cfg(not(windows))]
             LocalDestinationErrorKind::SettingFilePermissionsFailed(err) => {
-                osattrs::restore_error_counts(err, true, root)
+                osattrs::restore_error_counts(err, osattrs::NotRoot::Forgiven, root)
             }
             _ => true,
         }

@@ -678,7 +678,7 @@ impl<'a> Prepare<'a> {
     /// counts unless the file system doesn't support them.
     fn prepare_failed(&mut self, path: &Path, err: &std::io::Error) {
         warn!("restore {}: {err}", path.display());
-        if osattrs::restore_error_counts(err, false, self.root) {
+        if osattrs::restore_error_counts(err, osattrs::NotRoot::Counted, self.root) {
             self.count();
         }
     }

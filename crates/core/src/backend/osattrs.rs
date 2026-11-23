@@ -1099,21 +1099,37 @@ pub(crate) fn is_root() -> bool {
     }
 }
 
+/// BackOtter: what a step of the restore makes of a permission refused
+/// (`EPERM`, `EACCES`) when the restore doesn't run as root, for
+/// [`restore_error_counts`], as BackOtter's restic does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotRoot {
+    /// Only warned about, not counted: the steps restic's restore not
+    /// running as root forgives it (S2): the owner, the permissions (a
+    /// symlink's too), the times (the birth time too), ACLs and the
+    /// attributes that go with extended attributes.
+    Forgiven,
+    /// Counted, as any other error: file flags, and what goes on with them
+    /// or before entries and contents (ZFS's DOS flags, FAT's attributes,
+    /// XFS's options).
+    Counted,
+}
+
 /// BackOtter: whether `err`, a failure to restore metadata that the restore
 /// warned about, is one BackOtter's restic counts as an error (exit 1): not
 /// metadata the file system doesn't support ([`Unsupported`],
 /// `ErrorKind::Unsupported`), a SID idmap couldn't map ([`SidUnmapped`]),
-/// nor, where `not_root_ok` and not running as root (`root`), a permission
-/// refused (`EPERM`, `EACCES`), which restic's restore not running as root
-/// only warns about (S2). Each of several ([`RestoreErrors`]) is judged
-/// alone.
-pub(crate) fn restore_error_counts(err: &io::Error, not_root_ok: bool, root: bool) -> bool {
+/// nor, in a step that forgives it (`not_root`: [`NotRoot::Forgiven`]) and
+/// not running as root (`root`), a permission refused (`EPERM`, `EACCES`),
+/// which restic's restore not running as root only warns about (S2). Each
+/// of several ([`RestoreErrors`]) is judged alone.
+pub(crate) fn restore_error_counts(err: &io::Error, not_root: NotRoot, root: bool) -> bool {
     let inner = err.get_ref();
     if let Some(errors) = inner.and_then(|e| e.downcast_ref::<RestoreErrors>()) {
         return errors
             .0
             .iter()
-            .any(|err| restore_error_counts(err, not_root_ok, root));
+            .any(|err| restore_error_counts(err, not_root, root));
     }
     if inner.is_some_and(|e| e.is::<Unsupported>() || e.is::<SidUnmapped>()) {
         return false;
@@ -1121,7 +1137,7 @@ pub(crate) fn restore_error_counts(err: &io::Error, not_root_ok: bool, root: boo
     if err.kind() == io::ErrorKind::Unsupported {
         return false;
     }
-    !(not_root_ok && !root && permission_refused(err))
+    !(not_root == NotRoot::Forgiven && !root && permission_refused(err))
 }
 
 /// BackOtter: the extended attributes of a file a backup read
@@ -2116,11 +2132,11 @@ mod tests {
             let err = acl_set_error(wrapped(errno));
             assert_eq!(err.kind(), io::ErrorKind::Unsupported);
             assert_eq!(err.to_string(), text);
-            assert!(!restore_error_counts(&err, true, true));
+            assert!(!restore_error_counts(&err, NotRoot::Forgiven, true));
         }
         let err = acl_set_error(wrapped(libc::EPERM));
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-        assert!(restore_error_counts(&err, true, true));
+        assert!(restore_error_counts(&err, NotRoot::Forgiven, true));
     }
 
     // BackOtter (ForkAudit1 G3-07): FICLONE as <linux/fs.h> gives it where
@@ -2142,21 +2158,21 @@ mod tests {
         let eperm = || io::Error::from_raw_os_error(libc::EPERM);
         let eio = || io::Error::from_raw_os_error(libc::EIO);
         let unsupported = || Unsupported::error("linux.inode_flags", 0x10, eperm());
-        assert!(!restore_error_counts(&unsupported(), false, true));
+        assert!(!restore_error_counts(&unsupported(), NotRoot::Counted, true));
         let kind = io::Error::new(io::ErrorKind::Unsupported, "no ACLs here");
-        assert!(!restore_error_counts(&kind, false, true));
+        assert!(!restore_error_counts(&kind, NotRoot::Counted, true));
         let sid = SidUnmapped::error("illumos.owner_sid", "S-1-5-21-1", eio());
-        assert!(!restore_error_counts(&sid, false, true));
+        assert!(!restore_error_counts(&sid, NotRoot::Counted, true));
         let several = |errors| io::Error::other(RestoreErrors(errors));
         let mixed = several(vec![unsupported(), eio()]);
-        assert!(restore_error_counts(&mixed, false, true));
+        assert!(restore_error_counts(&mixed, NotRoot::Counted, true));
         let all_unsupported = several(vec![unsupported(), unsupported()]);
-        assert!(!restore_error_counts(&all_unsupported, false, true));
-        assert!(!restore_error_counts(&eperm(), true, false));
-        assert!(restore_error_counts(&eperm(), true, true));
-        assert!(restore_error_counts(&eperm(), false, false));
-        assert!(restore_error_counts(&eio(), true, false));
-        assert!(restore_error_counts(&eio(), false, true));
+        assert!(!restore_error_counts(&all_unsupported, NotRoot::Counted, true));
+        assert!(!restore_error_counts(&eperm(), NotRoot::Forgiven, false));
+        assert!(restore_error_counts(&eperm(), NotRoot::Forgiven, true));
+        assert!(restore_error_counts(&eperm(), NotRoot::Counted, false));
+        assert!(restore_error_counts(&eio(), NotRoot::Forgiven, false));
+        assert!(restore_error_counts(&eio(), NotRoot::Counted, true));
     }
 
     /// BackOtter: extended attributes the file system doesn't support

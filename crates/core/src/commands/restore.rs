@@ -24,7 +24,7 @@ use crate::{
         decrypt::DecryptReadBackend,
         local_destination::{self, LocalDestination},
         node::{ExtendedAttribute, Node, NodeType, generic_attributes::XfsOptions},
-        osattrs,
+        osattrs::{self, NotRoot},
     },
     blob::{BlobLocation, BlobLocations},
     error::{ErrorKind, RusticError, RusticResult},
@@ -280,16 +280,16 @@ impl RestoreTally {
 
     /// Warns about `err` restoring the metadata of `path`
     /// (`osattrs::warn_restore`), and counts it if restic would;
-    /// `not_root_ok` for the steps restic's restore not running as root
-    /// doesn't count a permission refused for.
-    fn io(&mut self, path: &Path, err: &std::io::Error, not_root_ok: bool) {
+    /// `not_root` says whether the step is one restic's restore not
+    /// running as root doesn't count a permission refused for.
+    fn io(&mut self, path: &Path, err: &std::io::Error, not_root: NotRoot) {
         osattrs::warn_restore(path, err);
-        self.count(err, not_root_ok);
+        self.count(err, not_root);
     }
 
     /// Counts `err`, warned about already, if restic would.
-    fn count(&mut self, err: &std::io::Error, not_root_ok: bool) {
-        if osattrs::restore_error_counts(err, not_root_ok, self.root) {
+    fn count(&mut self, err: &std::io::Error, not_root: NotRoot) {
+        if osattrs::restore_error_counts(err, not_root, self.root) {
             self.errors += 1;
         }
     }
@@ -858,11 +858,11 @@ fn restore_metadata(
         // flags pass), unless the file system doesn't support them.
         if let Some(attrs) = late_attrs.fat_attrs {
             osattrs::restore_fat_attrs(&target, &node_type, attrs)
-                .unwrap_or_else(|err| tally.io(&path, &err, false));
+                .unwrap_or_else(|err| tally.io(&path, &err, NotRoot::Counted));
         }
         if let Some(xfs) = &late_attrs.xfs_options {
             osattrs::restore_xfs_options(&target, &node_type, xfs)
-                .unwrap_or_else(|err| tally.io(&path, &err, false));
+                .unwrap_or_else(|err| tally.io(&path, &err, NotRoot::Counted));
             // BackOtter: a directory's options, cleared before its entries
             // went in or not, are its node's or those it had now.
             if node_type == NodeType::Dir {
@@ -872,17 +872,18 @@ fn restore_metadata(
         let (flags, dos_flags) = (late_attrs.flags, late_attrs.dos_flags);
         if let Some(dos_flags) = dos_flags {
             osattrs::restore_zfs_dos_flags(&target, &node_type, dos_flags)
-                .unwrap_or_else(|err| tally.io(&path, &err, false));
+                .unwrap_or_else(|err| tally.io(&path, &err, NotRoot::Counted));
         }
         if let Some(flags) = flags {
             osattrs::restore_file_flags(&target, &node_type, flags, &xattrs)
-                .unwrap_or_else(|err| tally.io(&path, &err, false));
+                .unwrap_or_else(|err| tally.io(&path, &err, NotRoot::Counted));
         }
     }
     // BackOtter: the directories cleared whose options the late pass didn't
     // set (the destination, which keeps its own metadata) get back those
     // they had.
-    dirs.xfs.put_back(|path, err| tally.io(path, err, false));
+    dirs.xfs
+        .put_back(|path, err| tally.io(path, err, NotRoot::Counted));
     // BackOtter: how many files had metadata the file system doesn't
     // support, warned about once; the SELinux labels an active SELinux
     // kept (--exact), one error for them all.
@@ -1166,7 +1167,8 @@ fn set_metadata(
             .unwrap_or_else(|err| chown_failed("User/Group", &err, tally)),
     }
     if ownership(opts) != Ownership::None {
-        osattrs::restore_owner(&target, node).unwrap_or_else(|err| tally.io(path, &err, true));
+        osattrs::restore_owner(&target, node)
+            .unwrap_or_else(|err| tally.io(path, &err, NotRoot::Forgiven));
     }
     // BackOtter: the attributes osattrs keeps; ACLs after the mode. One
     // warning naming each attribute not set, and its error.
@@ -1183,7 +1185,7 @@ fn set_metadata(
                 tally.dest(&err);
             });
         osattrs::restore_attributes(&target, node, known_bko, ownership(opts) != Ownership::None)
-            .unwrap_or_else(|err| tally.io(path, &err, true));
+            .unwrap_or_else(|err| tally.io(path, &err, NotRoot::Forgiven));
     };
     // On Haiku before the mode: BFS wants write access to the file for
     // each attribute it writes, which a restore by a user other than root
@@ -1199,14 +1201,14 @@ fn set_metadata(
     if node.is_symlink() {
         osattrs::restore_symlink_mode(&target, node).unwrap_or_else(|err| {
             warn!("restore {}: {err}", path.display());
-            tally.count(&err, true);
+            tally.count(&err, NotRoot::Forgiven);
         });
     }
     if !cfg!(target_os = "haiku") {
         set_attributes(tally);
     }
     osattrs::restore_acls(&target, node, known_bko)
-        .unwrap_or_else(|err| tally.io(path, &err, true));
+        .unwrap_or_else(|err| tally.io(path, &err, NotRoot::Forgiven));
     if contents_failed {
         debug!(
             "restore {}: times not set, its contents were not restored",
@@ -1218,7 +1220,7 @@ fn set_metadata(
     // NetBSD replace the earlier mtime it is set as.
     osattrs::restore_birthtime(&target, node).unwrap_or_else(|err| {
         warn!("restore {}: {err}", path.display());
-        tally.count(&err, true);
+        tally.count(&err, NotRoot::Forgiven);
     });
     dest.set_times(path, &node.meta).unwrap_or_else(|err| {
         warn_metadata_failed(path, "setting file times", &err);
