@@ -1338,6 +1338,8 @@ mod tests {
         let sub = dir.path().join("d");
         std::fs::create_dir(&sub).unwrap();
         assert!(set_xattrs(&sub, &[xattr("../x", b"y")]).is_err());
+        // In sub's attribute directory `..` is sub itself.
+        assert!(!sub.join("x").exists());
         assert!(!dir.path().join("x").exists());
     }
 
