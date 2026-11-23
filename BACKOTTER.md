@@ -84,7 +84,13 @@ that either program restores what the other backed up.
     a file's extended attributes (attribute files, `runat(1)`), by name:
     `{"note":{"uid":1500,"gid":1501,"mode":416,"mtime":"2001-09-09T01:46:40.123456789Z","atime":"2001-09-09T01:46:40Z","acl":[...]}}`,
     the times in the form of the node's, `"acl"` only when the ACL says
-    more than the mode, in `illumos.acl`'s form, SIDs included. Written for
+    more than the mode, in `illumos.acl`'s form, SIDs included. An owner
+    or group that is a SID (an ephemeral uid or gid) has the SID too, in
+    `"owner_sid"` and `"group_sid"` after `"gid"`, left out otherwise,
+    which older readers ignore; a restore gives the attribute the id the
+    SID has there, or nobody and a warning, as for a file's own
+    (0.14.0+backotter.2; before, the number alone was kept, which after a
+    reboot is another SID's or nobody). Written for
     every file with extended attributes (unless `--set-xattrs no`), read
     with `fstatat(2)` and `facl(2)` on the attribute directory before the
     values: reading a value moves the attribute's atime (illumos has no
@@ -656,8 +662,10 @@ that either program restores what the other backed up.
   and keeps it, and a restore asks it for the id the SID has now, and gives
   the file that (a second `lchown(2)`, right after the one with the numbers,
   before the mode: `osattrs::restore_owner`, a no-op elsewhere) and the ACL
-  entry that. A SID idmap can't map gets nobody (60001), never the number
-  the backup saw, which may be another SID's by now, with a warning once
+  entry that. An extended attribute's own owner and group are kept and
+  restored the same way (`illumos.xattr_meta`). A SID idmap can't map gets
+  nobody (60001), never the number the backup saw, which may be another
+  SID's by now, with a warning once
   per attribute (owner and group of the same file each get theirs) and
   the number of files at the end; it isn't an error. A
   backup where idmap gives no SID warns once (`idmap offline: SID owners

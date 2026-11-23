@@ -934,9 +934,15 @@ fn read_xattr_meta(dir: &File, path: &Path, name: &str, sids: &mut SidNamer) -> 
         return None;
     }
     let time = |sec, nsec| Timestamp::new(sec, i32::try_from(nsec).ok()?).ok();
+    // An owner or group that is a SID, as the file's own
+    // ([`SidNamer::owner`]).
+    let mut sid = |id: u32, group| (id > illumos_acl::MAX_UID).then(|| sids.sid(id, group)).flatten();
+    let (owner_sid, group_sid) = (sid(st.st_uid, false), sid(st.st_gid, true));
     let mut meta = XattrMeta {
         uid: st.st_uid,
         gid: st.st_gid,
+        owner_sid,
+        group_sid,
         mode: st.st_mode & 0o7777,
         mtime: time(st.st_mtime, st.st_mtime_nsec)?,
         atime: time(st.st_atime, st.st_atime_nsec)?,
@@ -964,7 +970,9 @@ fn read_xattr_meta(dir: &File, path: &Path, name: &str, sids: &mut SidNamer) -> 
 /// Its owner and group only with `owners`, as the file's own: not under
 /// `--no-ownership`, and one that was its file's owner's or group's follows
 /// the file to the owner or group the restore gave it, by name or as a
-/// SID's id here ([`restored_owner`]).
+/// SID's id here ([`restored_owner`]). One that is a SID itself gets the id
+/// the SID has here, or nobody (60001) and a [`SidUnmapped`] error when
+/// idmap can't map it, as the file's own ([`restore_owner`]).
 fn restore_xattr_meta(path: &Path, node: &Node, owners: bool) -> io::Result<()> {
     let Some(metas) = node
         .meta
@@ -989,7 +997,18 @@ fn restore_xattr_meta(path: &Path, node: &Node, owners: bool) -> io::Result<()> 
         if !node.meta.extended_attributes.iter().any(|a| a.name == *name) {
             continue;
         }
-        let owner = file_now.map(|now| restored_owner(meta, (node.meta.uid, node.meta.gid), now));
+        let owner = file_now.map(|now| {
+            let (mut uid, mut gid) = restored_owner(meta, (node.meta.uid, node.meta.gid), now);
+            // An owner or group that is a SID: the id it has here, not the
+            // backup's number ([`map_sid`]).
+            if let Some(sid) = &meta.owner_sid {
+                uid = map_sid(ILLUMOS_XATTR_META, sid, false, &mut unmapped);
+            }
+            if let Some(sid) = &meta.group_sid {
+                gid = map_sid(ILLUMOS_XATTR_META, sid, true, &mut unmapped);
+            }
+            (uid, gid)
+        });
         if let Err(err) = restore_one_xattr_meta(&dir, path, name, meta, owner, &mut unmapped) {
             _ = failed.get_or_insert(err);
         }
@@ -1211,7 +1230,7 @@ mod tests {
             mode: 0o640,
             mtime: t,
             atime: t,
-            acl: Vec::new(),
+            ..XattrMeta::default()
         };
         // At backup the file and "mine" were 1001:1001's, "other" 1002's.
         let mut node = file_node(0o644, 1001, 1001);
@@ -1245,6 +1264,68 @@ mod tests {
         restore_xattr_meta(&file, &node, true).unwrap();
         assert_eq!(attr_owner(&file, "mine"), (1001, 1001));
         assert_eq!(attr_owner(&file, "other"), (1002, 1001));
+    }
+
+    /// ForkAudit1 G5-03: an attribute file owned by a SID (an ephemeral id)
+    /// is kept with the SID, and restored to the id the SID has here, not
+    /// the backup's number; one idmap can't map goes to nobody, with a
+    /// `SidUnmapped` error. As root, with idmap online.
+    #[test]
+    fn xattr_meta_sid_owners() {
+        let (owner, group) = ("S-1-5-21-1111-2222-3333-1017", "S-1-5-21-1111-2222-3333-518");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"").unwrap();
+        let attrs = [xattr("stream", b"s")];
+        let ids = illumos_idmap::id_of_sid(owner, false)
+            .and_then(|uid| Ok((uid, illumos_idmap::id_of_sid(group, true)?)));
+        let (Ok((uid, gid)), true, Ok(())) = (ids, is_root(), set_xattrs(&file, &attrs)) else {
+            eprintln!("not root, idmap offline, or no extended attributes");
+            return;
+        };
+        assert!(uid > illumos_acl::MAX_UID && gid > illumos_acl::MAX_UID);
+        let adir = attr_dir(&file).unwrap().unwrap();
+        let chown = |uid, gid| {
+            // SAFETY: the name is a C string.
+            _ = check(unsafe { libc::fchownat(adir.as_raw_fd(), c"stream".as_ptr(), uid, gid, 0) })
+                .unwrap();
+        };
+        chown(uid, gid);
+
+        // The backup keeps both SIDs beside the numbers.
+        let mut node = file_node(0o644, 0, 0);
+        node.meta.extended_attributes = attrs.to_vec();
+        fill_xattr_meta(&file, &mut node);
+        let mut metas = node
+            .meta
+            .generic_attributes
+            .get::<BTreeMap<String, XattrMeta>>(ILLUMOS_XATTR_META)
+            .unwrap()
+            .unwrap();
+        let meta = metas.get_mut("stream").unwrap();
+        assert_eq!((meta.uid, meta.gid), (uid, gid));
+        assert_eq!(meta.owner_sid.as_deref(), Some(owner));
+        assert_eq!(meta.group_sid.as_deref(), Some(group));
+
+        // After a reboot the numbers are someone else's: the SIDs decide.
+        (meta.uid, meta.gid) = (uid + 1000, gid + 1000);
+        node.meta.generic_attributes.set(ILLUMOS_XATTR_META, &metas).unwrap();
+        chown(0, 0);
+        restore_xattr_meta(&file, &node, true).unwrap();
+        assert_eq!(attr_owner(&file, "stream"), (uid, gid));
+
+        // Without ownership, nothing.
+        chown(0, 0);
+        restore_xattr_meta(&file, &node, false).unwrap();
+        assert_eq!(attr_owner(&file, "stream"), (0, 0));
+
+        // A SID idmap can't map: nobody, never the number, and a warning.
+        metas.get_mut("stream").unwrap().owner_sid = Some("S-1-5-21-x".to_string());
+        node.meta.generic_attributes.set(ILLUMOS_XATTR_META, &metas).unwrap();
+        let err = restore_xattr_meta(&file, &node, true).unwrap_err();
+        let unmapped = err.get_ref().and_then(|e| e.downcast_ref::<SidUnmapped>());
+        assert!(unmapped.is_some(), "{err}");
+        assert_eq!(attr_owner(&file, "stream"), (NOBODY, gid));
     }
 
     /// A named user's entry, as `chmod A+user:nobody:read_data:allow`.
@@ -1357,12 +1438,10 @@ mod tests {
         set_ace(AclOf::File(&attr_file, &at), &acl).unwrap();
         let t = Timestamp::new(1_000_000_000, 0).unwrap();
         let meta = XattrMeta {
-            uid: 0,
-            gid: 0,
             mode: 0o600,
             mtime: t,
             atime: t,
-            acl: Vec::new(),
+            ..XattrMeta::default()
         };
         let mut node = file_node(0o644, 0, 0);
         node.meta.extended_attributes = attrs.to_vec();

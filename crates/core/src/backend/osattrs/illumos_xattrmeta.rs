@@ -47,10 +47,20 @@ pub(super) fn attr_name_refused(name: &str) -> Option<io::Error> {
 /// The metadata of one attribute file. The times are in UTC, in the form of
 /// a node's mtime; the ACL is there only when it says more than the mode
 /// ([`is_trivial`](super::illumos_acl::is_trivial)), as `illumos.acl`.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+///
+/// An owner or group that is a SID (an ephemeral id, above
+/// [`MAX_UID`](super::illumos_acl::MAX_UID)) has the SID too, as a file's
+/// own has in `illumos.owner_sid` and `illumos.group_sid`: the number means
+/// nothing after a reboot. Readers that don't know the two fields ignore
+/// them, and get the numbers.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct XattrMeta {
     pub uid: u32,
     pub gid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_sid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_sid: Option<String>,
     /// The permission bits, `st_mode & 07777`.
     pub mode: u32,
     pub mtime: Timestamp,
@@ -85,6 +95,7 @@ pub(super) fn same_but_owners(now: &Value, want: &Value) -> bool {
         let mut metas = BTreeMap::<String, XattrMeta>::deserialize(v).ok()?;
         for meta in metas.values_mut() {
             (meta.uid, meta.gid) = (0, 0);
+            (meta.owner_sid, meta.group_sid) = (None, None);
         }
         Some(metas)
     };
@@ -105,7 +116,7 @@ mod tests {
             mode: 0o600,
             mtime: Timestamp::new(1_000_000_000, 0).unwrap(),
             atime: Timestamp::new(1_000_000_000, 0).unwrap(),
-            acl: Vec::new(),
+            ..XattrMeta::default()
         }
     }
 
@@ -146,6 +157,12 @@ mod tests {
         assert!(!same_but_owners(&value(&[("a", mode), ("b", meta(0, 0))]), &want));
         assert!(!same_but_owners(&value(&[("a", meta(0, 0))]), &want));
         assert!(!same_but_owners(&value(&[("a", meta(0, 0)), ("c", meta(0, 0))]), &want));
+        // An owner that is a SID is an owner (ForkAudit1 G5-03).
+        let mut sid = meta(2_147_483_650, 10);
+        sid.owner_sid = Some("S-1-5-21-1111-2222-3333-1001".to_string());
+        let want_sid = value(&[("a", sid), ("b", meta(1002, 11))]);
+        assert!(same_but_owners(&want, &want_sid));
+        assert!(same_but_owners(&want_sid, &want));
         // What isn't an `illumos.xattr_meta` is the same only as itself.
         assert!(same_but_owners(&Value::from(1), &Value::from(1)));
         assert!(!same_but_owners(&Value::from(1), &Value::from(2)));
@@ -190,6 +207,8 @@ mod tests {
                 XattrMeta {
                     uid: 1500,
                     gid: 1501,
+                    owner_sid: None,
+                    group_sid: None,
                     mode: 0o640,
                     mtime: t(1_000_000_000, 123_456_789),
                     atime: t(1_000_000_000, 0),
@@ -217,7 +236,7 @@ mod tests {
                     mode: 0o600,
                     mtime: t(1_000_000_000, 5),
                     atime: t(1_000_000_000, 5),
-                    acl: Vec::new(),
+                    ..XattrMeta::default()
                 },
             ),
             (
@@ -228,7 +247,7 @@ mod tests {
                     mode: 0o4755,
                     mtime: t(1_900_000_000, 0),
                     atime: t(1, 0),
-                    acl: Vec::new(),
+                    ..XattrMeta::default()
                 },
             ),
         ]);
@@ -255,5 +274,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(meta.mtime, t(1_000_000_000, 500_000_000));
+        assert_eq!((&meta.owner_sid, &meta.group_sid), (&None, &None));
+    }
+
+    /// ForkAudit1 G5-03: an attribute file's owner and group that are SIDs
+    /// are kept as SIDs too, after the numbers, and a reader that doesn't
+    /// know the fields (rustic-bko before them, BackOtter's restic) reads
+    /// the rest.
+    #[test]
+    fn xattr_meta_sid_owners_json() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldXattrMeta {
+            uid: u32,
+            gid: u32,
+            mode: u32,
+            mtime: Timestamp,
+            atime: Timestamp,
+            #[serde(default)]
+            acl: Vec<AceEntry>,
+        }
+
+        let t = Timestamp::new(1_000_000_000, 0).unwrap();
+        let meta = XattrMeta {
+            uid: 2_147_483_650,
+            gid: 2_147_483_651,
+            owner_sid: Some("S-1-5-21-1111-2222-3333-1001".to_string()),
+            group_sid: Some("S-1-5-21-1111-2222-3333-513".to_string()),
+            mode: 0o600,
+            mtime: t,
+            atime: t,
+            acl: Vec::new(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"uid":2147483650,"gid":2147483651,"#,
+                r#""owner_sid":"S-1-5-21-1111-2222-3333-1001","group_sid":"S-1-5-21-1111-2222-3333-513","#,
+                r#""mode":384,"mtime":"2001-09-09T01:46:40Z","atime":"2001-09-09T01:46:40Z"}"#
+            )
+        );
+        assert_eq!(serde_json::from_str::<XattrMeta>(&json).unwrap(), meta);
+        let old: OldXattrMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!((old.uid, old.gid, old.mode), (2_147_483_650, 2_147_483_651, 0o600));
+        // One alone.
+        let group = XattrMeta {
+            owner_sid: None,
+            uid: 1500,
+            ..meta
+        };
+        let json = serde_json::to_string(&group).unwrap();
+        assert!(json.starts_with(r#"{"uid":1500,"gid":2147483651,"group_sid":"S-1-5-"#), "{json}");
+        assert_eq!(serde_json::from_str::<XattrMeta>(&json).unwrap(), group);
     }
 }
