@@ -42,6 +42,9 @@ fn st_flags(m: &Metadata) -> u32 {
 }
 
 /// Gives the file open as `f` the flags `flags`.
+// fchflags(2) takes the flags as a c_ulong but on OpenBSD, a u32: the
+// conversion is one on the other three.
+#[cfg_attr(target_os = "openbsd", allow(clippy::useless_conversion))]
 fn set_fd_flags(f: &File, path: &Path, flags: u32) -> io::Result<()> {
     // SAFETY: f is open for the call's duration.
     check(unsafe { libc::fchflags(f.as_raw_fd(), flags.into()) })

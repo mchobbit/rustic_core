@@ -1,9 +1,13 @@
 //! FreeBSD: file flags (`st_flags`), ZFS project IDs, and the ACLs and
 //! system extended attributes it shares with NetBSD (`freebsd_netbsd.rs`).
 
+#![allow(
+    clippy::unnecessary_wraps,
+    reason = "the os:: interface: every system's module has the same signatures"
+)]
+
 use std::{
     collections::BTreeMap,
-    ffi::CStr,
     fs::{File, OpenOptions},
     io,
     os::{
@@ -58,7 +62,7 @@ pub(super) fn open_for_attrs(path: &Path, typ: &NodeType, m: &std::fs::Metadata)
 /// inheritance (`ZFS_PROJINHERIT_FL`) is changed; the others are given back
 /// as read.
 #[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ZfsXattr {
     xflags: u32,
     extsize: u32,
@@ -226,9 +230,15 @@ fn fs_type(path: &Path) -> io::Result<String> {
     let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: p is a C string, fs a statfs.
     _ = check(unsafe { libc::statfs(p.as_ptr(), &raw mut fs) })?;
-    // SAFETY: the kernel ends f_fstypename with a NUL.
-    let name = unsafe { CStr::from_ptr(fs.f_fstypename.as_ptr()) };
-    Ok(name.to_string_lossy().into_owned())
+    // The name within the array, up to its NUL; all of it, should the
+    // kernel have left none.
+    let name: Vec<u8> = fs
+        .f_fstypename
+        .iter()
+        .map(|c| u8::from_ne_bytes(c.to_ne_bytes()))
+        .take_while(|&c| c != 0)
+        .collect();
+    Ok(String::from_utf8_lossy(&name).into_owned())
 }
 
 pub(super) fn fill_attributes(path: &Path, node: &mut Node, f: Option<&File>) -> io::Result<()> {

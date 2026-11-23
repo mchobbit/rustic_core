@@ -60,6 +60,7 @@ const fn is_zero(v: &u16) -> bool {
 
 /// What FreeBSD's and NetBSD's ACLs and system extended attributes differ
 /// in: the names they are kept under, and the numbers of `<sys/unistd.h>`.
+#[derive(Debug)]
 pub(super) struct Os {
     /// The generic attribute of a POSIX.1e access ACL.
     pub acl_access: &'static str,

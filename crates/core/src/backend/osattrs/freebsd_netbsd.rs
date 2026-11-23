@@ -45,8 +45,20 @@ struct RawAcl {
     entries: [RawAclEntry; MAX_ENTRIES],
 }
 
+/// The count and the entries in use, not all 254.
+impl std::fmt::Debug for RawAcl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let used = usize::try_from(self.cnt).unwrap_or(usize::MAX);
+        f.debug_struct("RawAcl")
+            .field("maxcnt", &self.maxcnt)
+            .field("cnt", &self.cnt)
+            .field("entries", &self.entries.iter().take(used).collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
+}
+
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 struct RawAclEntry {
     tag: u32,
     id: u32,
@@ -90,9 +102,13 @@ mod sys {
     }
 }
 
+/// [`MAX_ENTRIES`] as `acl_maxcnt` and `acl_cnt` hold it.
+const MAX_CNT: u32 = 254;
+const _: () = assert!(MAX_CNT as usize == MAX_ENTRIES);
+
 fn new_raw_acl() -> Box<RawAcl> {
     Box::new(RawAcl {
-        maxcnt: u32::try_from(MAX_ENTRIES).unwrap(),
+        maxcnt: MAX_CNT,
         cnt: 0,
         spare: [0; 4],
         entries: [RawAclEntry::default(); MAX_ENTRIES],
@@ -145,7 +161,7 @@ fn set_acl(path: &Path, typ: AclType, acl: &[AclEntry]) -> io::Result<()> {
     }
     let p = c_path(path)?;
     let mut raw = new_raw_acl();
-    raw.cnt = u32::try_from(acl.len()).unwrap();
+    raw.cnt = u32::try_from(acl.len()).expect("at most MAX_ENTRIES, checked above");
     for (r, e) in raw.entries.iter_mut().zip(acl) {
         *r = RawAclEntry {
             tag: e.tag,
@@ -325,7 +341,7 @@ fn delete_system_extattr(path: &Path, name: &[u8]) -> io::Result<()> {
 /// The system extended attributes, by name, as BackOtter's restic keeps them
 /// (a Go `map[string][]byte`: base64 values).
 #[serde_as]
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 #[serde(transparent)]
 struct SystemExtattrs(#[serde_as(as = "BTreeMap<_, DefaultOnNull<Base64>>")] BTreeMap<String, Vec<u8>>);
 

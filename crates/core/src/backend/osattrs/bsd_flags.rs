@@ -91,6 +91,13 @@ pub(super) const NETBSD_KEPT_FLAGS: u32 =
 #[cfg_attr(not(target_os = "dragonfly"), allow(dead_code))]
 pub(super) const DRAGONFLY_KEPT_FLAGS: u32 = 0xffff_ffff;
 
+/// The flags kept on OpenBSD, from its `<sys/stat.h>`: all those an owner
+/// may set (`UF_SETTABLE`: nodump, immutable, append, opaque) and those only
+/// root may (`SF_SETTABLE`: archived, immutable, append; the last two can't
+/// be cleared again above securelevel 0). None is the kernel's.
+#[cfg_attr(not(target_os = "openbsd"), allow(dead_code))]
+pub(super) const OPENBSD_KEPT_FLAGS: u32 = 0x0000_ffff | 0xffff_0000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,9 +166,10 @@ mod tests {
     }
 
     #[test]
-    fn dragonfly_keeps_every_flag() {
+    fn dragonfly_and_openbsd_keep_every_flag() {
         for bit in (0..32).map(|i| 1_u32 << i) {
             assert_eq!(bit & DRAGONFLY_KEPT_FLAGS, bit, "{bit:#x} not kept");
+            assert_eq!(bit & OPENBSD_KEPT_FLAGS, bit, "{bit:#x} not kept");
         }
     }
 }

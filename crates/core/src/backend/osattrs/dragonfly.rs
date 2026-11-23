@@ -1,6 +1,11 @@
 //! DragonFly: file flags (`st_flags`) and symlinks' own permissions. Its
 //! file systems (HAMMER2, UFS) have no extended attributes and no ACLs.
 
+#![allow(
+    clippy::unnecessary_wraps,
+    reason = "the os:: interface: every system's module has the same signatures"
+)]
+
 use std::{io, os::dragonfly::fs::MetadataExt, path::Path};
 
 use jiff::Timestamp;

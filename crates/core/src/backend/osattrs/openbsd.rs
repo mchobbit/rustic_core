@@ -1,11 +1,17 @@
 //! OpenBSD: file flags (`st_flags`) and symlinks' own permissions.
 
+#![allow(
+    clippy::unnecessary_wraps,
+    reason = "the os:: interface: every system's module has the same signatures"
+)]
+
 use std::{io, os::openbsd::fs::MetadataExt, path::Path};
 
 use jiff::Timestamp;
 
 use super::{
-    XattrErrors, bsd_held::restore_no_flags, c_path, check, chmod_symlink, set_flags_best_effort,
+    XattrErrors, bsd_flags::OPENBSD_KEPT_FLAGS as KEPT_FLAGS, bsd_held::restore_no_flags, c_path,
+    check, chmod_symlink, set_flags_best_effort,
 };
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType, generic_attributes::OPENBSD_FILE_FLAGS,
@@ -16,11 +22,6 @@ pub(super) const FLAGS_BEFORE_DATA: u32 = 0;
 pub(super) const FLAGS_BEFORE_ENTRIES: u32 = 0;
 pub(super) const FLAGS_XATTRS: &[&str] = &[];
 pub(super) const ZFS_DOS_FLAGS: Option<&str> = None;
-
-/// From `<sys/stat.h>`: the flags an owner may set (nodump, immutable,
-/// append, opaque) and those only root may (archived, immutable, append; the
-/// last two can't be cleared again above securelevel 0).
-const KEPT_FLAGS: u32 = 0x0000_ffff | 0xffff_0000;
 
 /// No file is opened for its attributes ahead of them here.
 pub(super) fn open_for_attrs(

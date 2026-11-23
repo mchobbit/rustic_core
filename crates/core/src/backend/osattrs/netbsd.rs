@@ -2,6 +2,11 @@
 //! and system extended attributes it shares with FreeBSD
 //! (`freebsd_netbsd.rs`), which FFSv2ea has (`newfs -O 2ea`) and FFSv2 not.
 
+#![allow(
+    clippy::unnecessary_wraps,
+    reason = "the os:: interface: every system's module has the same signatures"
+)]
+
 use std::{io, os::netbsd::fs::MetadataExt, path::Path};
 
 use jiff::Timestamp;
