@@ -326,23 +326,36 @@ pub(super) fn open_to_verify(filename: &Path, size: u64) -> Option<File> {
     (m.is_file() && m.len() == size).then_some(f)
 }
 
-/// BackOtter: opens the file `filename` in the destination for reading its
-/// contents, following no symlink, and on Linux with `O_NOATIME` where the
-/// restore may set it, so that reading leaves its atime alone
-/// ([`open_to_verify`]; a blob a restore takes from a file there).
+/// BackOtter: opens the regular file `filename` in the destination for
+/// reading its contents ([`open_to_verify`]; a blob a restore takes from a
+/// file there), by BackOtter's rule for such opens (S11, as
+/// `commands::restore::exact`'s `open_regular`): following no symlink
+/// (`O_NOFOLLOW`), not waiting for the writer of a FIFO that has taken the
+/// file's place since the restore looked (`O_NONBLOCK`, which does nothing
+/// to the reads of a regular file), taking no terminal (`O_NOCTTY`), and
+/// checking with `fstat` that it is a regular file. On Linux with
+/// `O_NOATIME` where the restore may set it, so that reading leaves its
+/// atime alone. 0.14.0+backotter.1 opened with `O_NOFOLLOW` alone, and a
+/// restore waited on such a FIFO for good (ForkAudit1 G7-05).
 ///
 /// # Errors
 ///
-/// * If it couldn't be opened.
+/// * If it couldn't be opened, or isn't a regular file.
 pub(super) fn open_reading(filename: &Path) -> std::io::Result<File> {
     let mut how = OpenOptions::new();
     _ = how.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        _ = how.custom_flags(libc::O_NOFOLLOW);
+        _ = how.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY);
     }
     let f = how.open(filename)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
     #[cfg(target_os = "linux")]
     {
         use nix::fcntl::{FcntlArg, OFlag, fcntl};
@@ -821,6 +834,46 @@ mod tests {
         symlink(&file, dir.path().join("l")).unwrap();
         assert!(open_to_verify(&dir.path().join("l"), 8).is_none());
         assert!(open_to_verify(&file, 9).is_none());
+    }
+
+    /// BackOtter (ForkAudit1 G7-05): a FIFO where the restore looks for a
+    /// file's contents (it took the file's place since the plan) is an
+    /// error at once, "not a regular file", and no match to verify;
+    /// 0.14.0+backotter.1 waited for a writer to open it.
+    #[test]
+    fn reading_a_fifo_fails_at_once() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("p");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let dest = LocalDestination::new(dir.path().to_str().unwrap(), false, false).unwrap();
+        // In a thread, so that a wait fails the test instead of hanging it.
+        let (tx, rx) = mpsc::channel();
+        let (d, f) = (dest.clone(), fifo.clone());
+        let reader = std::thread::spawn(move || {
+            let read = d
+                .read_at("p", 0, 4)
+                .map(|_| ())
+                .map_err(|err| err.to_string());
+            let verified = open_to_verify(&f, 0).is_some();
+            tx.send((read, verified)).unwrap();
+        });
+        let Ok((read, verified)) = rx.recv_timeout(Duration::from_secs(20)) else {
+            // Lets the reader go: its open waits for a writer.
+            for _ in 0..2 {
+                drop(OpenOptions::new().write(true).open(&fifo));
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            panic!("reading a FIFO waited for a writer");
+        };
+        reader.join().unwrap();
+        let err = read.unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+        assert!(!verified);
+        // The match by size is by lstat first: none either.
+        assert!(dest.get_matching_file("p", 0).is_none());
     }
 
     /// BackOtter: under `--exact`, an SELinux label an active SELinux refuses
