@@ -206,6 +206,11 @@ impl LocalSource {
 
         if needs_entry_filter {
             _ = walk_builder.filter_entry(move |entry| {
+                // BackOtter: never this process's own links' directory.
+                if is_own_links_dir(entry) {
+                    return false;
+                }
+
                 // exclude-if-present: skip directories containing a marker file
                 if !exclude_if_present.is_empty()
                     && let Some(tpe) = entry.file_type()
@@ -237,6 +242,11 @@ impl LocalSource {
 
                 true
             });
+        }
+        // BackOtter: without that filter (the builder keeps one), one that
+        // leaves out this process's own links' directory alone.
+        if !needs_entry_filter {
+            _ = walk_builder.filter_entry(|entry| !is_own_links_dir(entry));
         }
 
         let builder = walk_builder;
@@ -597,6 +607,24 @@ fn unread_ignore_files<'a>(dir: &Path, names: &'a [String]) -> Vec<&'a str> {
         _ = (dir, names);
         Vec::new()
     }
+}
+
+/// BackOtter: whether `entry` is the directory this process keeps its
+/// links to paths of `PATH_MAX` bytes or more in
+/// (`walkdir::is_short_path_dir`: `.bko-longpath-PID-N` in `$TMPDIR`), which
+/// a walk of a source that holds `$TMPDIR` finds there once it has passed
+/// such a path. It is the backup's own, and no part of the source: left
+/// out with all in it, without a warning, and not counted as incomplete.
+/// rustic-bko 0.12.0+backotter.1 saved it and its links, under a name that
+/// holds the process id, so that two backups of an unchanged tree differed
+/// (ForkAudit1 G7-02).
+fn is_own_links_dir(entry: &ignore::DirEntry) -> bool {
+    let own = entry.file_type().is_some_and(|tpe| tpe.is_dir())
+        && walkdir::is_short_path_dir(entry.path());
+    if own {
+        log::debug!("{} left out: this backup's own links", entry.path().display());
+    }
+    own
 }
 
 /// BackOtter: whether `err`, for an entry at `depth` of the walk, is one

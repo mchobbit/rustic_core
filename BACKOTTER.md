@@ -336,7 +336,17 @@ that either program restores what the other backed up.
   without them (ForkAudit1 G7-01). Where `$TMPDIR` itself is an extra
   entry, `--delete` removes what is in it but the links' directory and
   reports `$TMPDIR` as not removed ("Directory not empty", an error); the
-  links go at exit, and the next run removes it.
+  links go at exit, and the next run removes it. A backup of a source that
+  holds `$TMPDIR` leaves the links' directory out the same way
+  (`LocalSourceWalker`'s entry filter: a debug line, no warning, not
+  counted as incomplete): it is the backup's own, not the source's. From
+  .16 to 0.14.0+backotter.1 it was saved with its links
+  (`tmp/.bko-longpath-PID-N/0`, ...) whenever a path past `PATH_MAX` sorted
+  before `$TMPDIR`, under a name that holds the process id, so that two
+  backups of an unchanged tree differed, and a restore made the stale
+  directory again (ForkAudit1 G7-02). Making and removing the links'
+  directory still moves `$TMPDIR`'s own mtime and ctime, which a backup
+  saves where it reads `$TMPDIR`'s metadata after its first long path.
   Where a link can't be made, a long path fails as before
   (`ENAMETOOLONG`): no usable temporary directory for the links (none, not
   writable, not absolute, or of over 1024 bytes, or of over 500 where the

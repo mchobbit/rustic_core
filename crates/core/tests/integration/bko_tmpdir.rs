@@ -47,9 +47,9 @@ fn in_child(name: &str, tmp: &str) -> Result<Option<PathBuf>> {
     let base_path = fs::canonicalize(base.path())?;
     let tmp = base_path.join(tmp);
     fs::create_dir_all(&tmp)?;
-    let test = format!("integration::bko_tmpdir::{name}");
+    let child_test = format!("integration::bko_tmpdir::{name}");
     let out = std::process::Command::new(std::env::current_exe()?)
-        .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+        .args(["--exact", &child_test, "--nocapture", "--test-threads=1"])
         .env(BASE, &base_path)
         .env("TMPDIR", &tmp)
         .current_dir(&base_path)
@@ -66,7 +66,9 @@ fn in_child(name: &str, tmp: &str) -> Result<Option<PathBuf>> {
 
 /// 120 directory names of 40 bytes: one in the other, a path of 4.9 KB.
 fn deep_names() -> Vec<String> {
-    (0..120).map(|i| format!("d{i:03}{}", "x".repeat(36))).collect()
+    (0..120)
+        .map(|i| format!("d{i:03}{}", "x".repeat(36)))
+        .collect()
 }
 
 /// Makes, in the new directory `source`: `aaa/` + `names`, one in the other
@@ -78,10 +80,19 @@ fn make_source(source: &Path, names: &[String]) -> Result<()> {
     fs::write(source.join("tmp/keep"), "keep")?;
     for (i, name) in names.iter().enumerate() {
         let fds = open_chain(&source.join("aaa"), &names[..i])?;
-        mkdirat(fds.last().unwrap(), name.as_str(), Mode::from_bits_truncate(0o755))?;
+        mkdirat(
+            fds.last().unwrap(),
+            name.as_str(),
+            Mode::from_bits_truncate(0o755),
+        )?;
     }
     let fds = open_chain(&source.join("aaa"), names)?;
-    let mut leaf = file_at(fds.last().unwrap(), "leaf", OFlag::O_WRONLY | OFlag::O_CREAT, 0o644)?;
+    let mut leaf = file_at(
+        fds.last().unwrap(),
+        "leaf",
+        OFlag::O_WRONLY | OFlag::O_CREAT,
+        0o644,
+    )?;
     leaf.write_all(&[b'l'; 4900])?;
     Ok(())
 }
@@ -170,18 +181,27 @@ fn test_restore_delete_with_tmpdir_in_destination(set_up_repo: Result<RepoOpen>)
 
     // To the destination, new but for $TMPDIR: the links are made in it.
     let top = dst.join("test/aaa");
-    assert_eq!(restore_to(&repo, &dst, RestoreOptions::default())?, (0, 0, 0));
+    assert_eq!(
+        restore_to(&repo, &dst, RestoreOptions::default())?,
+        (0, 0, 0)
+    );
     assert_eq!(leaf_of(&top, &names)?, want);
     let in_tmp = names_in(&tmp)?;
     assert_eq!(in_tmp.len(), 2, "{in_tmp:?}");
-    assert!(in_tmp[0].starts_with(".bko-longpath-") && in_tmp[1] == "keep", "{in_tmp:?}");
+    assert!(
+        in_tmp[0].starts_with(".bko-longpath-") && in_tmp[1] == "keep",
+        "{in_tmp:?}"
+    );
     let links = tmp.join(&in_tmp[0]);
     assert!(walkdir::is_short_path_dir(&links));
 
     // The file at the bottom gone: --delete, then --exact, restore it, find
     // nothing additional, and leave $TMPDIR as it is.
     let delete = RestoreOptions::default().delete(true);
-    let exact = RestoreOptions::default().exact(true).delete(true).numeric_id(true);
+    let exact = RestoreOptions::default()
+        .exact(true)
+        .delete(true)
+        .numeric_id(true);
     for opts in [delete, exact, RestoreOptions::default()] {
         unlink_leaf(&top, &names)?;
         assert_eq!(restore_to(&repo, &dst, opts)?, (0, 0, 0));
@@ -202,8 +222,80 @@ fn test_restore_delete_with_tmpdir_in_destination(set_up_repo: Result<RepoOpen>)
     let repo = repo.to_indexed()?;
     unlink_leaf(&top, &names)?;
     let (errors, dirs, files) = restore_to(&repo, &dst, delete)?;
-    assert_eq!(leaf_of(&top, &names)?, want, "the file past PATH_MAX, $TMPDIR extra");
+    assert_eq!(
+        leaf_of(&top, &names)?,
+        want,
+        "the file past PATH_MAX, $TMPDIR extra"
+    );
     assert_eq!((errors, dirs, files), (1, 1, 0));
     assert_eq!(names_in(&tmp)?, in_tmp[..1]);
+    Ok(())
+}
+
+/// BackOtter (ForkAudit1 G7-02): a backup of a source that holds `$TMPDIR`
+/// (given by a relative path, where the links' directory's own is
+/// canonical), with a path past `PATH_MAX` that sorts before it, leaves the
+/// process's own links' directory out, with or without another entry
+/// filter (`--exclude-if-present`), and counts nothing as incomplete.
+/// rustic-bko 0.12.0+backotter.1 saved `tmp/.bko-longpath-PID-N` and its
+/// links, under a name that differs from run to run.
+#[rstest]
+fn test_backup_with_tmpdir_in_source(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    use rustic_core::LocalSourceFilterOptions;
+
+    let name = "test_backup_with_tmpdir_in_source";
+    let Some(base) = in_child(name, "src/tmp")? else {
+        return Ok(());
+    };
+    let names = deep_names();
+    let deep: PathBuf = names.iter().collect();
+    assert_eq!(std::env::current_dir()?, base);
+    assert_eq!(std::env::temp_dir(), base.join("src/tmp"));
+    let source = Path::new("src");
+    make_source(source, &names)?;
+
+    let mut repo = set_up_repo?.to_indexed_ids()?;
+    let present =
+        LocalSourceFilterOptions::default().exclude_if_present(vec!["no-such".to_string()]);
+    for filter in [LocalSourceFilterOptions::default(), present] {
+        let opts = BackupOptions::default()
+            .as_path(PathBuf::from_str("test")?)
+            .ignore_filter_opts(filter);
+        let paths = PathList::from_iter(Some(source.to_path_buf()));
+        let snap = repo.backup(&opts, &paths, SnapshotFile::default())?;
+        assert_eq!(snap.summary.as_ref().map(|s| s.items_incomplete), Some(0));
+        // The links' directory is there, beside keep, for the walk to find.
+        let in_tmp = names_in(&source.join("tmp"))?;
+        assert_eq!(in_tmp.len(), 2, "{in_tmp:?}");
+        assert!(
+            in_tmp[0].starts_with(".bko-longpath-") && in_tmp[1] == "keep",
+            "{in_tmp:?}"
+        );
+
+        let indexed = repo.to_indexed()?;
+        let node = indexed.node_from_snapshot_path("latest", |_| true)?;
+        let listed: Vec<PathBuf> = indexed
+            .ls(&node, &LsOptions::default())?
+            .map(|item| item.map(|(p, _)| p))
+            .collect::<Result<_, _>>()?;
+        let test = PathBuf::from("test");
+        assert!(
+            listed.contains(&test.join("aaa").join(&deep).join("leaf")),
+            "{} entries",
+            listed.len()
+        );
+        assert!(listed.contains(&test.join("tmp/keep")));
+        let own: Vec<_> = listed
+            .iter()
+            .filter(|p| p.to_string_lossy().contains(".bko-longpath-"))
+            .collect();
+        assert!(own.is_empty(), "the backup's own links saved: {own:?}");
+        assert_eq!(
+            listed.iter().filter(|p| p.starts_with("test/tmp")).count(),
+            2,
+            "tmp and keep"
+        );
+        repo = indexed.to_indexed_ids()?;
+    }
     Ok(())
 }
