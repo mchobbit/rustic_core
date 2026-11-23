@@ -182,13 +182,19 @@ fn path_conf(path: &Path, name: i32) -> io::Result<libc::c_long> {
     check(unsafe { sys::lpathconf(p.as_ptr(), name) })
 }
 
-/// Errors that mean the file system or the user can't have this kind of
-/// metadata, rather than that reading it failed.
+/// Errors listing the system extended attributes that mean the file system
+/// or the user can't have them, rather than that reading them failed: only
+/// root may list that namespace (`EPERM`, `EACCES`).
 fn unsupported(err: &io::Error) -> bool {
-    matches!(
-        err.raw_os_error(),
-        Some(libc::EOPNOTSUPP | libc::EINVAL | libc::EPERM | libc::EACCES)
-    )
+    no_acls(err) || matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES))
+}
+
+/// Errors reading an ACL that mean the file system has none of that type,
+/// rather than that reading it failed. A refusal (`EACCES` where an NFSv4
+/// ACL denies the user `read_acl`, `EPERM`) is not among them: such an ACL
+/// is there, and a backup that can't read it says so.
+fn no_acls(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL))
 }
 
 /// Calls an `extattr_*_link(2)` function with a buffer of `size`, or no
@@ -332,7 +338,7 @@ fn fill_acls(path: &Path, node: &mut Node) -> io::Result<()> {
     let attrs = &mut node.meta.generic_attributes;
     let mut keep = |typ| match get_acl(path, typ) {
         Ok(acl) => freebsd_acl::keep_acl(sys::OS, attrs, typ, &acl).map_err(io::Error::other),
-        Err(err) if unsupported(&err) => {
+        Err(err) if no_acls(&err) => {
             debug!("no ACL for {}: {err}", path.display());
             Ok(())
         }
@@ -423,6 +429,20 @@ pub(super) fn restore_acls(path: &Path, node: &Node) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An ACL the user may not read is not "no ACL" (G4-05): only the
+    /// listing of the system namespace takes a refusal for that.
+    #[test]
+    fn a_refused_acl_read_is_an_error() {
+        let err = io::Error::from_raw_os_error;
+        for code in [libc::EOPNOTSUPP, libc::EINVAL] {
+            assert!(no_acls(&err(code)) && unsupported(&err(code)), "{code}");
+        }
+        for code in [libc::EACCES, libc::EPERM] {
+            assert!(!no_acls(&err(code)) && unsupported(&err(code)), "{code}");
+        }
+        assert!(!no_acls(&err(libc::EIO)) && !unsupported(&err(libc::EIO)));
+    }
 
     #[test]
     fn raw_acl_is_struct_acl() {

@@ -45,7 +45,13 @@ that either program restores what the other backed up.
     `chflags(1)` sets there, is kept.
   - `freebsd.acl_access`, `freebsd.acl_default`: POSIX.1e ACLs (UFS mounted
     `acls`), access and directories' default.
-  - `freebsd.acl_nfs4`: NFSv4 ACLs (ZFS, UFS mounted `nfsv4acls`).
+  - `freebsd.acl_nfs4`: NFSv4 ACLs (ZFS, UFS mounted `nfsv4acls`). An ACL
+    the backup may not read (`EACCES`, `EPERM`: an NFSv4 ACL that denies
+    the user `read_acl`) is warned about ("ignoring attributes of ...") and
+    counted in `items_incomplete`, as an extended attribute that can't be
+    read is; only a file system without ACLs (`EOPNOTSUPP`, `EINVAL`) is
+    passed over quietly (until 0.14.0+backotter.1 a refusal was too, and
+    the node said the file had no ACL).
   - `freebsd.system_extattrs`: extended attributes in the system namespace,
     except those UFS stores ACLs in.
   - `illumos.acl`: ZFS's ACLs on illumos (NFSv4-style ACEs). An entry for
