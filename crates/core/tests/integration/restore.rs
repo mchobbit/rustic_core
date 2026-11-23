@@ -103,7 +103,9 @@ fn restore_to(
     opts: RestoreOptions,
 ) -> Result<()> {
     let snap = repo.get_snapshot_from_str("latest", |_| true)?;
-    restore_with(repo, dir, opts.origin(SnapshotOrigin::of(&snap)), |node| node)
+    restore_with(repo, dir, opts.origin(SnapshotOrigin::of(&snap)), |node| {
+        node
+    })
 }
 
 /// BackOtter: restores what the repository's latest snapshot holds into
@@ -123,7 +125,9 @@ fn restore_with(
         true,
         !node.is_dir(),
     )?;
-    let ls = repo.ls(&node, &ls_opts)?.map(move |item| item.map(|(p, n)| (p, change(n))));
+    let ls = repo
+        .ls(&node, &ls_opts)?
+        .map(move |item| item.map(|(p, n)| (p, change(n))));
     let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false)?;
     _ = repo.restore(plan, &opts, ls, &dest)?;
     Ok(())
@@ -212,7 +216,10 @@ fn test_restore_sparse(set_up_repo: Result<RepoOpen>) -> Result<()> {
     write_full(&source.path().join("trailing"), &[&data, &zeros])?;
     fs::create_dir(source.path().join("linked"))?;
     write_sparse(&source.path().join("linked/a"))?;
-    fs::hard_link(source.path().join("linked/a"), source.path().join("linked/b"))?;
+    fs::hard_link(
+        source.path().join("linked/a"),
+        source.path().join("linked/b"),
+    )?;
     if allocated(&source.path().join("sparse"))? || !allocated(&source.path().join("full"))? {
         // A file system without holes, or one that compresses.
         return Ok(());
@@ -230,7 +237,10 @@ fn test_restore_sparse(set_up_repo: Result<RepoOpen>) -> Result<()> {
     let mut contents = std::collections::BTreeMap::new();
     for item in repo.ls(&node, &ls_opts)? {
         let (path, node) = item?;
-        sparse_marks.push((path.clone(), node.meta.generic_attributes.is_true("unix.sparse")));
+        sparse_marks.push((
+            path.clone(),
+            node.meta.generic_attributes.is_true("unix.sparse"),
+        ));
         _ = contents.insert(path, node.content);
     }
     // The file read by its data extents has the blobs of the same bytes read
@@ -260,13 +270,18 @@ fn test_restore_sparse(set_up_repo: Result<RepoOpen>) -> Result<()> {
             _ => sparse_data.clone(),
         }
     };
-    let names = ["sparse", "full", "zeros", "trailing", "linked/a", "linked/b"];
+    let names = [
+        "sparse", "full", "zeros", "trailing", "linked/a", "linked/b",
+    ];
     // Allocation is only certain where the restore can allocate (Linux).
     // Those in neither list have holes and data.
     let check = |dir: &Path, sparse: &[&str], dense: &[&str]| -> Result<()> {
         for name in names {
             let path = dir.join("test").join(name);
-            assert!(fs::read(&path)? == expected(name), "{name}: contents differ");
+            assert!(
+                fs::read(&path)? == expected(name),
+                "{name}: contents differ"
+            );
             if sparse.contains(&name) {
                 assert!(!allocated(&path)?, "{name}: allocated");
             } else if cfg!(target_os = "linux") && dense.contains(&name) {
@@ -357,20 +372,34 @@ fn test_restore_sparse(set_up_repo: Result<RepoOpen>) -> Result<()> {
     let dry_run_modify = |opts: RestoreOptions| -> Result<u64> {
         let node = repo.node_from_snapshot_path("latest", |_| true)?;
         let dest = LocalDestination::new(
-            restore_dir.path().to_str().expect("restore path is valid utf-8"),
+            restore_dir
+                .path()
+                .to_str()
+                .expect("restore path is valid utf-8"),
             true,
             false,
         )?;
         let ls = repo.ls(&node, &LsOptions::default())?;
-        Ok(repo.prepare_restore(&opts, ls, &dest, true)?.stats.files.modify)
+        Ok(repo
+            .prepare_restore(&opts, ls, &dest, true)?
+            .stats
+            .files
+            .modify)
     };
     let snap = repo.get_snapshot_from_str("latest", |_| true)?;
     let bko = RestoreOptions::default().origin(SnapshotOrigin::of(&snap));
     // Holes are filled on Linux only, where the restore allocates.
     let fills = u64::from(cfg!(any(target_os = "linux", target_os = "android")) && allocates);
     assert_eq!(dry_run_modify(bko)?, fills, "BackOtter's snapshot");
-    assert_eq!(dry_run_modify(RestoreOptions::default())?, 0, "stock snapshot");
-    assert!(!allocated(&test.join("zeros"))?, "zeros: allocated by --dry-run");
+    assert_eq!(
+        dry_run_modify(RestoreOptions::default())?,
+        0,
+        "stock snapshot"
+    );
+    assert!(
+        !allocated(&test.join("zeros"))?,
+        "zeros: allocated by --dry-run"
+    );
 
     // The same file of holes, left as it is, from a snapshot not
     // BackOtter's (stock rustic's, which marks no file): it keeps its holes,
@@ -379,8 +408,16 @@ fn test_restore_sparse(set_up_repo: Result<RepoOpen>) -> Result<()> {
     let test = restore_dir.path().join("test");
     fs::create_dir(&test)?;
     File::create(test.join("zeros"))?.set_len(u64::try_from(zeros.len())?)?;
-    restore_with(&repo, restore_dir.path(), RestoreOptions::default(), |node| node)?;
-    assert!(fs::read(test.join("zeros"))? == zeros, "zeros: contents differ");
+    restore_with(
+        &repo,
+        restore_dir.path(),
+        RestoreOptions::default(),
+        |node| node,
+    )?;
+    assert!(
+        fs::read(test.join("zeros"))? == zeros,
+        "zeros: contents differ"
+    );
     assert!(!allocated(&test.join("zeros"))?, "zeros: allocated");
 
     // Over a symlink where the snapshot has a directory: the symlink is
@@ -395,7 +432,10 @@ fn test_restore_sparse(set_up_repo: Result<RepoOpen>) -> Result<()> {
     std::os::unix::fs::symlink("real", restore_dir.path().join("test"))?;
     restore_to(&repo, restore_dir.path(), RestoreOptions::default())?;
     assert!(fs::symlink_metadata(restore_dir.path().join("test"))?.is_dir());
-    assert!(fs::read(real.join("sparse"))? == other, "written through the symlink");
+    assert!(
+        fs::read(real.join("sparse"))? == other,
+        "written through the symlink"
+    );
     assert_eq!(fs::read_dir(&real)?.count(), 1);
     check(
         restore_dir.path(),
@@ -419,12 +459,15 @@ fn test_restore_missing_mode(set_up_repo: Result<RepoOpen>) -> Result<()> {
 
     use rustic_core::{CommandInput, PathList};
 
-    let mode = |path: &Path| -> Result<u32> { Ok(fs::metadata(path)?.permissions().mode() & 0o7777) };
+    let mode =
+        |path: &Path| -> Result<u32> { Ok(fs::metadata(path)?.permissions().mode() & 0o7777) };
 
     // stdin, in a snapshot of BackOtter's.
     let repo = set_up_repo?.to_indexed_ids()?;
     let cmd: CommandInput = "echo test".parse()?;
-    let opts = BackupOptions::default().stdin_filename("dump.sql").stdin_command(cmd);
+    let opts = BackupOptions::default()
+        .stdin_filename("dump.sql")
+        .stdin_command(cmd);
     let snap = repo.backup(&opts, &PathList::from_string("-")?, SnapshotFile::default())?;
     assert_eq!(SnapshotOrigin::of(&snap), SnapshotOrigin::BackOtter);
     let repo = repo.to_indexed()?;
@@ -432,7 +475,12 @@ fn test_restore_missing_mode(set_up_repo: Result<RepoOpen>) -> Result<()> {
     restore_to(&repo, restore_dir.path(), RestoreOptions::default())?;
     let dump = restore_dir.path().join("dump.sql");
     assert_eq!(fs::read(&dump)?, b"test\n");
-    assert_ne!(mode(&dump)? & 0o600, 0, "stdin dump restored as {:o}", mode(&dump)?);
+    assert_ne!(
+        mode(&dump)? & 0o600,
+        0,
+        "stdin dump restored as {:o}",
+        mode(&dump)?
+    );
 
     // A file of a Unix file system, its mode left out as restic leaves 0
     // out: 0000 from restic's snapshot, the creation mode from stock
@@ -459,9 +507,19 @@ fn test_restore_missing_mode(set_up_repo: Result<RepoOpen>) -> Result<()> {
     assert_eq!(fs::read(&shadow)?, b"secret");
 
     let restore_dir = tempdir()?;
-    restore_with(&repo, restore_dir.path(), RestoreOptions::default(), no_mode)?;
+    restore_with(
+        &repo,
+        restore_dir.path(),
+        RestoreOptions::default(),
+        no_mode,
+    )?;
     let shadow = restore_dir.path().join("test/shadow");
-    assert_ne!(mode(&shadow)? & 0o600, 0, "restored as {:o}", mode(&shadow)?);
+    assert_ne!(
+        mode(&shadow)? & 0o600,
+        0,
+        "restored as {:o}",
+        mode(&shadow)?
+    );
     Ok(())
 }
 
@@ -519,7 +577,11 @@ fn test_restore_counts_what_delete_left(set_up_repo: Result<RepoOpen>) -> Result
 /// XFS, as `xfs_io`'s stat shows them.
 #[cfg(target_os = "linux")]
 fn xfs_xflags(path: &Path) -> u64 {
-    let out = std::process::Command::new("xfs_io").args(["-r", "-c", "stat"]).arg(path).output().unwrap();
+    let out = std::process::Command::new("xfs_io")
+        .args(["-r", "-c", "stat"])
+        .arg(path)
+        .output()
+        .unwrap();
     let out = String::from_utf8_lossy(&out.stdout);
     let x = out
         .lines()
@@ -567,11 +629,18 @@ fn loop_xfs() -> Result<Option<LoopFs>> {
         eprintln!("skipped: no mkfs.xfs");
         return Ok(None);
     }
-    if !ok(Command::new("mount").args(["-o", "loop"]).arg(&img).arg(&mnt)) {
+    if !ok(Command::new("mount")
+        .args(["-o", "loop"])
+        .arg(&img)
+        .arg(&mnt))
+    {
         eprintln!("skipped: mount failed");
         return Ok(None);
     }
-    Ok(Some(LoopFs { _scratch: scratch, mnt }))
+    Ok(Some(LoopFs {
+        _scratch: scratch,
+        mnt,
+    }))
 }
 
 /// BackOtter: a snapshot ("test") of dir, holding in and sub/f, and plain,
@@ -601,7 +670,10 @@ fn xfs_snapshot(
 fn with_xfs_options(mut node: rustic_core::repofile::Node) -> rustic_core::repofile::Node {
     if node.is_dir() && &*node.name() == std::ffi::OsStr::new("dir") {
         let opts = std::collections::BTreeMap::from([("extsize", 2_u32 << 20), ("xflags", 0x5100)]);
-        node.meta.generic_attributes.set("linux.xfs_options", &opts).unwrap();
+        node.meta
+            .generic_attributes
+            .set("linux.xfs_options", &opts)
+            .unwrap();
     }
     node
 }
@@ -618,12 +690,20 @@ fn with_xfs_options(mut node: rustic_core::repofile::Node) -> rustic_core::repof
 fn test_restore_xfs_options(set_up_repo: Result<RepoOpen>) -> Result<()> {
     use std::process::Command;
 
-    let Some(xfs) = loop_xfs()? else { return Ok(()) };
+    let Some(xfs) = loop_xfs()? else {
+        return Ok(());
+    };
     let repo = xfs_snapshot(set_up_repo)?;
     let dst = xfs.mnt.join("dst");
     restore_with(&repo, &dst, RestoreOptions::default(), with_xfs_options)?;
     let t = dst.join("test");
-    for (name, want) in [("dir", 0x5100), ("dir/in", 0), ("dir/sub", 0), ("dir/sub/f", 0), ("plain", 0)] {
+    for (name, want) in [
+        ("dir", 0x5100),
+        ("dir/in", 0),
+        ("dir/sub", 0),
+        ("dir/sub/f", 0),
+        ("plain", 0),
+    ] {
         assert_eq!(xfs_xflags(&t.join(name)), want, "{name}");
     }
 
@@ -631,13 +711,24 @@ fn test_restore_xfs_options(set_up_repo: Result<RepoOpen>) -> Result<()> {
     // inheritance on a directory whose node has no XFS options.
     for name in ["dir/in", "dir/sub", "plain/sub"] {
         let p = t.join(name);
-        if p.is_dir() { fs::remove_dir_all(p)? } else { fs::remove_file(p)? }
+        if p.is_dir() {
+            fs::remove_dir_all(p)?;
+        } else {
+            fs::remove_file(p)?;
+        }
     }
-    assert!(ok(Command::new("xfs_io").args(["-c", "chattr +t"]).arg(t.join("plain"))));
+    assert!(ok(Command::new("xfs_io")
+        .args(["-c", "chattr +t"])
+        .arg(t.join("plain"))));
     restore_with(&repo, &dst, RestoreOptions::default(), with_xfs_options)?;
-    for (name, want) in
-        [("dir", 0x5100), ("dir/in", 0), ("dir/sub", 0), ("dir/sub/f", 0), ("plain", 0x100), ("plain/sub", 0)]
-    {
+    for (name, want) in [
+        ("dir", 0x5100),
+        ("dir/in", 0),
+        ("dir/sub", 0),
+        ("dir/sub/f", 0),
+        ("plain", 0x100),
+        ("plain/sub", 0),
+    ] {
         assert_eq!(xfs_xflags(&t.join(name)), want, "again: {name}");
     }
     Ok(())
@@ -657,12 +748,16 @@ fn test_restore_xfs_options_stopped(set_up_repo: Result<RepoOpen>) -> Result<()>
 
     use rustic_core::{ErrorKind, RusticError};
 
-    let Some(xfs) = loop_xfs()? else { return Ok(()) };
+    let Some(xfs) = loop_xfs()? else {
+        return Ok(());
+    };
     let repo = xfs_snapshot(set_up_repo)?;
     let dst = xfs.mnt.join("dst");
     restore_with(&repo, &dst, RestoreOptions::default(), with_xfs_options)?;
     let t = dst.join("test");
-    assert!(ok(Command::new("xfs_io").args(["-c", "chattr +t"]).arg(t.join("plain"))));
+    assert!(ok(Command::new("xfs_io")
+        .args(["-c", "chattr +t"])
+        .arg(t.join("plain"))));
     let check = |when: &str| {
         for (name, want) in [("dir", 0x5100), ("plain", 0x100)] {
             assert_eq!(xfs_xflags(&t.join(name)), want, "{when}: {name}");
@@ -670,8 +765,14 @@ fn test_restore_xfs_options_stopped(set_up_repo: Result<RepoOpen>) -> Result<()>
     };
 
     let node = repo.node_from_snapshot_path("latest", |_| true)?;
-    let dest = LocalDestination::new(dst.to_str().expect("restore path is valid utf-8"), true, false)?;
-    let ls = repo.ls(&node, &LsOptions::default())?.map(|item| item.map(|(p, n)| (p, with_xfs_options(n))));
+    let dest = LocalDestination::new(
+        dst.to_str().expect("restore path is valid utf-8"),
+        true,
+        false,
+    )?;
+    let ls = repo
+        .ls(&node, &LsOptions::default())?
+        .map(|item| item.map(|(p, n)| (p, with_xfs_options(n))));
     let opts = RestoreOptions::default();
 
     // Planned, and not restored. A directory loses its options only once
@@ -685,11 +786,19 @@ fn test_restore_xfs_options_stopped(set_up_repo: Result<RepoOpen>) -> Result<()>
     // Restored with a node stream that fails after its first two nodes.
     fs::remove_dir(t.join("plain/sub"))?;
     let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false)?;
-    assert_eq!(xfs_xflags(&t.join("plain")), 0, "planned again: plain's cleared");
-    let failing = ls
-        .take(2)
-        .chain(std::iter::once(Err(RusticError::new(ErrorKind::Internal, "stopped by the test"))));
-    assert!(repo.restore(plan, &opts, failing, &dest).is_err(), "the failing restore succeeded");
+    assert_eq!(
+        xfs_xflags(&t.join("plain")),
+        0,
+        "planned again: plain's cleared"
+    );
+    let failing = ls.take(2).chain(std::iter::once(Err(RusticError::new(
+        ErrorKind::Internal,
+        "stopped by the test",
+    ))));
+    assert!(
+        repo.restore(plan, &opts, failing, &dest).is_err(),
+        "the failing restore succeeded"
+    );
     check("restore failed");
 
     restore_with(&repo, &dst, opts, with_xfs_options)?;
@@ -707,12 +816,16 @@ fn test_restore_xfs_options_stopped(set_up_repo: Result<RepoOpen>) -> Result<()>
 fn test_restore_xfs_options_destination(set_up_repo: Result<RepoOpen>) -> Result<()> {
     use std::process::Command;
 
-    let Some(xfs) = loop_xfs()? else { return Ok(()) };
+    let Some(xfs) = loop_xfs()? else {
+        return Ok(());
+    };
     let repo = xfs_snapshot(set_up_repo)?;
     let dst = xfs.mnt.join("dst");
     fs::create_dir(&dst)?;
     fs::write(dst.join("keep"), "keep")?;
-    assert!(ok(Command::new("xfs_io").args(["-c", "extsize 2m", "-c", "chattr +tS"]).arg(&dst)));
+    assert!(ok(Command::new("xfs_io")
+        .args(["-c", "extsize 2m", "-c", "chattr +tS"])
+        .arg(&dst)));
     assert_eq!(xfs_xflags(&dst), 0x5100, "the destination before");
     restore_with(&repo, &dst, RestoreOptions::default(), with_xfs_options)?;
     for (name, want) in [
@@ -743,12 +856,20 @@ fn test_restore_xfs_options_destination(set_up_repo: Result<RepoOpen>) -> Result
 fn test_restore_clone_from_holding_the_destination(set_up_repo: Result<RepoOpen>) -> Result<()> {
     use rustic_core::PathList;
 
-    let (live, snap, same) = (&b"live @ content"[..], &b"snapshot 12345"[..], &b"same contents."[..]);
+    let (live, snap, same) = (
+        &b"live @ content"[..],
+        &b"snapshot 12345"[..],
+        &b"same contents."[..],
+    );
     let (only_live, only_snap) = (&b"live only 1234"[..], &b"in snapshot 99"[..]);
     let source = tempdir()?;
     let (s, ss) = (source.path(), source.path().join(".snapshots/1/snapshot"));
     fs::create_dir_all(&ss)?;
-    for (name, at, in_snap) in [("diff", live, snap), ("same", same, same), ("moved", only_live, only_snap)] {
+    for (name, at, in_snap) in [
+        ("diff", live, snap),
+        ("same", same, same),
+        ("moved", only_live, only_snap),
+    ] {
         fs::write(s.join(name), at)?;
         fs::write(ss.join(name), in_snap)?;
     }
@@ -756,7 +877,11 @@ fn test_restore_clone_from_holding_the_destination(set_up_repo: Result<RepoOpen>
     fs::write(s.join("other"), only_snap)?;
     let repo = set_up_repo?.to_indexed_ids()?;
     let opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
-    let _snapshot = repo.backup(&opts, &PathList::from_iter(Some(s.to_path_buf())), SnapshotFile::default())?;
+    let _snapshot = repo.backup(
+        &opts,
+        &PathList::from_iter(Some(s.to_path_buf())),
+        SnapshotFile::default(),
+    )?;
     let repo = repo.to_indexed()?;
 
     // @ restored, and the snapshot seeded from it.
@@ -783,18 +908,34 @@ fn test_restore_clone_from_holding_the_destination(set_up_repo: Result<RepoOpen>
         Ok(found.expect("the file is in the snapshot"))
     };
     let sources = repo.clone_sources(&from, &at, Some(&dst))?;
-    assert_eq!(sources.get(&content("diff")?), None, "the destination's own seed is offered");
-    assert_eq!(sources.get(&content("moved")?), Some(at.join("other").as_path()));
+    assert_eq!(
+        sources.get(&content("diff")?),
+        None,
+        "the destination's own seed is offered"
+    );
+    assert_eq!(
+        sources.get(&content("moved")?),
+        Some(at.join("other").as_path())
+    );
 
-    let dest = LocalDestination::new(dst.to_str().expect("restore path is valid utf-8"), true, false)?
-        .with_clone_sources(sources);
+    let dest = LocalDestination::new(
+        dst.to_str().expect("restore path is valid utf-8"),
+        true,
+        false,
+    )?
+    .with_clone_sources(sources);
     let opts = RestoreOptions::default().exact(true);
     let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false)?;
     _ = repo.restore(plan, &opts, ls, &dest)?;
     for (name, want) in [("diff", snap), ("same", same), ("moved", only_snap)] {
         assert_eq!(fs::read(dst.join(name))?, want, "{name}");
     }
-    for (name, want) in [("diff", live), ("same", same), ("moved", only_live), ("other", only_snap)] {
+    for (name, want) in [
+        ("diff", live),
+        ("same", same),
+        ("moved", only_live),
+        ("other", only_snap),
+    ] {
         assert_eq!(fs::read(at.join(name))?, want, "@'s {name}");
     }
     Ok(())
@@ -847,7 +988,10 @@ fn inodes(dir: &Path) -> Result<std::collections::BTreeMap<PathBuf, (u64, i64, i
         if !m.is_file() {
             continue;
         }
-        _ = seen.insert(entry.path().to_path_buf(), (m.ino(), m.ctime(), m.ctime_nsec()));
+        _ = seen.insert(
+            entry.path().to_path_buf(),
+            (m.ino(), m.ctime(), m.ctime_nsec()),
+        );
     }
     Ok(seen)
 }
@@ -881,7 +1025,10 @@ fn test_restore_exact_twice_changes_nothing(set_up_repo: Result<RepoOpen>) -> Re
     let exact = exact.origin(SnapshotOrigin::of(&snap));
     restore_with(&repo, target.path(), exact, late_atime)?;
     let before = inodes(target.path())?;
-    let (a, b) = (target.path().join("test/d/a"), target.path().join("test/d/b"));
+    let (a, b) = (
+        target.path().join("test/d/a"),
+        target.path().join("test/d/b"),
+    );
     assert_eq!(fs::metadata(&a)?.ino(), fs::metadata(&b)?.ino());
     std::thread::sleep(std::time::Duration::from_millis(20));
     restore_with(&repo, target.path(), exact, late_atime)?;
@@ -918,13 +1065,28 @@ fn test_restore_exact_temp_name_is_no_entry(set_up_repo: Result<RepoOpen>) -> Re
     assert_eq!(errors, 0);
     assert_eq!(fs::read_to_string(&victim)?, "outside the destination");
     assert_eq!(fs::read_link(t.join(".bko-exact-foo"))?, victim);
-    assert_eq!(fs::read_to_string(t.join(".bko-exact-baz"))?, "a file of the snapshot's");
+    assert_eq!(
+        fs::read_to_string(t.join(".bko-exact-baz"))?,
+        "a file of the snapshot's"
+    );
     for name in ["foo", "baz"] {
-        assert_eq!(fs::read_to_string(t.join(name))?, format!("snapshot {name}"));
-        assert_eq!(fs::read_to_string(outside.path().join(name))?, format!("snapshot {name}"));
-        assert_eq!(fs::metadata(t.join(name))?.nlink(), 1, "{name}'s link not broken");
+        assert_eq!(
+            fs::read_to_string(t.join(name))?,
+            format!("snapshot {name}")
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join(name))?,
+            format!("snapshot {name}")
+        );
+        assert_eq!(
+            fs::metadata(t.join(name))?.nlink(),
+            1,
+            "{name}'s link not broken"
+        );
     }
-    let names: Vec<_> = fs::read_dir(&t)?.map(|e| e.map(|e| e.file_name())).collect::<Result<_, _>>()?;
+    let names: Vec<_> = fs::read_dir(&t)?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<Result<_, _>>()?;
     assert_eq!(names.len(), 4, "{names:?}");
     Ok(())
 }
@@ -963,7 +1125,10 @@ fn test_restore_exact_unbroken_link_left_alone(set_up_repo: Result<RepoOpen>) ->
     fs::set_permissions(t.join("d"), fs::Permissions::from_mode(0o555))?;
     let result = restore_counting(&repo, target.path(), RestoreOptions::default().exact(true));
     fs::set_permissions(t.join("d"), fs::Permissions::from_mode(0o755))?;
-    assert!(result? >= 2, "the link not broken and the name not linked are errors");
+    assert!(
+        result? >= 2,
+        "the link not broken and the name not linked are errors"
+    );
     assert_eq!(fs::read_to_string(t.join("d/foo"))?, "old");
     assert_eq!(fs::read_to_string(outside.path().join("o"))?, "old");
     assert!(!t.join("d/foo2").exists());
@@ -1045,7 +1210,9 @@ fn has_attr(path: &Path, attr: char) -> bool {
 /// flags (TMPDIR).
 #[rstest]
 #[cfg(target_os = "linux")]
-fn test_restore_exact_flags_left_where_nothing_changes(set_up_repo: Result<RepoOpen>) -> Result<()> {
+fn test_restore_exact_flags_left_where_nothing_changes(
+    set_up_repo: Result<RepoOpen>,
+) -> Result<()> {
     let source = tempdir()?;
     let s = source.path();
     fs::create_dir(s.join("d"))?;
@@ -1116,7 +1283,10 @@ fn test_restore_exact_flags_back_on_other_names(set_up_repo: Result<RepoOpen>) -
     assert!(flagged, "the name outside lost immutable");
     assert_eq!(fs::read_to_string(&o)?, "old");
     assert_eq!(fs::read_to_string(t.join("d/b"))?, "snapshot");
-    assert!(!t.join("d/a").exists(), "the unexpected name is still there");
+    assert!(
+        !t.join("d/a").exists(),
+        "the unexpected name is still there"
+    );
     assert_eq!(fs::metadata(&o)?.nlink(), 1);
     Ok(())
 }
@@ -1135,15 +1305,25 @@ fn loop_ext4_casefold() -> Result<Option<LoopFs>> {
     let (img, mnt) = (scratch.path().join("fs.img"), scratch.path().join("mnt"));
     File::create(&img)?.set_len(64 << 20)?;
     fs::create_dir(&mnt)?;
-    if !ok(Command::new("mkfs.ext4").args(["-q", "-F", "-O", "casefold"]).arg(&img)) {
+    if !ok(Command::new("mkfs.ext4")
+        .args(["-q", "-F", "-O", "casefold"])
+        .arg(&img))
+    {
         eprintln!("skipped: no mkfs.ext4 with casefold");
         return Ok(None);
     }
-    if !ok(Command::new("mount").args(["-o", "loop"]).arg(&img).arg(&mnt)) {
+    if !ok(Command::new("mount")
+        .args(["-o", "loop"])
+        .arg(&img)
+        .arg(&mnt))
+    {
         eprintln!("skipped: mount failed");
         return Ok(None);
     }
-    Ok(Some(LoopFs { _scratch: scratch, mnt }))
+    Ok(Some(LoopFs {
+        _scratch: scratch,
+        mnt,
+    }))
 }
 
 /// BackOtter: `size` bytes that don't repeat, the same every time.
@@ -1201,11 +1381,17 @@ fn test_restore_delete_leaves_a_case_variant(set_up_repo: Result<RepoOpen>) -> R
     fs::write(t.join("docs/y"), "unexpected")?;
     fs::write(t.join("KIND"), "a file where the snapshot has a directory")?;
     fs::create_dir(t.join("FLAT"))?;
-    fs::write(t.join("FLAT/junk"), "a directory where the snapshot has a file")?;
+    fs::write(
+        t.join("FLAT/junk"),
+        "a directory where the snapshot has a file",
+    )?;
     fs::write(t.join("extra"), "unexpected")?;
     for opts in [
         RestoreOptions::default().delete(true),
-        RestoreOptions::default().delete(true).exact(true).numeric_id(true),
+        RestoreOptions::default()
+            .delete(true)
+            .exact(true)
+            .numeric_id(true),
     ] {
         assert_eq!(restore_counting(&repo, &dst, opts)?, 0, "{opts:?}");
         assert_eq!(fs::read_to_string(t.join("same"))?, "same");
@@ -1215,13 +1401,22 @@ fn test_restore_delete_leaves_a_case_variant(set_up_repo: Result<RepoOpen>) -> R
         assert_eq!(fs::read_to_string(t.join("kind/f"))?, "f");
         assert_eq!(fs::read_to_string(t.join("flat"))?, "flat");
         assert!(fs::read(t.join("other"))? == other, "other's contents");
-        assert!(!t.join("docs/y").exists(), "the unexpected docs/y is still there");
-        assert!(!t.join("extra").exists(), "the unexpected extra is still there");
+        assert!(
+            !t.join("docs/y").exists(),
+            "the unexpected docs/y is still there"
+        );
+        assert!(
+            !t.join("extra").exists(),
+            "the unexpected extra is still there"
+        );
         let mut names: Vec<_> = fs::read_dir(&t)?
             .map(|e| e.map(|e| e.file_name().to_string_lossy().to_lowercase()))
             .collect::<Result<_, _>>()?;
         names.sort();
-        assert_eq!(names, ["docs", "flat", "kind", "other", "same", "snapupper"]);
+        assert_eq!(
+            names,
+            ["docs", "flat", "kind", "other", "same", "snapupper"]
+        );
     }
     Ok(())
 }
@@ -1264,9 +1459,14 @@ fn test_restore_existing_file_gone_is_no_panic(set_up_repo: Result<RepoOpen>) ->
     fs::remove_file(t.join("f"))?;
     fs::create_dir(t.join("f"))?;
     // f and g without their contents: the restore's error.
-    let err = repo.restore(plan, &opts, ls, &dest).expect_err("contents not restored");
+    let err = repo
+        .restore(plan, &opts, ls, &dest)
+        .expect_err("contents not restored");
     assert!(err.to_string().contains("could not be restored"), "{err}");
-    assert!(fs::read(t.join("g")).ok() != Some(data), "g restored from what?");
+    assert!(
+        fs::read(t.join("g")).ok() != Some(data),
+        "g restored from what?"
+    );
     assert_eq!(fs::read_to_string(t.join("h"))?, "h");
     Ok(())
 }
@@ -1319,11 +1519,24 @@ fn test_restore_failed_contents_get_no_mtime(set_up_repo: Result<RepoOpen>) -> R
         fs::set_permissions(t.join(name), fs::Permissions::from_mode(0o644))?;
     }
     restore_to(&repo, target.path(), RestoreOptions::default())?;
-    assert!(fs::read(t.join("f"))? == data, "f still has its old contents");
-    assert!(fs::read(t.join("l"))? == data[..1000], "l still has its old contents");
-    assert!(fs::read(t.join("l2"))? == data[..1000], "l2 still has its old contents");
+    assert!(
+        fs::read(t.join("f"))? == data,
+        "f still has its old contents"
+    );
+    assert!(
+        fs::read(t.join("l"))? == data[..1000],
+        "l still has its old contents"
+    );
+    assert!(
+        fs::read(t.join("l2"))? == data[..1000],
+        "l2 still has its old contents"
+    );
     for (name, first) in ["f", "l", "l2"].into_iter().zip(after_first) {
-        assert_ne!(first, old.unix_seconds(), "{name} got the snapshot's mtime without its contents");
+        assert_ne!(
+            first,
+            old.unix_seconds(),
+            "{name} got the snapshot's mtime without its contents"
+        );
         assert_eq!(mtime(name)?, old.unix_seconds(), "{name}");
     }
     Ok(())
@@ -1367,7 +1580,16 @@ fn test_restore_refuses_paths_leaving_the_destination(set_up_repo: Result<RepoOp
     let ls_opts = LsOptions::default();
     let renamed = |from: &'static str, to: &'static str| -> Result<_> {
         Ok(repo.ls(&node, &ls_opts)?.map(move |item| {
-            item.map(|(p, n)| (if p == Path::new(from) { PathBuf::from(to) } else { p }, n))
+            item.map(|(p, n)| {
+                (
+                    if p == Path::new(from) {
+                        PathBuf::from(to)
+                    } else {
+                        p
+                    },
+                    n,
+                )
+            })
         }))
     };
     let absolute = outer.path().join("x").to_str().expect("utf-8").to_string();
@@ -1389,7 +1611,10 @@ fn test_restore_refuses_paths_leaving_the_destination(set_up_repo: Result<RepoOp
         ] {
             let planned = repo.prepare_restore(&opts, renamed(from, to)?, &dest, false);
             let err = planned.expect_err("a path leaving the destination");
-            assert!(err.to_string().contains("Invalid path in snapshot"), "{to}: {err}");
+            assert!(
+                err.to_string().contains("Invalid path in snapshot"),
+                "{to}: {err}"
+            );
             assert_eq!(beside()?, before, "{to}");
 
             // The metadata pass alone, after a plan of the snapshot as it is.
@@ -1433,9 +1658,15 @@ fn test_restore_exact_delete_link_group_in_the_way(set_up_repo: Result<RepoOpen>
     fs::write(d.join("b"), "old Y")?;
     fs::hard_link(d.join("b"), d.join("y_extra"))?;
     assert!(chattr("+i", &d.join("a")) && chattr("+i", &d.join("b")));
-    let exact = RestoreOptions::default().exact(true).delete(true).numeric_id(true);
+    let exact = RestoreOptions::default()
+        .exact(true)
+        .delete(true)
+        .numeric_id(true);
     let result = restore_counting(&repo, target.path(), exact);
-    let left: Vec<_> = ["x_extra", "y_extra"].into_iter().filter(|n| d.join(n).exists()).collect();
+    let left: Vec<_> = ["x_extra", "y_extra"]
+        .into_iter()
+        .filter(|n| d.join(n).exists())
+        .collect();
     let flagged = immutable(&d.join("a")) && immutable(&d.join("b"));
     for entry in fs::read_dir(&d)? {
         _ = chattr("-i", &entry?.path());
@@ -1444,7 +1675,10 @@ fn test_restore_exact_delete_link_group_in_the_way(set_up_repo: Result<RepoOpen>
     assert!(left.is_empty(), "unexpected names left: {left:?}");
     assert!(flagged, "the pair lost immutable");
     assert_eq!(fs::read_to_string(d.join("a"))?, "snapshot");
-    assert_eq!(fs::metadata(d.join("a"))?.ino(), fs::metadata(d.join("b"))?.ino());
+    assert_eq!(
+        fs::metadata(d.join("a"))?.ino(),
+        fs::metadata(d.join("b"))?.ino()
+    );
     assert_eq!(fs::metadata(d.join("a"))?.nlink(), 2);
     Ok(())
 }
@@ -1480,7 +1714,12 @@ pub(super) fn file_at(
     use nix::sys::stat::Mode;
 
     let how = how | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-    Ok(File::from(openat(dir, name, how, Mode::from_bits_truncate(mode))?))
+    Ok(File::from(openat(
+        dir,
+        name,
+        how,
+        Mode::from_bits_truncate(mode),
+    )?))
 }
 
 /// BackOtter (BackShot2's fail-001): a tree deeper than a path a system
@@ -1503,14 +1742,20 @@ fn test_backup_restore_past_path_max(set_up_repo: Result<RepoOpen>) -> Result<()
     use xattr::FileExt;
 
     let source = tempdir()?;
-    let names: Vec<String> = (0..120).map(|i| format!("d{i:03}{}", "x".repeat(36))).collect();
+    let names: Vec<String> = (0..120)
+        .map(|i| format!("d{i:03}{}", "x".repeat(36)))
+        .collect();
     let deep: PathBuf = names.iter().collect();
     assert!(source.path().join(&deep).as_os_str().len() > 4096);
     // The tree, made through descriptors.
     for (i, name) in names.iter().enumerate() {
         let fds = open_chain(source.path(), &names[..i])?;
         let mode = if i % 2 == 0 { 0o750 } else { 0o705 };
-        mkdirat(fds.last().unwrap(), name.as_str(), Mode::from_bits_truncate(mode))?;
+        mkdirat(
+            fds.last().unwrap(),
+            name.as_str(),
+            Mode::from_bits_truncate(mode),
+        )?;
     }
     let fds = open_chain(source.path(), &names)?;
     let bottom = fds.last().unwrap();
@@ -1525,7 +1770,10 @@ fn test_backup_restore_past_path_max(set_up_repo: Result<RepoOpen>) -> Result<()
     drop(leaf);
     nix::unistd::symlinkat("leaf", bottom, "lnk")?;
     let times = |st: &FileStat| (st.st_mode, st.st_mtime, st.st_mtime_nsec);
-    let want: Vec<_> = fds.iter().map(|fd| fstat(fd).map(|st| times(&st))).collect::<Result<_, _>>()?;
+    let want: Vec<_> = fds
+        .iter()
+        .map(|fd| fstat(fd).map(|st| times(&st)))
+        .collect::<Result<_, _>>()?;
     let want_leaf = times(&fstatat(bottom, "leaf", AtFlags::AT_SYMLINK_NOFOLLOW)?);
     drop(fds);
 
@@ -1541,7 +1789,11 @@ fn test_backup_restore_past_path_max(set_up_repo: Result<RepoOpen>) -> Result<()
         .map(|item| item.map(|(p, _)| p))
         .collect::<Result<_, _>>()?;
     let test = PathBuf::from("test");
-    assert!(listed.contains(&test.join(&deep).join("leaf")), "{} entries", listed.len());
+    assert!(
+        listed.contains(&test.join(&deep).join("leaf")),
+        "{} entries",
+        listed.len()
+    );
     assert!(listed.contains(&test.join(&deep).join("lnk")));
 
     let target = tempdir()?;
@@ -1551,26 +1803,43 @@ fn test_backup_restore_past_path_max(set_up_repo: Result<RepoOpen>) -> Result<()
             assert_eq!(times(&fstat(fd)?), *want, "mode and mtime of directory {i}");
         }
         let bottom = fds.last().unwrap();
-        assert_eq!(times(&fstatat(bottom, "leaf", AtFlags::AT_SYMLINK_NOFOLLOW)?), want_leaf);
+        assert_eq!(
+            times(&fstatat(bottom, "leaf", AtFlags::AT_SYMLINK_NOFOLLOW)?),
+            want_leaf
+        );
         let mut leaf = file_at(bottom, "leaf", OFlag::O_RDONLY, 0)?;
         let mut data = String::new();
         _ = leaf.read_to_string(&mut data)?;
         assert_eq!(data, "deep down");
         assert_eq!(leaf.get_xattr("user.bko")?, Some(b"otter".to_vec()));
         assert_eq!(readlinkat(bottom, "lnk")?, "leaf");
-        assert!(fstatat(bottom, "extra", AtFlags::AT_SYMLINK_NOFOLLOW).is_err(), "extra left");
+        assert!(
+            fstatat(bottom, "extra", AtFlags::AT_SYMLINK_NOFOLLOW).is_err(),
+            "extra left"
+        );
         Ok(())
     };
-    assert_eq!(restore_counting(&repo, target.path(), RestoreOptions::default())?, 0);
+    assert_eq!(
+        restore_counting(&repo, target.path(), RestoreOptions::default())?,
+        0
+    );
     check()?;
 
     // Again over it, as it is.
-    assert_eq!(restore_counting(&repo, target.path(), RestoreOptions::default())?, 0);
+    assert_eq!(
+        restore_counting(&repo, target.path(), RestoreOptions::default())?,
+        0
+    );
     check()?;
 
     // And with --delete, over a file the snapshot hasn't got at the bottom.
     let fds = open_chain(&target.path().join("test"), &names)?;
-    drop(file_at(fds.last().unwrap(), "extra", OFlag::O_WRONLY | OFlag::O_CREAT, 0o600)?);
+    drop(file_at(
+        fds.last().unwrap(),
+        "extra",
+        OFlag::O_WRONLY | OFlag::O_CREAT,
+        0o600,
+    )?);
     drop(fds);
     let delete = RestoreOptions::default().delete(true);
     assert_eq!(restore_counting(&repo, target.path(), delete)?, 0);

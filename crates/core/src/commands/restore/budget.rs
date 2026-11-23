@@ -77,7 +77,8 @@ mod tests {
     fn byte_budget_waits_and_gives_back() {
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
-        let free = |budget: &ByteBudget| *budget.free.lock().unwrap_or_else(PoisonError::into_inner);
+        let free =
+            |budget: &ByteBudget| *budget.free.lock().unwrap_or_else(PoisonError::into_inner);
         let budget = ByteBudget::new(10);
         let first = budget.acquire(8);
         assert_eq!(free(&budget), 2);

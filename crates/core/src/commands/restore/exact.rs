@@ -169,7 +169,10 @@ fn open_regular(path: &Path, shown: &Path) -> io::Result<(std::fs::File, std::fs
     let f = how.open(path)?;
     let m = f.metadata()?;
     if !m.is_file() {
-        return Err(io::Error::other(format!("{} isn't a regular file", shown.display())));
+        return Err(io::Error::other(format!(
+            "{} isn't a regular file",
+            shown.display()
+        )));
     }
     Ok((f, m))
 }
@@ -188,7 +191,9 @@ fn create_temp(dir: &Path) -> io::Result<(PathBuf, std::fs::File)> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            _ = how.custom_flags(libc::O_NOFOLLOW | libc::O_NOCTTY).mode(0o600);
+            _ = how
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NOCTTY)
+                .mode(0o600);
         }
         match how.open(&tmp) {
             Ok(f) => return Ok((tmp, f)),
@@ -206,7 +211,9 @@ fn create_temp(dir: &Path) -> io::Result<(PathBuf, std::fs::File)> {
 /// that name only: they keep the old file. The clone's metadata is a new
 /// file's, which the restore sets after.
 fn clone_over(src: &std::fs::File, dst: &Path) -> Result<(), CloneFailed> {
-    clone_over_with(src, dst, osattrs::clone_contents, |tmp| std::fs::remove_file(tmp))
+    clone_over_with(src, dst, osattrs::clone_contents, |tmp| {
+        std::fs::remove_file(tmp)
+    })
 }
 
 /// [`clone_over`], cloning with `clone` and removing the temporary file
@@ -267,7 +274,9 @@ pub(super) fn clone_file(src: &Path, dst: &Path, size: u64) -> Result<(), CloneF
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if std::fs::symlink_metadata(dst_sys).is_ok_and(|d| d.dev() == m.dev() && d.ino() == m.ino()) {
+        if std::fs::symlink_metadata(dst_sys)
+            .is_ok_and(|d| d.dev() == m.dev() && d.ino() == m.ino())
+        {
             return Err(CloneFailed::Failed(io::Error::other(format!(
                 "{} is {} itself",
                 src.display(),
@@ -361,7 +370,7 @@ pub(super) fn same_type(target: &Path, node: &Node) -> bool {
 
 /// Whether `a` and `b` are the same entry, by device and inode, not
 /// following a symlink (a directory too); `off_unix` where there is no such
-/// thing to compare. For [`same_file`] and [`same_entry`].
+/// thing to compare. For [`same_file()`] and [`same_entry`].
 fn same_inode(a: &Path, b: &Path, off_unix: bool) -> bool {
     #[cfg(unix)]
     {
@@ -486,7 +495,10 @@ fn atime_alone_differs(now: &Node, node: &Node, how: Compared) -> Option<Timesta
 fn same_metadata(now: &Node, node: &Node, how: Compared) -> bool {
     /// The names and values, borrowed, in one order.
     fn sorted(x: &[ExtendedAttribute]) -> Vec<(&str, Option<&[u8]>)> {
-        let mut v: Vec<_> = x.iter().map(|e| (e.name.as_str(), e.value.as_deref())).collect();
+        let mut v: Vec<_> = x
+            .iter()
+            .map(|e| (e.name.as_str(), e.value.as_deref()))
+            .collect();
         v.sort_unstable();
         v
     }
@@ -586,8 +598,16 @@ mod tests {
     /// (`ownership`) or not, a snapshot of BackOtter's (`known_bko`) or of
     /// stock rustic's.
     fn how(ownership: bool, known_bko: bool) -> Compared {
-        let origin = if known_bko { SnapshotOrigin::BackOtter } else { SnapshotOrigin::Other };
-        Compared { numeric: true, ownership, origin }
+        let origin = if known_bko {
+            SnapshotOrigin::BackOtter
+        } else {
+            SnapshotOrigin::Other
+        };
+        Compared {
+            numeric: true,
+            ownership,
+            origin,
+        }
     }
 
     fn node(mode: u32, xattrs: &[(&str, &[u8])]) -> Node {
@@ -603,7 +623,10 @@ mod tests {
                 size: 3,
                 extended_attributes: xattrs
                     .iter()
-                    .map(|(n, v)| ExtendedAttribute { name: (*n).to_string(), value: Some(v.to_vec()) })
+                    .map(|(n, v)| ExtendedAttribute {
+                        name: (*n).to_string(),
+                        value: Some(v.to_vec()),
+                    })
                     .collect(),
                 ..Metadata::default()
             },
@@ -628,8 +651,16 @@ mod tests {
     #[test]
     fn same_metadata_sees_every_difference() {
         let a = node(0o644, &[("user.a", b"1")]);
-        assert!(!same_metadata(&a, &node(0o600, &[("user.a", b"1")]), how(true, true)));
-        assert!(!same_metadata(&a, &node(0o644, &[("user.a", b"2")]), how(true, true)));
+        assert!(!same_metadata(
+            &a,
+            &node(0o600, &[("user.a", b"1")]),
+            how(true, true)
+        ));
+        assert!(!same_metadata(
+            &a,
+            &node(0o644, &[("user.a", b"2")]),
+            how(true, true)
+        ));
         assert!(!same_metadata(&a, &node(0o644, &[]), how(true, true)));
         let mut b = node(0o644, &[("user.a", b"1")]);
         b.meta.atime = Some(Timestamp::from_second(1_700_000_200).unwrap());
@@ -662,7 +693,11 @@ mod tests {
     /// any mode matches.
     #[test]
     fn same_metadata_missing_mode_as_the_restore_sets_it() {
-        let by = |origin| Compared { numeric: true, ownership: true, origin };
+        let by = |origin| Compared {
+            numeric: true,
+            ownership: true,
+            origin,
+        };
         let mut shadow = node(0, &[]);
         shadow.meta.mode = None;
         shadow.meta.inode = 1234;
@@ -684,8 +719,16 @@ mod tests {
         there.node_type = NodeType::Dir;
         assert!(same_metadata(&there, &dir, by(SnapshotOrigin::BackOtter)));
         // A node with a mode matches that mode alone, 0 too.
-        assert!(same_metadata(&zero, &node(0, &[]), by(SnapshotOrigin::Other)));
-        assert!(!same_metadata(&other, &node(0, &[]), by(SnapshotOrigin::Other)));
+        assert!(same_metadata(
+            &zero,
+            &node(0, &[]),
+            by(SnapshotOrigin::Other)
+        ));
+        assert!(!same_metadata(
+            &other,
+            &node(0, &[]),
+            by(SnapshotOrigin::Other)
+        ));
     }
 
     /// An atime a read moved (NetBSD) is put back alone: only where the
@@ -697,11 +740,17 @@ mod tests {
         let mut now = node(0o644, &[("user.a", b"1")]);
         assert_eq!(atime_alone_differs(&now, &node_, how(true, true)), None);
         now.meta.atime = Some(ts(1_800_000_000));
-        assert_eq!(atime_alone_differs(&now, &node_, how(true, true)), Some(ts(1_700_000_100)));
+        assert_eq!(
+            atime_alone_differs(&now, &node_, how(true, true)),
+            Some(ts(1_700_000_100))
+        );
         // The mtime in place of a missing atime; no mtime, no times compared.
         let mut no_atime = node_.clone();
         no_atime.meta.atime = None;
-        assert_eq!(atime_alone_differs(&now, &no_atime, how(true, true)), Some(ts(1_700_000_000)));
+        assert_eq!(
+            atime_alone_differs(&now, &no_atime, how(true, true)),
+            Some(ts(1_700_000_000))
+        );
         no_atime.meta.mtime = None;
         assert_eq!(atime_alone_differs(&now, &no_atime, how(true, true)), None);
         // Anything else that differs: the metadata are set whole.
@@ -714,7 +763,10 @@ mod tests {
         let mut more = now.clone();
         more.meta.uid = Some(1);
         assert_eq!(atime_alone_differs(&more, &node_, how(true, true)), None);
-        assert_eq!(atime_alone_differs(&more, &node_, how(false, true)), Some(ts(1_700_000_100)));
+        assert_eq!(
+            atime_alone_differs(&more, &node_, how(false, true)),
+            Some(ts(1_700_000_100))
+        );
         let mut more = node(0o644, &[("user.a", b"2")]);
         more.meta.atime = now.meta.atime;
         assert_eq!(atime_alone_differs(&more, &node_, how(true, true)), None);
@@ -729,17 +781,25 @@ mod tests {
         let mut now = node(0o644, &[]);
         now.meta.generic_attributes.set_true(UNIX_SPARSE);
         assert!(same_metadata(&now, &node_, how(true, true)));
-        now.meta.generic_attributes.set_number("linux.inode_flags", 0x10);
+        now.meta
+            .generic_attributes
+            .set_number("linux.inode_flags", 0x10);
         assert!(!same_metadata(&now, &node_, how(true, true)));
         assert!(same_metadata(&now, &node_, how(true, false)));
         let mut want = node_.clone();
-        want.meta.generic_attributes.set_number("linux.inode_flags", 0x10);
+        want.meta
+            .generic_attributes
+            .set_number("linux.inode_flags", 0x10);
         assert!(same_metadata(&now, &want, how(true, true)));
-        want.meta.generic_attributes.set_number("linux.inode_flags", 0x30);
+        want.meta
+            .generic_attributes
+            .set_number("linux.inode_flags", 0x30);
         assert!(!same_metadata(&now, &want, how(true, false)));
         // One the node has that the file hasn't never matches.
         let mut want = node_;
-        want.meta.generic_attributes.set_number("linux.project_id", 3);
+        want.meta
+            .generic_attributes
+            .set_number("linux.project_id", 3);
         assert!(!same_metadata(&now, &want, how(true, false)));
     }
 
@@ -780,23 +840,57 @@ mod tests {
         let with_birth = |birth: Option<i64>| {
             let mut n = node(0o644, &[]);
             if let Some(b) = birth {
-                n.meta.generic_attributes.set_timestamp(UNIX_BIRTHTIME, ts(b));
+                n.meta
+                    .generic_attributes
+                    .set_timestamp(UNIX_BIRTHTIME, ts(b));
             }
             n
         };
         // mtime 1_700_000_000
         let node_ = with_birth(Some(1_600_000_000));
         assert!(same_birth_time(&with_birth(None), &node_, true));
-        assert!(same_birth_time(&with_birth(Some(1_650_000_000)), &with_birth(None), true));
-        assert!(same_birth_time(&with_birth(Some(1_600_000_000)), &node_, true));
-        assert!(same_birth_time(&with_birth(Some(1_500_000_000)), &node_, true));
-        assert!(!same_birth_time(&with_birth(Some(1_650_000_000)), &node_, true));
-        assert!(!same_birth_time(&with_birth(Some(1_500_000_000)), &node_, false));
-        assert!(same_birth_time(&with_birth(Some(1_600_000_000)), &node_, false));
+        assert!(same_birth_time(
+            &with_birth(Some(1_650_000_000)),
+            &with_birth(None),
+            true
+        ));
+        assert!(same_birth_time(
+            &with_birth(Some(1_600_000_000)),
+            &node_,
+            true
+        ));
+        assert!(same_birth_time(
+            &with_birth(Some(1_500_000_000)),
+            &node_,
+            true
+        ));
+        assert!(!same_birth_time(
+            &with_birth(Some(1_650_000_000)),
+            &node_,
+            true
+        ));
+        assert!(!same_birth_time(
+            &with_birth(Some(1_500_000_000)),
+            &node_,
+            false
+        ));
+        assert!(same_birth_time(
+            &with_birth(Some(1_600_000_000)),
+            &node_,
+            false
+        ));
         // A birth time after the mtime is lowered to the mtime.
         let later = with_birth(Some(1_800_000_000));
-        assert!(same_birth_time(&with_birth(Some(1_700_000_000)), &later, true));
-        assert!(!same_birth_time(&with_birth(Some(1_700_000_001)), &later, true));
+        assert!(same_birth_time(
+            &with_birth(Some(1_700_000_000)),
+            &later,
+            true
+        ));
+        assert!(!same_birth_time(
+            &with_birth(Some(1_700_000_001)),
+            &later,
+            true
+        ));
     }
 
     /// D1, D5: the clone source is opened without following a symlink or
@@ -805,7 +899,11 @@ mod tests {
     #[cfg(unix)]
     fn clone_source_regular_only() {
         let dir = tempfile::tempdir().unwrap();
-        let (f, l, p) = (dir.path().join("f"), dir.path().join("l"), dir.path().join("p"));
+        let (f, l, p) = (
+            dir.path().join("f"),
+            dir.path().join("l"),
+            dir.path().join("p"),
+        );
         std::fs::write(&f, b"x").unwrap();
         std::os::unix::fs::symlink(&f, &l).unwrap();
         nix::unistd::mkfifo(&p, nix::sys::stat::Mode::S_IRWXU).unwrap();
@@ -852,18 +950,32 @@ mod tests {
         std::fs::write(&src, b"new contents").unwrap();
         let s = std::fs::File::open(&src).unwrap();
 
-        let failed = clone_over_with(&s, &foo, |_, _| Err(io::Error::other("no reflinks")), |t| {
-            std::fs::remove_file(t)
-        });
+        let failed = clone_over_with(
+            &s,
+            &foo,
+            |_, _| Err(io::Error::other("no reflinks")),
+            |t| std::fs::remove_file(t),
+        );
         assert!(matches!(failed, Err(CloneFailed::Failed(_))), "{failed:?}");
         assert_eq!(std::fs::read(&foo).unwrap(), b"old contents");
         assert!(temps(dir.path()).is_empty(), "{:?}", temps(dir.path()));
 
-        let failed = clone_over_with(&s, &foo, |_, _| Err(io::Error::other("no reflinks")), |_| {
-            Err(io::Error::from_raw_os_error(libc::EPERM))
-        });
-        let Err(CloneFailed::TempLeft { tmp, .. }) = &failed else { panic!("{failed:?}") };
-        assert!(failed.as_ref().unwrap_err().to_string().contains(&*tmp.to_string_lossy()));
+        let failed = clone_over_with(
+            &s,
+            &foo,
+            |_, _| Err(io::Error::other("no reflinks")),
+            |_| Err(io::Error::from_raw_os_error(libc::EPERM)),
+        );
+        let Err(CloneFailed::TempLeft { tmp, .. }) = &failed else {
+            panic!("{failed:?}")
+        };
+        assert!(
+            failed
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains(&*tmp.to_string_lossy())
+        );
         assert_eq!(temps(dir.path()).len(), 1);
         std::fs::remove_file(tmp).unwrap();
 
@@ -922,7 +1034,10 @@ mod tests {
             assert!(left.to_string().contains(".bko-exact-1"));
             // RustAudit1 R5-06: the clone's error is its source, not only
             // text in its message.
-            let cause = left.get_ref().and_then(|e| e.source()).map(ToString::to_string);
+            let cause = left
+                .get_ref()
+                .and_then(|e| e.source())
+                .map(ToString::to_string);
             assert_eq!(cause.as_deref(), Some("no reflinks"));
             assert!(has_other_names(&foo), "the file is left as it is");
         }
@@ -958,7 +1073,12 @@ mod tests {
                 "{} isn't untouched",
                 dst.display()
             );
-            assert_eq!(std::fs::read(&f).unwrap(), b"snapshot 12345", "{}", dst.display());
+            assert_eq!(
+                std::fs::read(&f).unwrap(),
+                b"snapshot 12345",
+                "{}",
+                dst.display()
+            );
         }
     }
 

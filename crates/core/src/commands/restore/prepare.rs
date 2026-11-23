@@ -15,8 +15,8 @@ use log::{debug, error, info, trace, warn};
 use walkdir::{DirEntry, WalkDir};
 
 use super::{
-    AddFileResult, FileDirStats, FileMatch, HardlinkKey, RestoreOptions, RestorePlan,
-    RestoreStats, exact,
+    AddFileResult, FileDirStats, FileMatch, HardlinkKey, RestoreOptions, RestorePlan, RestoreStats,
+    exact,
 };
 use crate::{
     backend::{
@@ -45,7 +45,8 @@ pub(super) struct XfsCleared(BTreeMap<PathBuf, (PathBuf, XfsOptions)>);
 /// BackOtter: the targets of every [`XfsCleared`] in this process, with the
 /// options they had, for [`put_back_xfs_options`]; `None` once that ran, and
 /// no directory loses its options after.
-static XFS_PENDING: Mutex<Option<BTreeMap<PathBuf, XfsOptions>>> = Mutex::new(Some(BTreeMap::new()));
+static XFS_PENDING: Mutex<Option<BTreeMap<PathBuf, XfsOptions>>> =
+    Mutex::new(Some(BTreeMap::new()));
 
 impl XfsCleared {
     /// Takes the XFS options off the directory `target`, at `path` in the
@@ -56,13 +57,17 @@ impl XfsCleared {
     #[allow(clippy::significant_drop_tightening)]
     fn clear(&mut self, path: &Path, target: &Path) {
         let mut pending = XFS_PENDING.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(pending) = pending.as_mut() else { return };
+        let Some(pending) = pending.as_mut() else {
+            return;
+        };
         if self.0.contains_key(path) {
             return;
         }
         if let Some(had) = osattrs::clear_dir_xfs_options(target) {
             _ = pending.insert(target.to_path_buf(), had);
-            _ = self.0.insert(path.to_path_buf(), (target.to_path_buf(), had));
+            _ = self
+                .0
+                .insert(path.to_path_buf(), (target.to_path_buf(), had));
         }
     }
 
@@ -74,7 +79,10 @@ impl XfsCleared {
     /// The late pass sets the options of the directory at `path`.
     pub(super) fn take(&mut self, path: &Path) {
         if let Some((target, _)) = self.0.remove(path)
-            && let Some(pending) = XFS_PENDING.lock().unwrap_or_else(PoisonError::into_inner).as_mut()
+            && let Some(pending) = XFS_PENDING
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
         {
             _ = pending.remove(&target);
         }
@@ -90,7 +98,9 @@ impl XfsCleared {
         let left = std::mem::take(&mut self.0);
         let mut pending = XFS_PENDING.lock().unwrap_or_else(PoisonError::into_inner);
         // An interrupt put them back already.
-        let Some(pending) = pending.as_mut() else { return };
+        let Some(pending) = pending.as_mut() else {
+            return;
+        };
         for (path, (target, had)) in left {
             _ = pending.remove(&target);
             debug!("putting back XFS options {}: {had:?}", target.display());
@@ -104,7 +114,10 @@ impl XfsCleared {
 impl Drop for XfsCleared {
     fn drop(&mut self) {
         self.put_back(|path, err| {
-            warn!("restore {}: XFS options not put back: {err}", path.display());
+            warn!(
+                "restore {}: XFS options not put back: {err}",
+                path.display()
+            );
         });
     }
 }
@@ -188,12 +201,12 @@ impl LinkGroup {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            std::fs::symlink_metadata(walkdir::short_path(&self.target)).is_ok_and(|m| {
-                m.is_file() && m.nlink() == 1 + self.others.len() as u64
-            }) && self
-                .others
-                .iter()
-                .all(|other| exact::same_file(&self.target, other))
+            std::fs::symlink_metadata(walkdir::short_path(&self.target))
+                .is_ok_and(|m| m.is_file() && m.nlink() == 1 + self.others.len() as u64)
+                && self
+                    .others
+                    .iter()
+                    .all(|other| exact::same_file(&self.target, other))
         }
         #[cfg(not(unix))]
         false
@@ -414,7 +427,8 @@ fn remove_unexpected(
     debug!("{} left: it is {}", path.display(), target.display());
     // A directory the walk saw there may since have been replaced by the
     // snapshot's file of that name: that stays, as a whole.
-    if !is_dir || !std::fs::symlink_metadata(walkdir::short_path(target)).is_ok_and(|m| m.is_dir()) {
+    if !is_dir || !std::fs::symlink_metadata(walkdir::short_path(target)).is_ok_and(|m| m.is_dir())
+    {
         return Ok(());
     }
     let mut first = None;
@@ -448,7 +462,10 @@ fn remove_tree(dir: &Path, replaced: &Replaced) -> std::io::Result<()> {
     // BackOtter: all but this process's own links' directory (paths past
     // PATH_MAX), there when $TMPDIR is in `dir`: it stays, and so do the
     // directories above it, each an error (ForkAudit1 G7-01).
-    let entries = WalkDir::new(dir).follow_links(false).contents_first(true).into_iter();
+    let entries = WalkDir::new(dir)
+        .follow_links(false)
+        .contents_first(true)
+        .into_iter();
     for entry in entries.filter_entry(|e| !walkdir::is_short_path_dir(e.path())) {
         let result = match &entry {
             Err(err) => Err(std::io::Error::other(err.to_string())),
@@ -493,7 +510,9 @@ static MAKING_ENTRIES: RwLock<()> = RwLock::new(());
 /// BackOtter: for a restore about to make an entry in the destination, or
 /// write to one: it waits for the exit once [`put_back_xfs_options`] ran.
 pub(crate) fn making_entries() -> RwLockReadGuard<'static, ()> {
-    MAKING_ENTRIES.read().unwrap_or_else(PoisonError::into_inner)
+    MAKING_ENTRIES
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 /// BackOtter: puts back, as they were, the XFS options a restore in this
@@ -505,17 +524,32 @@ pub(crate) fn making_entries() -> RwLockReadGuard<'static, ()> {
 /// writes one ([`making_entries`]: its threads wait for the exit) or takes a
 /// directory's options off. Best effort: what fails is a warning.
 pub fn put_back_xfs_options() {
-    if XFS_PENDING.lock().unwrap_or_else(PoisonError::into_inner).is_none() {
+    if XFS_PENDING
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_none()
+    {
         return;
     }
-    std::mem::forget(MAKING_ENTRIES.write().unwrap_or_else(PoisonError::into_inner));
-    let Some(pending) = XFS_PENDING.lock().unwrap_or_else(PoisonError::into_inner).take() else {
+    std::mem::forget(
+        MAKING_ENTRIES
+            .write()
+            .unwrap_or_else(PoisonError::into_inner),
+    );
+    let Some(pending) = XFS_PENDING
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+    else {
         return;
     };
     for (target, had) in pending {
         debug!("putting back XFS options {}: {had:?}", target.display());
         if let Err(err) = osattrs::restore_xfs_options(&target, &NodeType::Dir, &had) {
-            warn!("restore {}: XFS options not put back: {err}", target.display());
+            warn!(
+                "restore {}: XFS options not put back: {err}",
+                target.display()
+            );
         }
     }
 }
@@ -688,14 +722,13 @@ impl<'a> Prepare<'a> {
         let delete = self.opts.delete;
         // BackOtter: nothing below a directory loses its flags: what
         // refuses removal stays, as with --delete.
-        let (removed, put_back) =
-            remove_held(path, sets, &mut self.replaced, |path, replaced| {
-                match (is_dir, delete) {
-                    (false, _) => std::fs::remove_file(walkdir::short_path(path)),
-                    (true, true) => remove_tree(path, replaced),
-                    (true, false) => std::fs::remove_dir(walkdir::short_path(path)),
-                }
-            });
+        let (removed, put_back) = remove_held(path, sets, &mut self.replaced, |path, replaced| {
+            match (is_dir, delete) {
+                (false, _) => std::fs::remove_file(walkdir::short_path(path)),
+                (true, true) => remove_tree(path, replaced),
+                (true, false) => std::fs::remove_dir(walkdir::short_path(path)),
+            }
+        });
         if let Err(err) = put_back {
             self.put_back_failed(path, &err);
         }
@@ -759,7 +792,11 @@ impl<'a> Prepare<'a> {
                 && (below || self.no_symlink_to(target))
             {
                 debug!("{} is there under another name", target.display());
-                let right_type = if node.is_dir() { meta.is_dir() } else { meta.is_file() };
+                let right_type = if node.is_dir() {
+                    meta.is_dir()
+                } else {
+                    meta.is_file()
+                };
                 exists = right_type
                     || !self.remove_in_the_way(
                         target,
@@ -812,8 +849,11 @@ impl<'a> Prepare<'a> {
         let is_dir =
             std::fs::symlink_metadata(walkdir::short_path(target)).is_ok_and(|m| m.is_dir());
         if !self.dry_run && is_dir {
-            self.dirs
-                .note(target, path, osattrs::node_sets_flags(node, self.known_bko()));
+            self.dirs.note(
+                target,
+                path,
+                osattrs::node_sets_flags(node, self.known_bko()),
+            );
         }
         if !self.dry_run
             && is_dir
@@ -898,15 +938,13 @@ impl<'a> Prepare<'a> {
                 target.display()
             );
             if !self.dry_run
-                && std::fs::symlink_metadata(walkdir::short_path(target))
-                    .is_ok_and(|m| m.is_file())
+                && std::fs::symlink_metadata(walkdir::short_path(target)).is_ok_and(|m| m.is_file())
             {
                 self.dirs.change_parent(target);
                 let sets = osattrs::node_sets_flags(node, self.known_bko());
-                let (removed, put_back) =
-                    remove_held(target, sets, &mut self.replaced, |t, _| {
-                        std::fs::remove_file(walkdir::short_path(t))
-                    });
+                let (removed, put_back) = remove_held(target, sets, &mut self.replaced, |t, _| {
+                    std::fs::remove_file(walkdir::short_path(t))
+                });
                 if let Err(err) = removed {
                     warn!("restore {}: {err}", path.display());
                     self.count();
@@ -1038,21 +1076,26 @@ impl<'a> Prepare<'a> {
             filled.changed
         };
         // collect blobs needed for restoring
-        let matched =
-            match plan.match_file(self.dest, node, path.to_path_buf(), repo, opts.verify_existing)? {
-                FileMatch::Existing => {
-                    // Note that exists = false and Existing can happen if the file is changed between scanning the dir
-                    // and calling match_file. So we don't care about exists but trust match_file here.
-                    trace!("identical file: {}", path.display());
-                    if fill_holes() {
-                        self.files.modify += 1;
-                    } else {
-                        self.files.unchanged += 1;
-                    }
-                    return Ok(());
+        let matched = match plan.match_file(
+            self.dest,
+            node,
+            path.to_path_buf(),
+            repo,
+            opts.verify_existing,
+        )? {
+            FileMatch::Existing => {
+                // Note that exists = false and Existing can happen if the file is changed between scanning the dir
+                // and calling match_file. So we don't care about exists but trust match_file here.
+                trace!("identical file: {}", path.display());
+                if fill_holes() {
+                    self.files.modify += 1;
+                } else {
+                    self.files.unchanged += 1;
                 }
-                FileMatch::Blobs(matched) => matched,
-            };
+                return Ok(());
+            }
+            FileMatch::Blobs(matched) => matched,
+        };
         if matched.changes() && !dry_run {
             if !fresh && sets {
                 osattrs::clear_restricting_flags(target);
@@ -1108,7 +1151,11 @@ impl<'a> Prepare<'a> {
         exists: bool,
     ) -> bool {
         let clone = (self.opts.exact && exact::clone_ok(node))
-            .then(|| node.content.as_deref().and_then(|c| self.dest.clone_source(c)))
+            .then(|| {
+                node.content
+                    .as_deref()
+                    .and_then(|c| self.dest.clone_source(c))
+            })
             .flatten();
         let Some(src) = clone else {
             return false;
@@ -1126,7 +1173,11 @@ impl<'a> Prepare<'a> {
                 true
             }
             Err(err @ exact::CloneFailed::TempLeft { .. }) => {
-                warn!("restore {}: not cloned from {}: {err}", path.display(), src.display());
+                warn!(
+                    "restore {}: not cloned from {}: {err}",
+                    path.display(),
+                    src.display()
+                );
                 false
             }
             Err(err) => {
@@ -1187,7 +1238,9 @@ impl<'a> Prepare<'a> {
             let removal = remove_held(&target, true, &mut self.replaced, |t, _| {
                 std::fs::remove_file(walkdir::short_path(t))
             });
-            report_early_removal(&target, removal, |path, err| self.put_back_failed(path, err));
+            report_early_removal(&target, removal, |path, err| {
+                self.put_back_failed(path, err);
+            });
         }
 
         for (path, is_dir) in extra {
@@ -1236,9 +1289,15 @@ mod tests {
         };
         assert_eq!(reported(Ok(()), Ok(())), None);
         assert_eq!(reported(failed("busy"), Ok(())), None);
-        assert_eq!(reported(Ok(()), failed("EIO")), Some("d/b: EIO".to_string()));
+        assert_eq!(
+            reported(Ok(()), failed("EIO")),
+            Some("d/b: EIO".to_string())
+        );
         // Both failed: this one was dropped.
-        assert_eq!(reported(failed("busy"), failed("EIO")), Some("d/b: EIO".to_string()));
+        assert_eq!(
+            reported(failed("busy"), failed("EIO")),
+            Some("d/b: EIO".to_string())
+        );
     }
 
     /// ForkAudit1 G6-04: `--delete` removing a name past restricting flags
@@ -1252,7 +1311,10 @@ mod tests {
         let eio = || Err(Error::other("EIO"));
         assert!(removed_and_put_back(Ok(()), Ok(())).is_ok());
         let err = removed_and_put_back(busy(), Ok(())).unwrap_err();
-        assert_eq!((err.kind(), err.to_string()), (ErrorKind::ResourceBusy, "busy".to_string()));
+        assert_eq!(
+            (err.kind(), err.to_string()),
+            (ErrorKind::ResourceBusy, "busy".to_string())
+        );
         let err = removed_and_put_back(Ok(()), eio()).unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -1261,7 +1323,10 @@ mod tests {
         // Both failed: the put-back's error was dropped.
         let err = removed_and_put_back(busy(), eio()).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ResourceBusy);
-        assert_eq!(err.to_string(), "busy; its restricting flags not set back: EIO");
+        assert_eq!(
+            err.to_string(),
+            "busy; its restricting flags not set back: EIO"
+        );
     }
 
     /// BackOtter: once `put_back_xfs_options` ran (an interrupt, about to
@@ -1285,8 +1350,7 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let dest =
-            LocalDestination::new(dir.path().to_str().unwrap(), false, false).unwrap();
+        let dest = LocalDestination::new(dir.path().to_str().unwrap(), false, false).unwrap();
         dest.create_dir("before").unwrap();
         assert!(dir.path().join("before").is_dir());
         put_back_xfs_options();
@@ -1312,7 +1376,8 @@ mod tests {
             _ = tx2.send(());
         });
         assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(500)).is_err(),
+            rx.recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
             "a file was made after the put-back"
         );
         assert!(!dir.path().join("after").exists());
@@ -1345,8 +1410,9 @@ mod tests {
         fs::set_permissions(walkdir::short_path(&held), Permissions::from_mode(0o555)).unwrap();
         assert!(held.as_os_str().len() > 4096);
         let mut replaced = Replaced::default();
-        let (removed, put_back) =
-            remove_held(&deep, false, &mut replaced, |path, replaced| remove_tree(path, replaced));
+        let (removed, put_back) = remove_held(&deep, false, &mut replaced, |path, replaced| {
+            remove_tree(path, replaced)
+        });
         fs::set_permissions(walkdir::short_path(&held), Permissions::from_mode(0o755)).unwrap();
         assert!(put_back.is_ok());
         let msg = removed.unwrap_err().to_string();

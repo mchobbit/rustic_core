@@ -91,7 +91,11 @@ pub struct RestoreOptions {
     /// Look the owners up by user/group name, falling back to the saved uid/gid (the default)
     #[cfg_attr(
         feature = "clap",
-        clap(long, visible_alias = "ownership-by-name", conflicts_with = "numeric_id")
+        clap(
+            long,
+            visible_alias = "ownership-by-name",
+            conflicts_with = "numeric_id"
+        )
     )]
     pub by_name: bool,
 
@@ -691,8 +695,17 @@ fn restore_metadata(
         // none, and wherever nothing else is set on it here. It stays in
         // xfs_cleared until the late pass sets them: a restore that stops
         // before puts them back.
-        let had_xfs = if node.is_dir() { dirs.xfs.had(path) } else { None };
-        let only_had_xfs = LateAttrs { flags: None, dos_flags: None, fat_attrs: None, xfs_options: had_xfs };
+        let had_xfs = if node.is_dir() {
+            dirs.xfs.had(path)
+        } else {
+            None
+        };
+        let only_had_xfs = LateAttrs {
+            flags: None,
+            dos_flags: None,
+            fat_attrs: None,
+            xfs_options: had_xfs,
+        };
         // BackOtter: under --exact, an entry whose metadata already matches
         // is left untouched, its restricting flags too: setting it again
         // would change its inode (the change time), which a btrfs snapshot
@@ -701,10 +714,8 @@ fn restore_metadata(
         // leaves its change time.
         let attrs = if opts.exact
             && dest.path(path).is_ok_and(|t| {
-                exact::already_matches(&t, node, how)
-                    || exact::atime_put_back(&t, node, how)
-            })
-        {
+                exact::already_matches(&t, node, how) || exact::atime_put_back(&t, node, how)
+            }) {
             trace!("metadata already matches: {}", path.display());
             only_had_xfs
         } else {
@@ -833,7 +844,11 @@ fn restore_metadata(
         finish(&mut pass, &path, &node);
     }
 
-    let MetadataPass { mut dirs, late, mut tally } = pass;
+    let MetadataPass {
+        mut dirs,
+        late,
+        mut tally,
+    } = pass;
     for (path, node_type, late_attrs, xattrs) in late.file_flags {
         // set_metadata made it, so its path is in the destination.
         let Ok(target) = dest.path(&path) else {
@@ -924,7 +939,9 @@ fn link_name(
 ) -> std::io::Result<()> {
     let MetadataPass { dirs, late, tally } = pass;
     let (Ok(first), Ok(target)) = (dest.path(canonical), dest.path(path)) else {
-        return dest.hard_link(canonical, path).map_err(std::io::Error::other);
+        return dest
+            .hard_link(canonical, path)
+            .map_err(std::io::Error::other);
     };
     dirs.change_parent(&target);
     if sets {
@@ -946,7 +963,8 @@ fn link_name(
     let in_the_way = std::fs::symlink_metadata(walkdir::short_path(&target)).is_ok();
     let mut replaced = Replaced::default();
     let (linked, put_back) = remove_held(&target, sets && in_the_way, &mut replaced, |_, _| {
-        dest.hard_link(canonical, path).map_err(std::io::Error::other)
+        dest.hard_link(canonical, path)
+            .map_err(std::io::Error::other)
     });
     if let Err(err) = put_back {
         error!(
@@ -1737,12 +1755,19 @@ mod tests {
     #[test]
     fn sockets_not_restored() {
         let node = |name: &str, node_type| {
-            Node::new_node(name.as_ref(), node_type, crate::backend::node::Metadata::default())
+            Node::new_node(
+                name.as_ref(),
+                node_type,
+                crate::backend::node::Metadata::default(),
+            )
         };
         let nodes = vec![
             Ok((PathBuf::from("dir"), node("dir", NodeType::Dir))),
             Ok((PathBuf::from("dir/file"), node("file", NodeType::File))),
-            Ok((PathBuf::from("dir/socket"), node("socket", NodeType::Socket))),
+            Ok((
+                PathBuf::from("dir/socket"),
+                node("socket", NodeType::Socket),
+            )),
             Ok((PathBuf::from("dir/fifo"), node("fifo", NodeType::Fifo))),
         ];
         let paths: Vec<_> = without_sockets(nodes.into_iter())
@@ -1841,7 +1866,10 @@ mod tests {
         assert!(!fills_holes(bko.sparse(SparseRestore::ByContent), &plain));
         assert!(fills_holes(bko.sparse(SparseRestore::No), &plain));
         assert!(!fills_holes(RestoreOptions::default(), &plain));
-        assert!(!fills_holes(RestoreOptions::default().origin(SnapshotOrigin::Restic), &plain));
+        assert!(!fills_holes(
+            RestoreOptions::default().origin(SnapshotOrigin::Restic),
+            &plain
+        ));
     }
 
     /// ForkAudit1 G6-01: a file whose contents couldn't be restored gets
@@ -1870,11 +1898,19 @@ mod tests {
         let mut tally = RestoreTally::new();
         let stat = || std::fs::metadata(&file).unwrap();
 
-        assert!(set_metadata(&dest, opts, &path, &node, false, true, &mut tally));
-        assert_eq!(stat().mode() & 0o7777, 0o640, "the rest of its metadata is set");
+        assert!(set_metadata(
+            &dest, opts, &path, &node, false, true, &mut tally
+        ));
+        assert_eq!(
+            stat().mode() & 0o7777,
+            0o640,
+            "the rest of its metadata is set"
+        );
         assert_ne!(stat().mtime(), 1_600_000_000);
 
-        assert!(set_metadata(&dest, opts, &path, &node, false, false, &mut tally));
+        assert!(set_metadata(
+            &dest, opts, &path, &node, false, false, &mut tally
+        ));
         assert_eq!(stat().mtime(), 1_600_000_000);
         assert_eq!(tally.errors, 0);
     }
@@ -1899,12 +1935,17 @@ mod tests {
         node.meta.mtime = Some(Timestamp::from_second(1_600_000_000).unwrap());
         let path = PathBuf::from(name);
         for (opts, owner) in [
-            (RestoreOptions::default().numeric_id(true), "setting UID/GID"),
+            (
+                RestoreOptions::default().numeric_id(true),
+                "setting UID/GID",
+            ),
             (RestoreOptions::default(), "setting User/Group"),
         ] {
             let before = test_log::lines(name).len();
             let mut tally = RestoreTally::new();
-            assert!(set_metadata(&dest, opts, &path, &node, false, false, &mut tally));
+            assert!(set_metadata(
+                &dest, opts, &path, &node, false, false, &mut tally
+            ));
             assert!(tally.errors >= 3, "owner, mode and times: {}", tally.errors);
             let lines = test_log::lines(name).split_off(before);
             for what in [owner, "chmod", "setting file times"] {
@@ -1933,14 +1974,22 @@ mod tests {
             RestoreOptions::try_parse_from(std::iter::once("restore").chain(args.iter().copied()))
         };
         assert_eq!(ownership(parse(&[]).unwrap()), Ownership::ByName);
-        assert_eq!(ownership(parse(&["--numeric-id"]).unwrap()), Ownership::Numeric);
+        assert_eq!(
+            ownership(parse(&["--numeric-id"]).unwrap()),
+            Ownership::Numeric
+        );
         assert_eq!(ownership(parse(&["--by-name"]).unwrap()), Ownership::ByName);
         // restic's name for it.
-        assert_eq!(ownership(parse(&["--ownership-by-name"]).unwrap()), Ownership::ByName);
-        assert_eq!(ownership(parse(&["--no-ownership"]).unwrap()), Ownership::None);
+        assert_eq!(
+            ownership(parse(&["--ownership-by-name"]).unwrap()),
+            Ownership::ByName
+        );
+        assert_eq!(
+            ownership(parse(&["--no-ownership"]).unwrap()),
+            Ownership::None
+        );
         assert!(parse(&["--by-name", "--numeric-id"]).is_err());
         assert!(parse(&["--by-name", "--no-ownership"]).is_err());
         assert!(parse(&["--ownership-by-name", "--numeric-id"]).is_err());
     }
-
 }

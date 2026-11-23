@@ -294,7 +294,11 @@ impl<'a> FilesWriter<'a> {
     /// The handles open, in use or idle.
     #[cfg(test)]
     fn open(&self) -> usize {
-        self.buckets.iter().map(|b| lock(b).busy.len()).sum::<usize>() + lock(&self.idle).len()
+        self.buckets
+            .iter()
+            .map(|b| lock(b).busy.len())
+            .sum::<usize>()
+            + lock(&self.idle).len()
     }
 
     /// Closes the handles left (none, unless a pack wasn't read) and gives
@@ -506,8 +510,7 @@ mod tests {
         shuffle(&mut blobs, 3);
         let sizes: Vec<_> = contents.iter().map(|c| c.len() as u64).collect();
         let sparse = vec![false; FILES];
-        let writer =
-            FilesWriter::new(&dest, &names, &sparse, &sizes, writes(FILES, &blobs), 1);
+        let writer = FilesWriter::new(&dest, &names, &sparse, &sizes, writes(FILES, &blobs), 1);
         write_all(&writer, &blobs, 4);
         assert_eq!(writer.open(), 0, "handles left open");
         assert_eq!(writer.sized.load(Ordering::Relaxed), FILES - 1);

@@ -482,16 +482,35 @@ fn test_backup_past_path_max_ignorefile(set_up_repo: Result<RepoOpen>) -> Result
     let source = tempdir()?;
     fs::write(source.path().join(".rusticignore"), "top.secret\n")?;
     fs::write(source.path().join("top.secret"), "x")?;
-    let names: Vec<String> = (0..120).map(|i| format!("d{i:03}{}", "x".repeat(36))).collect();
+    let names: Vec<String> = (0..120)
+        .map(|i| format!("d{i:03}{}", "x".repeat(36)))
+        .collect();
     let deep: PathBuf = names.iter().collect();
-    assert!(source.path().join(&deep).join(".rusticignore").as_os_str().len() > 4096);
+    assert!(
+        source
+            .path()
+            .join(&deep)
+            .join(".rusticignore")
+            .as_os_str()
+            .len()
+            > 4096
+    );
     for (i, name) in names.iter().enumerate() {
         let fds = open_chain(source.path(), &names[..i])?;
-        mkdirat(fds.last().unwrap(), name.as_str(), Mode::from_bits_truncate(0o755))?;
+        mkdirat(
+            fds.last().unwrap(),
+            name.as_str(),
+            Mode::from_bits_truncate(0o755),
+        )?;
     }
     let fds = open_chain(source.path(), &names)?;
     let write = |name: &str, data: &[u8]| -> Result<()> {
-        let mut f = file_at(fds.last().unwrap(), name, OFlag::O_WRONLY | OFlag::O_CREAT, 0o644)?;
+        let mut f = file_at(
+            fds.last().unwrap(),
+            name,
+            OFlag::O_WRONLY | OFlag::O_CREAT,
+            0o644,
+        )?;
         f.write_all(data)?;
         Ok(())
     };
@@ -501,7 +520,8 @@ fn test_backup_past_path_max_ignorefile(set_up_repo: Result<RepoOpen>) -> Result
     drop(fds);
 
     let repo = set_up_repo?.to_indexed_ids()?;
-    let filter = LocalSourceFilterOptions::default().custom_ignorefiles(vec![".rusticignore".to_string()]);
+    let filter =
+        LocalSourceFilterOptions::default().custom_ignorefiles(vec![".rusticignore".to_string()]);
     let opts = BackupOptions::default()
         .as_path(PathBuf::from_str("test")?)
         .ignore_filter_opts(filter);
@@ -514,10 +534,20 @@ fn test_backup_past_path_max_ignorefile(set_up_repo: Result<RepoOpen>) -> Result
         .map(|item| item.map(|(p, _)| p))
         .collect::<Result<_, _>>()?;
     let test = PathBuf::from("test");
-    assert!(!listed.contains(&test.join("top.secret")), "the short one not applied");
-    assert!(listed.contains(&test.join(&deep).join("kept")), "{} entries", listed.len());
+    assert!(
+        !listed.contains(&test.join("top.secret")),
+        "the short one not applied"
+    );
+    assert!(
+        listed.contains(&test.join(&deep).join("kept")),
+        "{} entries",
+        listed.len()
+    );
     let applied = !listed.contains(&test.join(&deep).join("secret.key"));
     let incomplete = snap.summary.as_ref().map_or(0, |s| s.items_incomplete);
-    assert!(applied || incomplete == 1, "secret.key backed up, {incomplete} incomplete");
+    assert!(
+        applied || incomplete == 1,
+        "secret.key backed up, {incomplete} incomplete"
+    );
     Ok(())
 }

@@ -2031,8 +2031,12 @@ fn clone_dir_outside(dir: &Path, dest: &Path) -> RusticResult<()> {
 /// below the directory it is joined to: it has no `..`, root or prefix
 /// component, as `LocalDestination::path` wants of a path it restores to.
 fn stays_below(rel: &Path) -> bool {
-    rel.components()
-        .all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir))
+    rel.components().all(|c| {
+        matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    })
 }
 
 #[cfg(test)]

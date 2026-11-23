@@ -171,6 +171,9 @@ mod tests {
     /// mount points, and directories on the path to them, at any depth. The
     /// mount points are made up here: a directory in `mounts` and what is
     /// below it are on a device of their own.
+    // One table of cases, each a line or two: longer than clippy likes a
+    // function, and no clearer cut in two.
+    #[allow(clippy::too_many_lines)]
     #[cfg(unix)]
     #[test]
     fn target_fresh_only_when_new_or_empty() {
@@ -204,7 +207,12 @@ mod tests {
         // A freshly booted server's /tmp: empty directories on its own
         // file system.
         let tmp = dir.path().join("tmp");
-        for sub in [".X11-unix", ".ICE-unix", ".font-unix", "systemd-private-1-x/tmp"] {
+        for sub in [
+            ".X11-unix",
+            ".ICE-unix",
+            ".font-unix",
+            "systemd-private-1-x/tmp",
+        ] {
             std::fs::create_dir_all(tmp.join(sub)).unwrap();
         }
         assert!(!fresh(&tmp), "/tmp");
@@ -345,7 +353,10 @@ mod tests {
         std::fs::write(&empty, b"").unwrap();
         std::os::unix::fs::symlink(&empty, &nilfs).unwrap();
         assert!(!fresh(&d), ".nilfs symlink to an empty file");
-        assert!(!restore_target_is_fresh(&d), ".nilfs symlink to an empty file");
+        assert!(
+            !restore_target_is_fresh(&d),
+            ".nilfs symlink to an empty file"
+        );
         std::fs::remove_file(&nilfs).unwrap();
         std::fs::write(d.join(".nilfs2"), b"").unwrap();
         assert!(!fresh(&d), "another name");
@@ -453,7 +464,11 @@ mod tests {
             // is not fresh; mounted below a fresh one, it may be.
             let mut results = vec![("empty tmpfs", false, restore_target_is_fresh(&efi))];
             std::fs::create_dir(efi.join("lost+found")).unwrap();
-            results.push(("boot and boot/efi mounted", true, restore_target_is_fresh(d)));
+            results.push((
+                "boot and boot/efi mounted",
+                true,
+                restore_target_is_fresh(d),
+            ));
             for (what, sub) in [
                 ("empty directory in efi", "efi/EFI"),
                 ("empty directory in boot", "grub"),
@@ -466,7 +481,11 @@ mod tests {
             results.push(("file in efi", false, restore_target_is_fresh(d)));
             std::fs::remove_file(efi.join("vmlinuz")).unwrap();
             std::fs::create_dir(d.join("tmp")).unwrap();
-            results.push(("empty directory beside boot", false, restore_target_is_fresh(d)));
+            results.push((
+                "empty directory beside boot",
+                false,
+                restore_target_is_fresh(d),
+            ));
             std::fs::remove_dir(d.join("tmp")).unwrap();
             std::fs::write(d.join(".nilfs"), b"").unwrap();
             std::fs::write(boot.join(".nilfs"), b"").unwrap();
