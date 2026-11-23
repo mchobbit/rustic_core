@@ -716,12 +716,39 @@ fn attr_dir(path: &Path) -> io::Result<Option<File>> {
     }
 }
 
+/// Sets errno, which `readdir(3C)` sets only on an error.
+fn set_errno(errno: libc::c_int) {
+    // SAFETY: ___errno gives this thread's errno.
+    unsafe { *libc::___errno() = errno };
+}
+
+/// One step of a `readdir(3C)` loop: what `read` gives, `None` at the end of
+/// the directory. `readdir` returns NULL at the end and on an error, and
+/// only errno tells them apart, so it is cleared before the call: an error
+/// partway is an error, not a short listing.
+fn readdir_step<T>(read: impl FnOnce() -> Option<T>) -> io::Result<Option<T>> {
+    set_errno(0);
+    read().map_or_else(
+        || match io::Error::last_os_error() {
+            err if err.raw_os_error() == Some(0) => Ok(None),
+            err => Err(err),
+        },
+        |entry| Ok(Some(entry)),
+    )
+}
+
 /// The names in an attribute directory, without the system attribute views,
 /// sorted, as BackOtter's restic stores them (not in directory order).
 fn attr_names(dir: &File) -> io::Result<Vec<String>> {
     // fdopendir(3C) takes over the descriptor it's given: give it its own.
     // SAFETY: dir is an open descriptor.
     let fd = check(unsafe { libc::dup(dir.as_raw_fd()) })?;
+    // The duplicate shares dir's offset: back to the start, wherever an
+    // earlier listing of dir left it (the end). Before fdopendir(3C), not
+    // rewinddir(3C) after it, which on illumos looks at the new DIR's
+    // still empty buffer for where it is, and may not seek at all.
+    // SAFETY: fd is an open descriptor.
+    _ = unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
     // SAFETY: fd is an open directory descriptor.
     let d = unsafe { libc::fdopendir(fd) };
     if d.is_null() {
@@ -731,12 +758,17 @@ fn attr_names(dir: &File) -> io::Result<Vec<String>> {
         return Err(err);
     }
     let mut names = Vec::new();
-    loop {
-        // SAFETY: d is an open DIR.
-        let e = unsafe { libc::readdir(d) };
-        if e.is_null() {
-            break;
-        }
+    let result = loop {
+        let step = readdir_step(|| {
+            // SAFETY: d is an open DIR.
+            let e = unsafe { libc::readdir(d) };
+            (!e.is_null()).then_some(e)
+        });
+        let e = match step {
+            Ok(Some(e)) => e,
+            Ok(None) => break Ok(()),
+            Err(err) => break Err(err),
+        };
         // SAFETY: e is the entry readdir just gave, valid until the next
         // readdir. libc declares d_name with 3 bytes, so the name is read
         // through a pointer taken from e itself, never a reference to that
@@ -748,9 +780,10 @@ fn attr_names(dir: &File) -> io::Result<Vec<String>> {
         if name != "." && name != ".." && !SYSTEM_VIEWS.contains(&&*name) {
             names.push(name.into_owned());
         }
-    }
+    };
     // SAFETY: d is an open DIR, closed once.
     _ = unsafe { libc::closedir(d) };
+    result?;
     names.sort_unstable();
     Ok(names)
 }
@@ -1188,6 +1221,29 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         assert!(set_xattrs(&sub, &[xattr("../x", b"y")]).is_err());
         assert!(!dir.path().join("x").exists());
+    }
+
+    /// ForkAudit1 G5-05 (RustAudit1 R4-04): a NULL from `readdir(3C)` with
+    /// errno set is an error, not the end of the directory; a stale errno
+    /// from before the call isn't one. Before, every NULL ended the listing,
+    /// cut short without an error.
+    #[test]
+    fn readdir_step_tells_an_error_from_the_end() {
+        assert_eq!(readdir_step(|| Some(7)).unwrap(), Some(7));
+        set_errno(libc::EIO);
+        assert_eq!(readdir_step(|| None::<()>).unwrap(), None);
+        let err = readdir_step(|| {
+            set_errno(libc::EIO);
+            None::<()>
+        })
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        // An entry is an entry, whatever errno was left at.
+        let got = readdir_step(|| {
+            set_errno(libc::ENOENT);
+            Some(1)
+        });
+        assert_eq!(got.unwrap(), Some(1));
     }
 
     /// The node of a file with the mode `mode`, owned by `uid`:`gid`.
