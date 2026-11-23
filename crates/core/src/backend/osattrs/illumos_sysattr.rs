@@ -58,16 +58,23 @@ fn invalid(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
-fn be32(buf: &[u8], pos: usize) -> u32 {
-    u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap())
+fn truncated(pos: usize) -> io::Error {
+    invalid(format!("nvlist truncated at {pos}"))
 }
 
-fn be64(buf: &[u8], pos: usize) -> u64 {
-    u64::from_be_bytes(buf[pos..pos + 8].try_into().unwrap())
+/// The big-endian `u32` at `pos` in `buf`, if `buf` has its 4 bytes.
+fn be32(buf: &[u8], pos: usize) -> Option<u32> {
+    buf.get(pos..)?.first_chunk().copied().map(u32::from_be_bytes)
 }
 
-fn usize32(buf: &[u8], pos: usize) -> usize {
-    usize::try_from(be32(buf, pos)).unwrap_or(usize::MAX)
+/// The big-endian `u64` at `pos` in `buf`, if `buf` has its 8 bytes.
+fn be64(buf: &[u8], pos: usize) -> Option<u64> {
+    buf.get(pos..)?.first_chunk().copied().map(u64::from_be_bytes)
+}
+
+fn usize32(buf: &[u8], pos: usize) -> io::Result<usize> {
+    let n = be32(buf, pos).ok_or_else(|| truncated(pos))?;
+    Ok(usize::try_from(n).unwrap_or(usize::MAX))
 }
 
 /// The type and encoded value of a pair in an XDR-encoded nvlist.
@@ -100,11 +107,11 @@ impl<'a> View<'a> {
         let mut values = BTreeMap::new();
         loop {
             if pos + 8 > buf.len() {
-                return Err(invalid(format!("nvlist truncated at {pos}")));
+                return Err(truncated(pos));
             }
             let start = pos;
-            let encoded_size = usize32(buf, pos);
-            let decoded_size = be32(buf, pos + 4);
+            let encoded_size = usize32(buf, pos)?;
+            let decoded_size = be32(buf, pos + 4).ok_or_else(|| truncated(pos))?;
             if encoded_size == 0 && decoded_size == 0 {
                 return Ok(Self(values)); // the end
             }
@@ -116,7 +123,7 @@ impl<'a> View<'a> {
             if pos + 4 > end {
                 return Err(invalid(format!("nvpair at {start} truncated")));
             }
-            let name_len = usize32(buf, pos);
+            let name_len = usize32(buf, pos)?;
             pos += 4;
             if pos.saturating_add(name_len) > end {
                 return Err(invalid(format!("nvpair at {start}: name too long")));
@@ -127,8 +134,8 @@ impl<'a> View<'a> {
                 return Err(invalid(format!("nvpair {name:?} truncated")));
             }
             let pair = Pair {
-                typ: be32(buf, pos),
-                nelem: be32(buf, pos + 4),
+                typ: be32(buf, pos).ok_or_else(|| truncated(pos))?,
+                nelem: be32(buf, pos + 4).ok_or_else(|| truncated(pos))?,
                 value: &buf[pos + 8..end],
             };
             _ = values.insert(name, pair);
@@ -146,7 +153,9 @@ impl<'a> View<'a> {
     /// The system attributes in the view, as a mask.
     pub(super) fn mask(&self) -> u32 {
         BITS.iter()
-            .filter(|(name, _)| self.has_boolean(name) && be32(self.0[*name].value, 0) != 0)
+            .filter(|(name, _)| {
+                self.has_boolean(name) && be32(self.0[*name].value, 0).is_some_and(|b| b != 0)
+            })
             .fold(0, |mask, (_, bit)| mask | bit)
     }
 
@@ -192,13 +201,12 @@ impl<'a> View<'a> {
     /// the seconds and nanoseconds.
     pub(super) fn crtime(&self) -> Option<Timestamp> {
         let v = self.0.get("crtime")?;
-        if v.typ != DATA_TYPE_UINT64_ARRAY || v.nelem != 2 || v.value.len() < 20 || be32(v.value, 0) != 2
-        {
+        if v.typ != DATA_TYPE_UINT64_ARRAY || v.nelem != 2 || be32(v.value, 0)? != 2 {
             return None;
         }
         // Two's complement, as the kernel's time_t.
-        let sec = be64(v.value, 4).cast_signed();
-        let nsec = i32::try_from(be64(v.value, 12)).ok()?;
+        let sec = be64(v.value, 4)?.cast_signed();
+        let nsec = i32::try_from(be64(v.value, 12)?).ok()?;
         Timestamp::new(sec, nsec).ok()
     }
 }
