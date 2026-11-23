@@ -180,8 +180,9 @@ const fn xfs_kept(dir: bool) -> u32 {
 /// `FS_IOC_SETFLAGS`, as `lsattr(1)` and `chattr(1)` do, so as not to follow
 /// a symlink, wait on a lock or take a terminal. Other types of file have no
 /// flags, and opening a device or FIFO could have side effects. An error if
-/// what it opens isn't of type `typ`, or, given `listed` (the backup's
-/// lstat), isn't that file.
+/// what it opens isn't of type `typ` ("PATH is not a regular file", "... a
+/// directory"), or, given `listed` (the backup's lstat), isn't that file
+/// ("PATH was replaced since it was listed").
 fn open_for_flags(path: &Path, typ: &NodeType, listed: Option<&Metadata>) -> io::Result<File> {
     let mut how = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY;
     let dir = match typ {
@@ -198,10 +199,15 @@ fn open_for_flags(path: &Path, typ: &NodeType, listed: Option<&Metadata>) -> io:
         .open(path)
         .map_err(|err| path_error("open", path, &err))?;
     let m = f.metadata().map_err(|err| path_error("fstat", path, &err))?;
-    let replaced = listed.is_some_and(|l| (l.dev(), l.ino()) != (m.dev(), m.ino()));
-    if (if dir { !m.is_dir() } else { !m.is_file() }) || replaced {
+    // BackOtter (RustAudit1 R2-11): which of the two it is; a restore gives
+    // no `listed`, and read nothing.
+    if if dir { !m.is_dir() } else { !m.is_file() } {
+        let what = if dir { "directory" } else { "regular file" };
+        return Err(io::Error::other(format!("{} is not a {what}", path.display())));
+    }
+    if listed.is_some_and(|l| (l.dev(), l.ino()) != (m.dev(), m.ino())) {
         return Err(io::Error::other(format!(
-            "{} was replaced while it was read",
+            "{} was replaced since it was listed",
             path.display()
         )));
     }
@@ -1730,6 +1736,28 @@ mod tests {
         want.extsize = 128 << 10;
         restore_xfs_options(&dir, &NodeType::Dir, &want).unwrap();
         assert_eq!(opts(&dir), Some(want));
+    }
+
+    // BackOtter (RustAudit1 R2-11): what open_for_flags found says which it
+    // was: another type of file, or another file than the one listed.
+    #[test]
+    fn open_for_flags_says_what_it_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let listed = std::fs::symlink_metadata(&a).unwrap();
+        _ = open_for_flags(&a, &NodeType::File, Some(&listed)).unwrap();
+        _ = open_for_flags(dir.path(), &NodeType::Dir, None).unwrap();
+        // A directory where the node is a file (a restore gives no lstat).
+        let err = open_for_flags(dir.path(), &NodeType::File, None).unwrap_err();
+        assert_eq!(err.to_string(), format!("{} is not a regular file", dir.path().display()));
+        // A file where the node is a directory: O_DIRECTORY refuses it.
+        let err = open_for_flags(&a, &NodeType::Dir, None).unwrap_err();
+        assert_eq!(err.raw_os_error().or_else(|| super::super::errno(&err)), Some(libc::ENOTDIR));
+        // Another file than the backup listed under that name.
+        let err = open_for_flags(&b, &NodeType::File, Some(&listed)).unwrap_err();
+        assert_eq!(err.to_string(), format!("{} was replaced since it was listed", b.display()));
     }
 
     #[test]
