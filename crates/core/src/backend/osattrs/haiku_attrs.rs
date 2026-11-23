@@ -515,7 +515,12 @@ mod tests {
             Ok(self.get(name).map(|a| {
                 let stat = a.attr.stat();
                 Stat {
-                    size: self.claimed.borrow().get(name).copied().unwrap_or(stat.size),
+                    size: self
+                        .claimed
+                        .borrow()
+                        .get(name)
+                        .copied()
+                        .unwrap_or(stat.size),
                     ..stat
                 }
             }))
@@ -738,7 +743,10 @@ mod tests {
         // A restore: the error names it, and the rest is done all the same.
         let w = want(&[("new", attr(RAWT, b"n"))]);
         let err = apply(&bfs, &w, false).unwrap_err();
-        assert!(err.to_string().starts_with("stat attribute user.a: "), "{err}");
+        assert!(
+            err.to_string().starts_with("stat attribute user.a: "),
+            "{err}"
+        );
         assert!(bfs.get(b"BEOS:TYPE").is_none() && bfs.get(b"big").is_none());
         assert_eq!(bfs.get(b"new").unwrap().attr, attr(RAWT, b"n"));
         assert!(bfs.get(b"user.a").is_some() && bfs.get(b"user.bad").is_some());
@@ -761,7 +769,12 @@ mod tests {
         assert_eq!(got, want(&[("small", attr(RAWT, b"s"))]));
         assert_eq!(names(&bad), [b"huge"]);
         assert_eq!(bad[0].1.kind(), io::ErrorKind::FileTooLarge);
-        assert!(bad[0].1.to_string().starts_with("too large to keep (18446744073709551615 bytes"));
+        assert!(
+            bad[0]
+                .1
+                .to_string()
+                .starts_with("too large to keep (18446744073709551615 bytes")
+        );
         assert_eq!(bfs.reads.get(), 1);
 
         _ = bfs.claimed.borrow_mut().insert(b"huge".to_vec(), max + 1);
@@ -775,7 +788,10 @@ mod tests {
         let stat = grows.stat(c"a").unwrap().unwrap();
         let err = read_attr(&grows, c"a", stat, 7).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
-        assert_eq!(read_attr(&grows, c"a", stat, 10).unwrap().unwrap().value, b"longer now");
+        assert_eq!(
+            read_attr(&grows, c"a", stat, 10).unwrap().unwrap().value,
+            b"longer now"
+        );
     }
 
     #[test]
@@ -917,7 +933,12 @@ mod tests {
     fn a_failed_write_truncates_an_attribute_in_its_own_inode() {
         let bfs = FakeBfs::with(&[(b"a", attr(MIMS, &[1; 2 * SMALL_DATA]))]);
         bfs.full.set(true);
-        let err = apply(&bfs, &want(&[("a", attr(MIMS, &[2; 2 * SMALL_DATA]))]), false).unwrap_err();
+        let err = apply(
+            &bfs,
+            &want(&[("a", attr(MIMS, &[2; 2 * SMALL_DATA]))]),
+            false,
+        )
+        .unwrap_err();
         assert!(err.to_string().starts_with("write attribute a: "), "{err}");
         assert_eq!(bfs.get(b"a").map(|a| a.attr.value), Some(Vec::new()));
     }

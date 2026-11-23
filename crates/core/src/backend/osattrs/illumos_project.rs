@@ -4,7 +4,10 @@
 //! Portable, so that it is tested on any system; the ioctls are in
 //! `illumos.rs` and `freebsd.rs`.
 
-#![cfg_attr(not(any(target_os = "illumos", target_os = "freebsd")), allow(dead_code))]
+#![cfg_attr(
+    not(any(target_os = "illumos", target_os = "freebsd")),
+    allow(dead_code)
+)]
 
 use serde::{Deserialize, Serialize};
 
@@ -68,7 +71,11 @@ mod tests {
             assert_eq!(back, p);
             assert_eq!(back.xflags(0), xflags);
         }
-        assert_eq!(ZfsProject::of(0, 0), None, "project 0 without inheritance kept");
+        assert_eq!(
+            ZfsProject::of(0, 0),
+            None,
+            "project 0 without inheritance kept"
+        );
 
         // Other flags stay as they are.
         let p = |id, inherit| ZfsProject { id, inherit };

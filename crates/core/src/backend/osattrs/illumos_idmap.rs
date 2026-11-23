@@ -68,7 +68,9 @@ fn dl_error() -> String {
         return "dlopen failed".to_string();
     }
     // SAFETY: err is a C string, valid until the next dl call.
-    unsafe { CStr::from_ptr(err) }.to_string_lossy().into_owned()
+    unsafe { CStr::from_ptr(err) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn open() -> Result<Idmap, String> {
@@ -138,19 +140,29 @@ static IDS: Mutex<BTreeMap<(String, bool), u32>> = Mutex::new(BTreeMap::new());
 
 /// The SID that the ephemeral uid `id` (gid, if `group`) is for.
 pub(super) fn sid_of_id(id: u32, group: bool) -> io::Result<String> {
-    let cached = SIDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(id, group)).cloned();
+    let cached = SIDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(id, group))
+        .cloned();
     if let Some(sid) = cached {
         return Ok(sid);
     }
     let (mut prefix, mut rid) = (ptr::null_mut::<c_char>(), 0);
     let result = request(|idmap, gh, stat| {
-        let get = if group { idmap.sid_by_gid } else { idmap.sid_by_uid };
+        let get = if group {
+            idmap.sid_by_gid
+        } else {
+            idmap.sid_by_uid
+        };
         // SAFETY: prefix, rid and stat outlive the request.
         unsafe { get(gh, id, 0, &raw mut prefix, &raw mut rid, stat) }
     });
     let prefix = (!prefix.is_null()).then(|| {
         // SAFETY: libidmap gave a C string.
-        let s = unsafe { CStr::from_ptr(prefix) }.to_string_lossy().into_owned();
+        let s = unsafe { CStr::from_ptr(prefix) }
+            .to_string_lossy()
+            .into_owned();
         // SAFETY: it was malloc(3C)ed, and is freed once, here, read.
         unsafe { libc::free(prefix.cast()) };
         s
@@ -171,16 +183,25 @@ pub(super) fn sid_of_id(id: u32, group: bool) -> io::Result<String> {
 /// it hasn't yet.
 pub(super) fn id_of_sid(sid: &str, group: bool) -> io::Result<u32> {
     let key = (sid.to_string(), group);
-    let cached = IDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key).copied();
+    let cached = IDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .copied();
     if let Some(id) = cached {
         return Ok(id);
     }
-    let (prefix, rid) = super::illumos_acl::split_sid(sid)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("malformed SID {sid:?}")))?;
+    let (prefix, rid) = super::illumos_acl::split_sid(sid).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("malformed SID {sid:?}"))
+    })?;
     let prefix = CString::new(prefix)?;
     let mut id = 0;
     request(|idmap, gh, stat| {
-        let get = if group { idmap.gid_by_sid } else { idmap.uid_by_sid };
+        let get = if group {
+            idmap.gid_by_sid
+        } else {
+            idmap.uid_by_sid
+        };
         // SAFETY: prefix (which libidmap copies), id and stat outlive the
         // request.
         unsafe { get(gh, prefix.as_ptr().cast_mut(), rid, 0, &raw mut id, stat) }

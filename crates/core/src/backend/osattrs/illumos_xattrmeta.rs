@@ -130,14 +130,20 @@ mod tests {
         let now = (1500, 20);
         assert_eq!(restored_owner(&meta(1001, 10), node, now), (1500, 20));
         // By number, or the same here: as in the snapshot.
-        assert_eq!(restored_owner(&meta(1001, 10), node, (1001, 10)), (1001, 10));
+        assert_eq!(
+            restored_owner(&meta(1001, 10), node, (1001, 10)),
+            (1001, 10)
+        );
         // Another user's attribute, the file's group's; and the reverse.
         assert_eq!(restored_owner(&meta(1002, 10), node, now), (1002, 20));
         assert_eq!(restored_owner(&meta(1001, 11), node, now), (1500, 11));
         // The file owner's number here as another user's attribute's: kept.
         assert_eq!(restored_owner(&meta(1500, 20), node, now), (1500, 20));
         // A node without an owner (not a Unix file's): the numbers.
-        assert_eq!(restored_owner(&meta(1001, 10), (None, None), now), (1001, 10));
+        assert_eq!(
+            restored_owner(&meta(1001, 10), (None, None), now),
+            (1001, 10)
+        );
     }
 
     /// BackOtter: without ownership, two `illumos.xattr_meta` that differ
@@ -151,12 +157,21 @@ mod tests {
         };
         let want = value(&[("a", meta(1001, 10)), ("b", meta(1002, 11))]);
         assert!(same_but_owners(&want, &want));
-        assert!(same_but_owners(&value(&[("a", meta(0, 0)), ("b", meta(0, 3))]), &want));
+        assert!(same_but_owners(
+            &value(&[("a", meta(0, 0)), ("b", meta(0, 3))]),
+            &want
+        ));
         let mut mode = meta(0, 0);
         mode.mode = 0o644;
-        assert!(!same_but_owners(&value(&[("a", mode), ("b", meta(0, 0))]), &want));
+        assert!(!same_but_owners(
+            &value(&[("a", mode), ("b", meta(0, 0))]),
+            &want
+        ));
         assert!(!same_but_owners(&value(&[("a", meta(0, 0))]), &want));
-        assert!(!same_but_owners(&value(&[("a", meta(0, 0)), ("c", meta(0, 0))]), &want));
+        assert!(!same_but_owners(
+            &value(&[("a", meta(0, 0)), ("c", meta(0, 0))]),
+            &want
+        ));
         // An owner that is a SID is an owner (ForkAudit1 G5-03).
         let mut sid = meta(2_147_483_650, 10);
         sid.owner_sid = Some("S-1-5-21-1111-2222-3333-1001".to_string());
@@ -257,7 +272,10 @@ mod tests {
 
         // The form both tools write: the names as they are, times as a
         // node's mtime, no "acl" for a trivial one.
-        let two: BTreeMap<_, _> = metas.iter().filter(|(name, _)| !name.starts_with('G')).collect();
+        let two: BTreeMap<_, _> = metas
+            .iter()
+            .filter(|(name, _)| !name.starts_with('G'))
+            .collect();
         let want = concat!(
             r#"{"a name with spaces":{"uid":0,"gid":0,"mode":384,"#,
             r#""mtime":"2001-09-09T01:46:40.000000005Z","atime":"2001-09-09T01:46:40.000000005Z"},"#,
@@ -317,7 +335,10 @@ mod tests {
         );
         assert_eq!(serde_json::from_str::<XattrMeta>(&json).unwrap(), meta);
         let old: OldXattrMeta = serde_json::from_str(&json).unwrap();
-        assert_eq!((old.uid, old.gid, old.mode), (2_147_483_650, 2_147_483_651, 0o600));
+        assert_eq!(
+            (old.uid, old.gid, old.mode),
+            (2_147_483_650, 2_147_483_651, 0o600)
+        );
         // One alone.
         let group = XattrMeta {
             owner_sid: None,
@@ -325,7 +346,10 @@ mod tests {
             ..meta
         };
         let json = serde_json::to_string(&group).unwrap();
-        assert!(json.starts_with(r#"{"uid":1500,"gid":2147483651,"group_sid":"S-1-5-"#), "{json}");
+        assert!(
+            json.starts_with(r#"{"uid":1500,"gid":2147483651,"group_sid":"S-1-5-"#),
+            "{json}"
+        );
         assert_eq!(serde_json::from_str::<XattrMeta>(&json).unwrap(), group);
     }
 

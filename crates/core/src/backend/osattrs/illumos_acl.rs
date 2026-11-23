@@ -168,7 +168,11 @@ pub(super) fn trivial(mode: u32, dir: bool) -> Vec<AceEntry> {
     if deny2 != 0 {
         acl.push(ace(deny2, GROUP | IDENTIFIER_GROUP, ACCESS_DENIED));
     }
-    acl.push(ace(owner | basic | OWNER_ONLY_ALLOWED, OWNER, ACCESS_ALLOWED));
+    acl.push(ace(
+        owner | basic | OWNER_ONLY_ALLOWED,
+        OWNER,
+        ACCESS_ALLOWED,
+    ));
     acl.push(ace(group | basic, GROUP | IDENTIFIER_GROUP, ACCESS_ALLOWED));
     acl.push(ace(everyone | basic, EVERYONE, ACCESS_ALLOWED));
     acl
@@ -232,7 +236,11 @@ mod tests {
         assert_eq!(
             trivial(0o077, false),
             [
-                ace(READ_DATA | WRITE_DATA | APPEND_DATA | EXECUTE, OWNER, ACCESS_DENIED),
+                ace(
+                    READ_DATA | WRITE_DATA | APPEND_DATA | EXECUTE,
+                    OWNER,
+                    ACCESS_DENIED
+                ),
                 ace(0x001e_0198, OWNER, ACCESS_ALLOWED),
                 ace(0x0012_00af, group, ACCESS_ALLOWED),
                 ace(0x0012_00af, EVERYONE, ACCESS_ALLOWED),
@@ -265,14 +273,27 @@ mod tests {
         let trivial = vec![
             ace(
                 0xffff_ffff,
-                read | write | attrs | WRITE_ATTRIBUTES | WRITE_NAMED_ATTRS | WRITE_ACL | WRITE_OWNER,
+                read | write
+                    | attrs
+                    | WRITE_ATTRIBUTES
+                    | WRITE_NAMED_ATTRS
+                    | WRITE_ACL
+                    | WRITE_OWNER,
                 OWNER,
                 ACCESS_ALLOWED,
             ),
-            ace(0xffff_ffff, read | attrs, GROUP | IDENTIFIER_GROUP, ACCESS_ALLOWED),
+            ace(
+                0xffff_ffff,
+                read | attrs,
+                GROUP | IDENTIFIER_GROUP,
+                ACCESS_ALLOWED,
+            ),
             ace(0xffff_ffff, read | attrs, EVERYONE, ACCESS_ALLOWED),
         ];
-        assert!(is_trivial(&trivial), "ZFS's trivial ACL for 0644 not trivial");
+        assert!(
+            is_trivial(&trivial),
+            "ZFS's trivial ACL for 0644 not trivial"
+        );
 
         let mut named = vec![ace(60001, read, 0, ACCESS_ALLOWED)];
         named.extend(trivial.iter().cloned());
@@ -280,15 +301,24 @@ mod tests {
 
         let mut deny = vec![ace(10, read, IDENTIFIER_GROUP, ACCESS_DENIED)];
         deny.extend(trivial.iter().cloned());
-        assert!(!is_trivial(&deny), "ACL with a named group's deny entry is trivial");
+        assert!(
+            !is_trivial(&deny),
+            "ACL with a named group's deny entry is trivial"
+        );
 
         let mut inherit = trivial.clone();
         inherit[2].flags |= FILE_INHERIT;
-        assert!(!is_trivial(&inherit), "ACL with an inheritable entry is trivial");
+        assert!(
+            !is_trivial(&inherit),
+            "ACL with an inheritable entry is trivial"
+        );
 
         let mut write_acl = trivial;
         write_acl[2].mask |= WRITE_ACL;
-        assert!(!is_trivial(&write_acl), "everyone@ allowed write_acl is trivial");
+        assert!(
+            !is_trivial(&write_acl),
+            "everyone@ allowed write_acl is trivial"
+        );
     }
 
     #[test]
@@ -337,12 +367,18 @@ mod tests {
         );
         let json = serde_json::to_string(&entries).unwrap();
         assert_eq!(json, want);
-        assert_eq!(serde_json::from_str::<Vec<AceEntry>>(&json).unwrap(), entries);
+        assert_eq!(
+            serde_json::from_str::<Vec<AceEntry>>(&json).unwrap(),
+            entries
+        );
 
         // A reader without "sid" gets the numbers.
         let old: Vec<OldAceEntry> = serde_json::from_str(&json).unwrap();
         assert_eq!(old.len(), 4);
-        assert_eq!((old[1].who, old[1].flags), (2_147_483_651, IDENTIFIER_GROUP));
+        assert_eq!(
+            (old[1].who, old[1].flags),
+            (2_147_483_651, IDENTIFIER_GROUP)
+        );
 
         // Which entries get a SID: ephemeral ids, not owner@, group@ or
         // everyone@ (whose who is -1).
@@ -432,7 +468,9 @@ mod tests {
             match split_sid(s) {
                 None => Found::Refused,
                 Some((prefix, rid))
-                    if prefix.strip_prefix("S-").is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+                    if prefix
+                        .strip_prefix("S-")
+                        .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
                         && s == format!("{prefix}-{}", &s[prefix.len() + 1..])
                         && s[prefix.len() + 1..].parse() == Ok(rid) =>
                 {

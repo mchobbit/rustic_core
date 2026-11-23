@@ -238,7 +238,10 @@ fn left_out(unreadable: &Unreadable) -> io::Result<()> {
         .iter()
         .map(|(name, err)| format!("{}: {err}", shown(name)))
         .collect();
-    Err(io::Error::other(format!("{}; its others are kept", each.join("; "))))
+    Err(io::Error::other(format!(
+        "{}; its others are kept",
+        each.join("; ")
+    )))
 }
 
 /// Gives the file at `path` exactly the extended attributes `attrs`, as
@@ -269,11 +272,18 @@ fn apply(path: &Path, want: &BTreeMap<String, Attr>, xattrs: bool) -> io::Result
 
 /// The attributes are read by path in `fill_attributes`: no file opened for
 /// them here.
-pub(super) fn open_for_attrs(_path: &Path, _typ: &NodeType, _m: &std::fs::Metadata) -> Option<File> {
+pub(super) fn open_for_attrs(
+    _path: &Path,
+    _typ: &NodeType,
+    _m: &std::fs::Metadata,
+) -> Option<File> {
     None
 }
 
-#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature every system's module has"
+)]
 pub(super) fn file_flags(
     _path: &Path,
     _typ: &NodeType,
@@ -306,17 +316,26 @@ pub(super) fn fill_attributes(path: &Path, node: &mut Node, _f: Option<&File>) -
     left_out(&unreadable)
 }
 
-#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature every system's module has"
+)]
 pub(super) fn prepare_file_for_flags(_path: &Path, _flags: u32) -> io::Result<()> {
     Ok(())
 }
 
-#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature every system's module has"
+)]
 pub(super) fn prepare_dir_for_flags(_path: &Path, _flags: u32) -> io::Result<()> {
     Ok(())
 }
 
-#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature every system's module has"
+)]
 pub(super) fn restore_file_flags(
     _path: &Path,
     _typ: &NodeType,
@@ -359,36 +378,54 @@ pub(super) fn restore_attributes(path: &Path, node: &Node) -> io::Result<()> {
     }
 }
 
-#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature every system's module has"
+)]
 pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) -> io::Result<()> {
     Ok(())
 }
 
 /// No flags here keep a restore from changing a file.
-#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature every system's module has"
+)]
 pub(super) fn clear_restricting_flags(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature every system's module has"
+)]
 pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
 
-#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature every system's module has"
+)]
 pub(super) fn restore_acls(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
 
 /// A symlink's own permissions don't matter on Haiku.
-#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature every system's module has"
+)]
 pub(super) fn restore_symlink_mode(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
 
 /// Haiku's creation time (`st_crtim`) isn't kept.
 pub(super) fn restore_birthtime(_path: &Path, _node: &Node, _birth: Timestamp) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "birth times aren't restored on Haiku"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "birth times aren't restored on Haiku",
+    ))
 }
 
 /// Extended attributes have no metadata of their own here.
@@ -580,7 +617,10 @@ mod tests {
         assert!(left_out(&Vec::new()).is_ok());
         let unreadable = vec![
             (b"big".to_vec(), io::Error::other("no")),
-            (b"bad\xff".to_vec(), io::Error::other("its name isn't UTF-8")),
+            (
+                b"bad\xff".to_vec(),
+                io::Error::other("its name isn't UTF-8"),
+            ),
         ];
         assert_eq!(
             left_out(&unreadable).unwrap_err().to_string(),

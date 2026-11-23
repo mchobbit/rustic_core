@@ -216,9 +216,10 @@ fn sysattr_view(path: &Path, typ: &NodeType, write: bool) -> io::Result<File> {
         .open(path)
     {
         Ok(f) => (f, libc::O_XATTR | libc::O_CLOEXEC | rw),
-        Err(err) if matches!(typ, NodeType::File) && err.raw_os_error() == Some(libc::EACCES) => {
-            (attr_dir_unopened(path).map_err(|_| err)?, libc::O_CLOEXEC | rw)
-        }
+        Err(err) if matches!(typ, NodeType::File) && err.raw_os_error() == Some(libc::EACCES) => (
+            attr_dir_unopened(path).map_err(|_| err)?,
+            libc::O_CLOEXEC | rw,
+        ),
         Err(err) => return Err(err),
     };
     // SAFETY: the name is a C string.
@@ -266,11 +267,7 @@ fn parse_view<'a>(buf: &'a [u8], path: &Path) -> io::Result<View<'a>> {
 /// Opens the `SUNWattr_rw` view of a regular file or directory, for its
 /// system attributes and creation time. `None` for other types of file, and
 /// on a file system without them.
-pub(super) fn open_for_attrs(
-    path: &Path,
-    typ: &NodeType,
-    _m: &std::fs::Metadata,
-) -> Option<File> {
+pub(super) fn open_for_attrs(path: &Path, typ: &NodeType, _m: &std::fs::Metadata) -> Option<File> {
     if !matches!(typ, NodeType::File | NodeType::Dir) {
         return None;
     }
@@ -315,7 +312,9 @@ pub(super) fn fill_attributes(path: &Path, node: &mut Node, f: Option<&File>) ->
         let buf = read_view(f, path)?;
         let view = parse_view(&buf, path)?;
         if let Some(crtime) = view.crtime() {
-            node.meta.generic_attributes.set_timestamp(UNIX_BIRTHTIME, crtime);
+            node.meta
+                .generic_attributes
+                .set_timestamp(UNIX_BIRTHTIME, crtime);
         }
         Ok(())
     });
@@ -400,7 +399,10 @@ impl SidNamer {
         if LOST.swap(true, Ordering::Relaxed) {
             debug!("SIDs of {} not kept: {err}", path.display());
         } else {
-            warn!("{}: idmap offline: SID owners not kept: {err}", path.display());
+            warn!(
+                "{}: idmap offline: SID owners not kept: {err}",
+                path.display()
+            );
         }
     }
 }
@@ -447,8 +449,7 @@ const ZFS_IOC_FSSETXATTR: u32 = 0x8008_5820; // _IOWN('X', 32, 8)
 
 fn zfs_xattr(f: &File, request: u32, zx: &mut ZfsXattr) -> io::Result<()> {
     // SAFETY: both ioctls take a ZfsXattr.
-    check(unsafe { libc::ioctl(f.as_raw_fd(), request.cast_signed(), ptr::from_mut(zx)) })
-        .map(drop)
+    check(unsafe { libc::ioctl(f.as_raw_fd(), request.cast_signed(), ptr::from_mut(zx)) }).map(drop)
 }
 
 /// Opens the regular file or directory at `path`, of type `typ`, for its
@@ -465,7 +466,11 @@ fn open_for_project(path: &Path, typ: &NodeType, ino: Option<u64>) -> io::Result
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(path)?;
     let m = f.metadata()?;
-    let same_type = if matches!(typ, NodeType::Dir) { m.is_dir() } else { m.is_file() };
+    let same_type = if matches!(typ, NodeType::Dir) {
+        m.is_dir()
+    } else {
+        m.is_file()
+    };
     if !same_type || ino.is_some_and(|ino| ino != m.ino()) {
         return Ok(None);
     }
@@ -504,8 +509,16 @@ fn fill_zfs_project(path: &Path, node: &mut Node) {
 /// the file then loses the one it has ([`reset_zfs_project`]). In any other
 /// snapshot it is unknown, and the file keeps it.
 fn restore_zfs_project(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
-    let Some(p) = node.meta.generic_attributes.get::<ZfsProject>(ILLUMOS_ZFS_PROJECT) else {
-        return if known_bko { reset_zfs_project(path, &node.node_type) } else { Ok(()) };
+    let Some(p) = node
+        .meta
+        .generic_attributes
+        .get::<ZfsProject>(ILLUMOS_ZFS_PROJECT)
+    else {
+        return if known_bko {
+            reset_zfs_project(path, &node.node_type)
+        } else {
+            Ok(())
+        };
     };
     let p = p.map_err(io::Error::other)?;
     let Some(f) = open_for_project(path, &node.node_type, None)? else {
@@ -519,7 +532,8 @@ fn restore_zfs_project(path: &Path, node: &Node, known_bko: bool) -> io::Result<
         }
     };
     let mut zx = ZfsXattr::default();
-    zfs_xattr(&f, ZFS_IOC_FSGETXATTR, &mut zx).map_err(|err| error("ioctl get ZFS project", err))?;
+    zfs_xattr(&f, ZFS_IOC_FSGETXATTR, &mut zx)
+        .map_err(|err| error("ioctl get ZFS project", err))?;
     let mut want = ZfsXattr {
         xflags: p.xflags(zx.xflags),
         projid: p.id,
@@ -560,12 +574,18 @@ fn reset_zfs_project(path: &Path, typ: &NodeType) -> io::Result<()> {
         .map_err(|err| path_error("ioctl set ZFS project", path, &err))
 }
 
-#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature every system's module has"
+)]
 pub(super) fn prepare_file_for_flags(_path: &Path, _flags: u32) -> io::Result<()> {
     Ok(())
 }
 
-#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature every system's module has"
+)]
 pub(super) fn prepare_dir_for_flags(_path: &Path, _flags: u32) -> io::Result<()> {
     Ok(())
 }
@@ -591,7 +611,8 @@ pub(super) fn restore_file_flags(
     flags: u32,
     _xattrs: &[ExtendedAttribute],
 ) -> io::Result<()> {
-    let f = sysattr_view(path, typ, true).map_err(|err| path_error("open SUNWattr_rw", path, &err))?;
+    let f =
+        sysattr_view(path, typ, true).map_err(|err| path_error("open SUNWattr_rw", path, &err))?;
     let buf = read_view(&f, path)?;
     let view = parse_view(&buf, path)?;
     set_flags_best_effort(
@@ -637,7 +658,10 @@ fn reset_file_flags(path: &Path, typ: &NodeType) -> io::Result<()> {
     want.map_or(Ok(()), |want| restore_file_flags(path, typ, want, &[]))
 }
 
-#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature every system's module has"
+)]
 pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) -> io::Result<()> {
     Ok(())
 }
@@ -645,7 +669,10 @@ pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) 
 /// No flags keep a restore from changing a file here that it clears
 /// (illumos' immutable, appendonly and nounlink system attributes are left
 /// as they are: see BACKOTTER.md).
-#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature every system's module has"
+)]
 pub(super) fn clear_restricting_flags(_path: &Path) -> io::Result<()> {
     Ok(())
 }
@@ -680,8 +707,10 @@ pub(super) fn restore_owner(path: &Path, node: &Node) -> io::Result<()> {
     }
     let p = c_path(path)?;
     // SAFETY: p is a C string; an id of -1 is left as it is.
-    _ = check(unsafe { libc::lchown(p.as_ptr(), uid.unwrap_or(u32::MAX), gid.unwrap_or(u32::MAX)) })
-        .map_err(|err| path_error("lchown", path, &err))?;
+    _ = check(unsafe {
+        libc::lchown(p.as_ptr(), uid.unwrap_or(u32::MAX), gid.unwrap_or(u32::MAX))
+    })
+    .map_err(|err| path_error("lchown", path, &err))?;
     RestoreErrors::result(owner_unmapped.into_iter().chain(group_unmapped).collect())
 }
 
@@ -711,13 +740,19 @@ pub(super) fn restore_attributes(
     owners: bool,
 ) -> io::Result<()> {
     let xattr_meta = restore_xattr_meta(path, node, owners);
-    let has_mask = node.meta.generic_attributes.value(ILLUMOS_SYSTEM_ATTRIBUTES).is_some();
+    let has_mask = node
+        .meta
+        .generic_attributes
+        .value(ILLUMOS_SYSTEM_ATTRIBUTES)
+        .is_some();
     let flags = if known_bko && !has_mask {
         reset_file_flags(path, &node.node_type)
     } else {
         Ok(())
     };
-    restore_zfs_project(path, node, known_bko).and(xattr_meta).and(flags)
+    restore_zfs_project(path, node, known_bko)
+        .and(xattr_meta)
+        .and(flags)
 }
 
 /// Gives `of`, which has no ACL to restore, the trivial ACL of `mode` (a
@@ -737,7 +772,11 @@ fn strip_acl(of: AclOf<'_>, mode: u32, dir: bool) -> io::Result<()> {
             return Ok(());
         }
         Err(err) => {
-            return Err(path_error(&format!("{} ACE_GETACL", of.op()), of.path(), &err));
+            return Err(path_error(
+                &format!("{} ACE_GETACL", of.op()),
+                of.path(),
+                &err,
+            ));
         }
     };
     if entries.is_empty() || illumos_acl::is_trivial(&entries) {
@@ -767,7 +806,11 @@ pub(super) fn restore_acls(path: &Path, node: &Node, known_bko: bool) -> io::Res
     if node.is_symlink() {
         return Ok(());
     }
-    let Some(entries) = node.meta.generic_attributes.get::<Vec<AceEntry>>(ILLUMOS_ACL) else {
+    let Some(entries) = node
+        .meta
+        .generic_attributes
+        .get::<Vec<AceEntry>>(ILLUMOS_ACL)
+    else {
         if !known_bko {
             return Ok(());
         }
@@ -788,7 +831,10 @@ pub(super) fn restore_acls(path: &Path, node: &Node, known_bko: bool) -> io::Res
 }
 
 /// A symlink's own permissions don't matter on illumos.
-#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature every system's module has"
+)]
 pub(super) fn restore_symlink_mode(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
@@ -953,7 +999,9 @@ fn node_name(name: &CStr) -> String {
 fn open_attr(dir: &File, name: &CStr, how: libc::c_int) -> io::Result<File> {
     let mode: libc::c_uint = 0o600;
     // SAFETY: name is a C string.
-    let fd = check(unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), how | libc::O_CLOEXEC, mode) })?;
+    let fd = check(unsafe {
+        libc::openat(dir.as_raw_fd(), name.as_ptr(), how | libc::O_CLOEXEC, mode)
+    })?;
     // SAFETY: fd is a new file descriptor, owned by nothing else.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
@@ -1046,7 +1094,10 @@ pub(super) fn set_xattrs(path: &Path, attrs: &[ExtendedAttribute]) -> Result<(),
         // Each one named, as those that can't be set are.
         let mut errors = XattrErrors::default();
         for attr in attrs {
-            errors.push(attr.name.as_str(), io::Error::new(io::ErrorKind::Unsupported, why));
+            errors.push(
+                attr.name.as_str(),
+                io::Error::new(io::ErrorKind::Unsupported, why),
+            );
         }
         return errors.into_result();
     };
@@ -1056,7 +1107,8 @@ pub(super) fn set_xattrs(path: &Path, attrs: &[ExtendedAttribute]) -> Result<(),
             for name in &names {
                 if !attrs.iter().any(|a| a.name.as_bytes() == name.to_bytes()) {
                     // SAFETY: name is a C string.
-                    let removed = check(unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) });
+                    let removed =
+                        check(unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) });
                     if let Err(err) = removed {
                         errors.push(format!("removing {}", node_name(name)), err);
                     }
@@ -1144,7 +1196,12 @@ fn read_xattr_meta(dir: &File, path: &Path, name: &CStr, sids: &mut SidNamer) ->
     let mut st = MaybeUninit::<libc::stat>::uninit();
     // SAFETY: name is a C string, st a stat buffer.
     let r = unsafe {
-        libc::fstatat(dir.as_raw_fd(), name.as_ptr(), st.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
     };
     if let Err(err) = check(r) {
         debug!("fstatat {}: {err}", at.display());
@@ -1158,7 +1215,11 @@ fn read_xattr_meta(dir: &File, path: &Path, name: &CStr, sids: &mut SidNamer) ->
     let time = |sec, nsec| Timestamp::new(sec, i32::try_from(nsec).ok()?).ok();
     // An owner or group that is a SID, as the file's own
     // ([`SidNamer::owner`]).
-    let mut sid = |id: u32, group| (id > illumos_acl::MAX_UID).then(|| sids.sid(id, group)).flatten();
+    let mut sid = |id: u32, group| {
+        (id > illumos_acl::MAX_UID)
+            .then(|| sids.sid(id, group))
+            .flatten()
+    };
     let (owner_sid, group_sid) = (sid(st.st_uid, false), sid(st.st_gid, true));
     let mut meta = XattrMeta {
         uid: st.st_uid,
@@ -1216,7 +1277,12 @@ fn restore_xattr_meta(path: &Path, node: &Node, owners: bool) -> io::Result<()> 
     };
     let (mut failed, mut unmapped) = (None, None);
     for (name, meta) in &metas {
-        if !node.meta.extended_attributes.iter().any(|a| a.name == *name) {
+        if !node
+            .meta
+            .extended_attributes
+            .iter()
+            .any(|a| a.name == *name)
+        {
             continue;
         }
         let owner = file_now.map(|now| {
@@ -1275,7 +1341,10 @@ fn restore_one_xattr_meta(
         None => Ok(()),
         Some(Err(err)) if gone(&err) => return Ok(()),
         Some(Err(err)) if !is_root() && permission_refused(&err) => {
-            debug!("not running as root, owner of {} not set: {err}", at.display());
+            debug!(
+                "not running as root, owner of {} not set: {err}",
+                at.display()
+            );
             Ok(())
         }
         Some(r) => r.map(drop).map_err(|err| path_error("fchownat", &at, &err)),
@@ -1460,13 +1529,22 @@ mod tests {
         let made = open_attr(&adir, raw, libc::O_WRONLY | libc::O_CREAT)
             .and_then(|mut f| f.write_all(b"latin-1"));
         if let Err(err) = made {
-            eprintln!("no attribute names that aren't UTF-8 in {}: {err}", dir.path().display());
+            eprintln!(
+                "no attribute names that aren't UTF-8 in {}: {err}",
+                dir.path().display()
+            );
             return;
         }
-        assert_eq!(attr_names(&adir).unwrap(), [raw.to_owned(), c"plain".to_owned()]);
+        assert_eq!(
+            attr_names(&adir).unwrap(),
+            [raw.to_owned(), c"plain".to_owned()]
+        );
         let read = xattrs_read(&file).unwrap();
         assert!(read.unreadable.is_empty(), "{:?}", read.unreadable);
-        assert_eq!(read.attrs, [xattr("caf\u{fffd}", b"latin-1"), xattr("plain", b"p")]);
+        assert_eq!(
+            read.attrs,
+            [xattr("caf\u{fffd}", b"latin-1"), xattr("plain", b"p")]
+        );
         let mut node = file_node(0o644, 0, 0);
         fill_xattr_meta(&file, &mut node);
         let metas = node
@@ -1480,7 +1558,10 @@ mod tests {
         // A restore of that node: the file has the attribute under the name
         // the node holds, and no longer the one it can't hold.
         set_xattrs(&file, &read.attrs).unwrap();
-        assert_eq!(attr_names(&adir).unwrap(), [c"caf\u{fffd}".to_owned(), c"plain".to_owned()]);
+        assert_eq!(
+            attr_names(&adir).unwrap(),
+            [c"caf\u{fffd}".to_owned(), c"plain".to_owned()]
+        );
         assert_eq!(xattrs_read(&file).unwrap().attrs, read.attrs);
 
         // And one the node hasn't got at all is removed.
@@ -1503,10 +1584,16 @@ mod tests {
             return;
         }
         let adir = attr_dir(&file).unwrap().unwrap();
-        for (name, size) in [(c"at-most", NATIVE_XATTR_MAX), (c"too-large", NATIVE_XATTR_MAX + 1)] {
+        for (name, size) in [
+            (c"at-most", NATIVE_XATTR_MAX),
+            (c"too-large", NATIVE_XATTR_MAX + 1),
+        ] {
             let f = open_attr(&adir, name, libc::O_WRONLY | libc::O_CREAT).unwrap();
             if let Err(err) = f.set_len(size) {
-                eprintln!("no attribute of {size} bytes in {}: {err}", dir.path().display());
+                eprintln!(
+                    "no attribute of {size} bytes in {}: {err}",
+                    dir.path().display()
+                );
                 return;
             }
         }
@@ -1518,14 +1605,19 @@ mod tests {
         let (name, err) = &read.unreadable[0];
         assert_eq!(name, "too-large");
         assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
-        assert_eq!(err.to_string(), "too large to keep (16777217 bytes, over 16777216)");
+        assert_eq!(
+            err.to_string(),
+            "too large to keep (16777217 bytes, over 16777216)"
+        );
     }
 
     /// The system attributes a backup would keep for `path`, and its ZFS
     /// project.
     fn kept_now(path: &Path, typ: &NodeType) -> (Option<u32>, Option<ZfsProject>) {
         let f = sysattr_view(path, typ, false).unwrap();
-        let mask = parse_view(&read_view(&f, path).unwrap(), path).unwrap().kept_mask();
+        let mask = parse_view(&read_view(&f, path).unwrap(), path)
+            .unwrap()
+            .kept_mask();
         let mut zx = ZfsXattr::default();
         let f = open_for_project(path, typ, None).unwrap().unwrap();
         zfs_xattr(&f, ZFS_IOC_FSGETXATTR, &mut zx).unwrap();
@@ -1554,7 +1646,11 @@ mod tests {
         }
         let (hidden, nodump, archive) = (1 << 0, 1 << 7, 1 << 3);
         let node = |typ: NodeType| {
-            Node::new_node(std::ffi::OsStr::new("n"), typ, crate::backend::node::Metadata::default())
+            Node::new_node(
+                std::ffi::OsStr::new("n"),
+                typ,
+                crate::backend::node::Metadata::default(),
+            )
         };
         for (path, typ, inherit) in [(&file, NodeType::File, false), (&sub, NodeType::Dir, true)] {
             assert_eq!(kept_now(path, &typ), (None, None), "{}", path.display());
@@ -1589,9 +1685,15 @@ mod tests {
             // A node with a mask: the late flags pass's, not reset here.
             set();
             let mut with_mask = node(typ.clone());
-            with_mask.meta.generic_attributes.set_u64(ILLUMOS_SYSTEM_ATTRIBUTES, hidden.into());
+            with_mask
+                .meta
+                .generic_attributes
+                .set_u64(ILLUMOS_SYSTEM_ATTRIBUTES, hidden.into());
             restore_attributes(path, &with_mask, true, true).unwrap();
-            assert_eq!(kept_now(path, &typ), (Some(hidden | nodump | archive), None));
+            assert_eq!(
+                kept_now(path, &typ),
+                (Some(hidden | nodump | archive), None)
+            );
             restore_attributes(path, &node(typ.clone()), true, true).unwrap();
         }
 
@@ -1618,7 +1720,8 @@ mod tests {
         set_xattrs(&link, &[]).unwrap();
         let err = set_xattrs(&link, &[xattr("security.selinux", b"x")]).unwrap_err();
         assert!(
-            err.to_string().contains("no extended attributes are kept for this type of file"),
+            err.to_string()
+                .contains("no extended attributes are kept for this type of file"),
             "{err}"
         );
         assert!(!err.counts(true), "{err}");
@@ -1654,7 +1757,10 @@ mod tests {
         std::fs::write(&file, b"").unwrap();
         let attrs = [xattr("mine", b"m"), xattr("other", b"o")];
         if !is_root() || set_xattrs(&file, &attrs).is_err() {
-            eprintln!("not root, or no extended attributes in {}", dir.path().display());
+            eprintln!(
+                "not root, or no extended attributes in {}",
+                dir.path().display()
+            );
             return;
         }
         let t = Timestamp::new(1_000_000_000, 0).unwrap();
@@ -1673,7 +1779,10 @@ mod tests {
             ("mine".to_string(), meta(1001, 1001)),
             ("other".to_string(), meta(1002, 1001)),
         ]);
-        node.meta.generic_attributes.set(ILLUMOS_XATTR_META, &metas).unwrap();
+        node.meta
+            .generic_attributes
+            .set(ILLUMOS_XATTR_META, &metas)
+            .unwrap();
         let mode = |name: &str| {
             let adir = attr_dir(&file).unwrap().unwrap();
             open_named(&adir, name).metadata().unwrap().mode() & 0o7777
@@ -1706,7 +1815,10 @@ mod tests {
     /// `SidUnmapped` error. As root, with idmap online.
     #[test]
     fn xattr_meta_sid_owners() {
-        let (owner, group) = ("S-1-5-21-1111-2222-3333-1017", "S-1-5-21-1111-2222-3333-518");
+        let (owner, group) = (
+            "S-1-5-21-1111-2222-3333-1017",
+            "S-1-5-21-1111-2222-3333-518",
+        );
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("f");
         std::fs::write(&file, b"").unwrap();
@@ -1743,7 +1855,10 @@ mod tests {
 
         // After a reboot the numbers are someone else's: the SIDs decide.
         (meta.uid, meta.gid) = (uid + 1000, gid + 1000);
-        node.meta.generic_attributes.set(ILLUMOS_XATTR_META, &metas).unwrap();
+        node.meta
+            .generic_attributes
+            .set(ILLUMOS_XATTR_META, &metas)
+            .unwrap();
         chown(0, 0);
         restore_xattr_meta(&file, &node, true).unwrap();
         assert_eq!(attr_owner(&file, "stream"), (uid, gid));
@@ -1755,7 +1870,10 @@ mod tests {
 
         // A SID idmap can't map: nobody, never the number, and a warning.
         metas.get_mut("stream").unwrap().owner_sid = Some("S-1-5-21-x".to_string());
-        node.meta.generic_attributes.set(ILLUMOS_XATTR_META, &metas).unwrap();
+        node.meta
+            .generic_attributes
+            .set(ILLUMOS_XATTR_META, &metas)
+            .unwrap();
         let err = restore_xattr_meta(&file, &node, true).unwrap_err();
         let unmapped = err.get_ref().and_then(|e| e.downcast_ref::<SidUnmapped>());
         assert!(unmapped.is_some(), "{err}");
@@ -1786,7 +1904,9 @@ mod tests {
             eprintln!("no NFSv4 ACLs in {}", dir.path().display());
             return;
         }
-        for mode in [0o644, 0o600, 0o640, 0o755, 0o604, 0o046, 0o077, 0o206, 0o000, 0o777, 0o4755] {
+        for mode in [
+            0o644, 0o600, 0o640, 0o755, 0o604, 0o046, 0o077, 0o206, 0o000, 0o777, 0o4755,
+        ] {
             for (path, is_dir) in [(&file, false), (&sub, true)] {
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
                 assert_eq!(
@@ -1818,15 +1938,22 @@ mod tests {
         };
         acl.insert(0, nobody_reads());
         set_ace(AclOf::Path(&file), &acl).unwrap();
-        assert!(!illumos_acl::is_trivial(&get_ace(AclOf::Path(&file)).unwrap()));
+        assert!(!illumos_acl::is_trivial(
+            &get_ace(AclOf::Path(&file)).unwrap()
+        ));
         let node = file_node(0o104_750, 0, 0);
 
         // Not BackOtter's snapshot: unknown, left.
         restore_acls(&file, &node, false).unwrap();
-        assert!(!illumos_acl::is_trivial(&get_ace(AclOf::Path(&file)).unwrap()));
+        assert!(!illumos_acl::is_trivial(
+            &get_ace(AclOf::Path(&file)).unwrap()
+        ));
 
         restore_acls(&file, &node, true).unwrap();
-        assert_eq!(get_ace(AclOf::Path(&file)).unwrap(), illumos_acl::trivial(0o750, false));
+        assert_eq!(
+            get_ace(AclOf::Path(&file)).unwrap(),
+            illumos_acl::trivial(0o750, false)
+        );
         assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o7777, 0o4750);
 
         // A node without a mode: the file's own.
@@ -1834,7 +1961,9 @@ mod tests {
         let mut no_mode = node;
         no_mode.meta.mode = None;
         restore_acls(&file, &no_mode, true).unwrap();
-        assert!(illumos_acl::is_trivial(&get_ace(AclOf::Path(&file)).unwrap()));
+        assert!(illumos_acl::is_trivial(
+            &get_ace(AclOf::Path(&file)).unwrap()
+        ));
 
         // A symlink has no ACL of its own: its target's is left.
         set_ace(AclOf::Path(&file), &acl).unwrap();
@@ -1849,7 +1978,9 @@ mod tests {
             crate::backend::node::Metadata::default(),
         );
         restore_acls(&link, &link_node, true).unwrap();
-        assert!(!illumos_acl::is_trivial(&get_ace(AclOf::Path(&file)).unwrap()));
+        assert!(!illumos_acl::is_trivial(
+            &get_ace(AclOf::Path(&file)).unwrap()
+        ));
     }
 
     /// ForkAudit1 G5-02: an attribute file whose metadata has no ACL loses
@@ -1861,7 +1992,10 @@ mod tests {
         std::fs::write(&file, b"").unwrap();
         let attrs = [xattr("note", b"n")];
         if get_ace(AclOf::Path(&file)).is_err() || set_xattrs(&file, &attrs).is_err() {
-            eprintln!("no NFSv4 ACLs or extended attributes in {}", dir.path().display());
+            eprintln!(
+                "no NFSv4 ACLs or extended attributes in {}",
+                dir.path().display()
+            );
             return;
         }
         let adir = attr_dir(&file).unwrap().unwrap();
@@ -1880,9 +2014,15 @@ mod tests {
         let mut node = file_node(0o644, 0, 0);
         node.meta.extended_attributes = attrs.to_vec();
         let metas = BTreeMap::from([("note".to_string(), meta)]);
-        node.meta.generic_attributes.set(ILLUMOS_XATTR_META, &metas).unwrap();
+        node.meta
+            .generic_attributes
+            .set(ILLUMOS_XATTR_META, &metas)
+            .unwrap();
         restore_xattr_meta(&file, &node, false).unwrap();
-        assert_eq!(get_ace(AclOf::File(&attr_file, &at)).unwrap(), illumos_acl::trivial(0o600, false));
+        assert_eq!(
+            get_ace(AclOf::File(&attr_file, &at)).unwrap(),
+            illumos_acl::trivial(0o600, false)
+        );
         assert_eq!(attr_file.metadata().unwrap().mode() & 0o7777, 0o600);
     }
 }

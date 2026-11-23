@@ -64,12 +64,18 @@ fn truncated(pos: usize) -> io::Error {
 
 /// The big-endian `u32` at `pos` in `buf`, if `buf` has its 4 bytes.
 fn be32(buf: &[u8], pos: usize) -> Option<u32> {
-    buf.get(pos..)?.first_chunk().copied().map(u32::from_be_bytes)
+    buf.get(pos..)?
+        .first_chunk()
+        .copied()
+        .map(u32::from_be_bytes)
 }
 
 /// The big-endian `u64` at `pos` in `buf`, if `buf` has its 8 bytes.
 fn be64(buf: &[u8], pos: usize) -> Option<u64> {
-    buf.get(pos..)?.first_chunk().copied().map(u64::from_be_bytes)
+    buf.get(pos..)?
+        .first_chunk()
+        .copied()
+        .map(u64::from_be_bytes)
 }
 
 fn usize32(buf: &[u8], pos: usize) -> io::Result<usize> {
@@ -116,7 +122,9 @@ impl<'a> View<'a> {
                 return Ok(Self(values)); // the end
             }
             if encoded_size < 8 || start.saturating_add(encoded_size) > buf.len() {
-                return Err(invalid(format!("nvpair at {start} has size {encoded_size}")));
+                return Err(invalid(format!(
+                    "nvpair at {start} has size {encoded_size}"
+                )));
             }
             let end = start + encoded_size;
             pos += 8;
@@ -216,7 +224,10 @@ impl<'a> View<'a> {
 pub(super) fn crtime_nvlist(t: Timestamp) -> Vec<u8> {
     let (sec, nsec) = super::unix_time(t);
     // Two's complement, as the kernel's time_t.
-    encode(&[("crtime", Nv::Uint64Array(vec![sec.cast_unsigned(), nsec.into()]))])
+    encode(&[(
+        "crtime",
+        Nv::Uint64Array(vec![sec.cast_unsigned(), nsec.into()]),
+    )])
 }
 
 /// A value to encode in an nvlist.
@@ -416,7 +427,10 @@ mod tests {
         assert_eq!(written.0.len(), view.0.len());
         assert_eq!(written.crtime(), None);
 
-        assert!(View::parse(&[0, 1, 0, 0]).is_err(), "a native-encoded nvlist was accepted");
+        assert!(
+            View::parse(&[0, 1, 0, 0]).is_err(),
+            "a native-encoded nvlist was accepted"
+        );
     }
 
     #[test]
@@ -455,9 +469,16 @@ mod tests {
         let plain = View::parse(&plain).unwrap();
         // A new file: nothing to do.
         assert_eq!(plain.reset_mask(left), None);
-        let reset = |mask: u32| View::parse(&plain.mask_nvlist(mask)).unwrap().reset_mask(left);
+        let reset = |mask: u32| {
+            View::parse(&plain.mask_nvlist(mask))
+                .unwrap()
+                .reset_mask(left)
+        };
         // hidden, nodump and readonly set since: cleared.
-        assert_eq!(reset(AUTOMATIC | bit("hidden") | bit("nodump") | bit("readonly")), Some(AUTOMATIC));
+        assert_eq!(
+            reset(AUTOMATIC | bit("hidden") | bit("nodump") | bit("readonly")),
+            Some(AUTOMATIC)
+        );
         // The automatic ones cleared since: set again.
         assert_eq!(reset(bit("archive")), Some(AUTOMATIC));
         assert_eq!(reset(0), Some(AUTOMATIC));
@@ -466,7 +487,10 @@ mod tests {
         let stays = bit("immutable") | bit("appendonly") | bit("nounlink") | AV_QUARANTINED;
         assert_eq!(stays, left);
         assert_eq!(reset(AUTOMATIC | stays), None);
-        assert_eq!(reset(AUTOMATIC | stays | bit("hidden")), Some(AUTOMATIC | stays));
+        assert_eq!(
+            reset(AUTOMATIC | stays | bit("hidden")),
+            Some(AUTOMATIC | stays)
+        );
         // What the file is reset to keeps nothing at the next backup.
         let after = plain.mask_nvlist(AUTOMATIC);
         assert_eq!(View::parse(&after).unwrap().kept_mask(), None);
@@ -489,7 +513,10 @@ mod tests {
                 NVLIST_CRTIME,
             ),
             (
-                vec![("hidden", Nv::Boolean(true)), ("immutable", Nv::Boolean(false))],
+                vec![
+                    ("hidden", Nv::Boolean(true)),
+                    ("immutable", Nv::Boolean(false)),
+                ],
                 NVLIST_HIDDEN,
             ),
             (vec![("ownersid", Nv::Nvlist(sid))], NVLIST_OWNER_SID),
@@ -521,7 +548,10 @@ mod tests {
         let buf = unhex(SUNWATTR_SID);
         let view = View::parse(&buf).unwrap();
         assert_eq!(view.0["groupsid"].typ, DATA_TYPE_NVLIST);
-        assert!(!view.0.contains_key("domain"), "a nested pair was read at the top");
+        assert!(
+            !view.0.contains_key("domain"),
+            "a nested pair was read at the top"
+        );
         assert_eq!(view.0.len(), 15);
 
         let buf = unhex(NVLIST_HIDDEN);
@@ -566,7 +596,9 @@ mod tests {
                     let after = view.mask_nvlist(reset);
                     match View::parse(&after).map(|v| v.reset_mask(AV_QUARANTINED | RESTRICTING)) {
                         Ok(None) => {}
-                        other => return Found::Wrong(format!("reset to {reset:#x}, then {other:?}")),
+                        other => {
+                            return Found::Wrong(format!("reset to {reset:#x}, then {other:?}"));
+                        }
                     }
                 }
                 let have = BITS
