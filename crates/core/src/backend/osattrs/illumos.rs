@@ -235,7 +235,12 @@ fn attr_dir_unopened(path: &Path) -> io::Result<File> {
     // SAFETY: p is a C string.
     let fd = check(unsafe { openattrdirat(libc::AT_FDCWD, p.as_ptr()) })?;
     // SAFETY: fd is a new file descriptor, owned by nothing else.
-    Ok(unsafe { File::from_raw_fd(fd) })
+    let dir = unsafe { File::from_raw_fd(fd) };
+    // __openattrdirat takes no flags, so the descriptor is made
+    // close-on-exec here, as std makes every other one.
+    // SAFETY: dir is an open descriptor.
+    _ = check(unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) })?;
+    Ok(dir)
 }
 
 /// The whole of the view `f`, in one read: illumos packs the view afresh
@@ -826,9 +831,10 @@ fn readdir_step<T>(read: impl FnOnce() -> Option<T>) -> io::Result<Option<T>> {
 /// their bytes, by which an attribute is opened and removed whatever they
 /// are. A node holds a name as UTF-8 ([`node_name`]).
 fn attr_names(dir: &File) -> io::Result<Vec<CString>> {
-    // fdopendir(3C) takes over the descriptor it's given: give it its own.
+    // fdopendir(3C) takes over the descriptor it's given: give it its own,
+    // close-on-exec as dir is.
     // SAFETY: dir is an open descriptor.
-    let fd = check(unsafe { libc::dup(dir.as_raw_fd()) })?;
+    let fd = check(unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) })?;
     // The duplicate shares dir's offset: back to the start, wherever an
     // earlier listing of dir left it (the end). Before fdopendir(3C), not
     // rewinddir(3C) after it, which on illumos looks at the new DIR's
