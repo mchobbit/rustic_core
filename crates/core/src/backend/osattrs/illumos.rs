@@ -32,14 +32,14 @@ use jiff::Timestamp;
 use log::{debug, warn};
 
 use super::{
-    RestoreErrors, SidUnmapped, Unsupported, XattrErrors, XattrsRead, acl_set_error, c_path,
-    check,
+    NATIVE_XATTR_MAX, RestoreErrors, SidUnmapped, Unsupported, XattrErrors, XattrsRead,
+    acl_set_error, c_path, check,
     illumos_acl::{self, AceEntry, NOBODY},
     illumos_idmap,
     illumos_project::ZfsProject,
     illumos_sysattr::{self, View},
     illumos_xattrmeta::{SYSTEM_VIEWS, XattrMeta, attr_name_refused, restored_owner},
-    is_root, path_error, permission_refused, set_flags_best_effort, unix_time,
+    is_root, path_error, permission_refused, set_flags_best_effort, unix_time, xattr_too_large,
 };
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType,
@@ -837,10 +837,21 @@ pub(super) fn xattrs_read(path: &Path) -> io::Result<XattrsRead> {
 }
 
 /// The value of the extended attribute `name` in `dir`, an attribute
-/// directory.
+/// directory. An attribute is a file of any size: one over
+/// [`NATIVE_XATTR_MAX`] is an error ([`xattr_too_large`]), by its size
+/// before any of it is read, or once it has grown past that as it is read.
 fn attr_value(dir: &File, name: &CStr) -> io::Result<Vec<u8>> {
+    let f = open_attr(dir, name, libc::O_RDONLY)?;
+    let size = f.metadata()?.len();
+    if size > NATIVE_XATTR_MAX {
+        return Err(xattr_too_large(size));
+    }
     let mut value = Vec::new();
-    _ = open_attr(dir, name, libc::O_RDONLY)?.read_to_end(&mut value)?;
+    _ = f.take(NATIVE_XATTR_MAX + 1).read_to_end(&mut value)?;
+    let read = value.len() as u64;
+    if read > NATIVE_XATTR_MAX {
+        return Err(xattr_too_large(read));
+    }
     Ok(value)
 }
 
@@ -1315,6 +1326,38 @@ mod tests {
         drop(open_attr(&adir, raw, libc::O_WRONLY | libc::O_CREAT).unwrap());
         set_xattrs(&file, &[]).unwrap();
         assert_eq!(attr_names(&adir).unwrap(), Vec::<CString>::new());
+    }
+
+    /// ForkAudit1 G5-07 (RustAudit1 R4-06): an attribute over
+    /// `NATIVE_XATTR_MAX` is left out by its size, unread, and named in
+    /// `unreadable`; one of just that size and the file's others are kept.
+    /// Before, any size was read whole into memory. The big ones are sparse.
+    #[test]
+    fn an_attribute_too_large_is_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"").unwrap();
+        if set_xattrs(&file, &[xattr("small", b"s")]).is_err() {
+            eprintln!("no extended attributes in {}", dir.path().display());
+            return;
+        }
+        let adir = attr_dir(&file).unwrap().unwrap();
+        for (name, size) in [(c"at-most", NATIVE_XATTR_MAX), (c"too-large", NATIVE_XATTR_MAX + 1)] {
+            let f = open_attr(&adir, name, libc::O_WRONLY | libc::O_CREAT).unwrap();
+            if let Err(err) = f.set_len(size) {
+                eprintln!("no attribute of {size} bytes in {}: {err}", dir.path().display());
+                return;
+            }
+        }
+        let read = xattrs_read(&file).unwrap();
+        let names: Vec<_> = read.attrs.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["at-most", "small"]);
+        assert_eq!(read.attrs[0].value.as_ref().map(Vec::len), Some(16 << 20));
+        assert_eq!(read.unreadable.len(), 1);
+        let (name, err) = &read.unreadable[0];
+        assert_eq!(name, "too-large");
+        assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(err.to_string(), "too large to keep (16777217 bytes, over 16777216)");
     }
 
     /// The node of a file with the mode `mode`, owned by `uid`:`gid`.

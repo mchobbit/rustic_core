@@ -1111,6 +1111,29 @@ pub(crate) struct XattrsRead {
     pub(crate) unreadable: Vec<(String, io::Error)>,
 }
 
+/// BackOtter: the largest extended attribute a backup keeps where one is a
+/// file of any size: an illumos named attribute (`runat(1)`, an SMB
+/// alternate data stream) and a BFS attribute in an inode of its own. 16
+/// MiB, twice the largest data blob. A node holds its attributes' values
+/// inline, base64-encoded in its tree's JSON, and the backup reads each
+/// whole into memory: a larger one is left out with a warning, counted as
+/// any attribute that couldn't be read, and the file's others are kept.
+/// Linux's are 64 KiB at most, and the BSDs' are read whole.
+pub(crate) const NATIVE_XATTR_MAX: u64 = 16 << 20;
+
+/// BackOtter: the error for an extended attribute of `size` bytes, over
+/// [`NATIVE_XATTR_MAX`].
+#[cfg_attr(
+    not(any(test, target_os = "illumos", target_os = "haiku")),
+    allow(dead_code)
+)]
+pub(crate) fn xattr_too_large(size: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::FileTooLarge,
+        format!("too large to keep ({size} bytes, over {NATIVE_XATTR_MAX})"),
+    )
+}
+
 impl From<Vec<ExtendedAttribute>> for XattrsRead {
     fn from(attrs: Vec<ExtendedAttribute>) -> Self {
         Self {
