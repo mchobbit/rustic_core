@@ -139,8 +139,11 @@ pub fn try_short_path(path: &Path) -> io::Result<Cow<'_, Path>> {
 /// and inode, so however `path` spells it (relative, or through a symbolic
 /// link). For a walk of a tree that holds the temporary directory: it is no
 /// part of the tree, so a backup leaves it out and a restore leaves it
-/// alone (ForkAudit1 G7-01, G7-02). Never true elsewhere than on Linux and
-/// Android, where there is none.
+/// alone (ForkAudit1 G7-01, G7-02). A walk with `contents_first` gives its
+/// links before it, so there each entry's directories are asked too, and
+/// `filter_entry` is of no use (it holds back the directory alone, and
+/// skips the rest of the directory above it). Never true elsewhere than on
+/// Linux and Android, where there is none.
 #[must_use]
 pub fn is_short_path_dir(path: &Path) -> bool {
     #[cfg(any(target_os = "linux", target_os = "android"))]

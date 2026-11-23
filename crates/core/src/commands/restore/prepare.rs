@@ -414,6 +414,15 @@ fn remove_unexpected(
     {
         return Ok(());
     }
+    // This process's own links' directory, an entry of a directory that is
+    // such a target (the plan's walk hands none in): it stays, as there.
+    if is_dir && walkdir::is_short_path_dir(path) {
+        debug!(
+            "{} left: this process's links to paths past PATH_MAX",
+            path.display()
+        );
+        return Ok(());
+    }
     let Some(target) = aliases.target_of(path) else {
         // Only a directory an entry goes from changes: one left as it is
         // keeps its flags and change time (DirChanges).
@@ -447,11 +456,32 @@ fn remove_unexpected(
     first.map_or(Ok(()), Err)
 }
 
+/// BackOtter: whether `entry` of a walk is this process's own links'
+/// directory (paths past `PATH_MAX`: `walkdir::is_short_path_dir`) or
+/// below it, by the entry and each directory above it in the walk: no
+/// system call for an entry whose path has no such name in it.
+fn in_links_dir(entry: &DirEntry) -> bool {
+    entry
+        .path()
+        .ancestors()
+        .take(entry.depth() + 1)
+        .any(walkdir::is_short_path_dir)
+}
+
 /// BackOtter: removes the directory `dir` and all below it, which `--delete`
 /// removes, each file as [`remove_extra`] does, one at a time, and past
 /// what it can't remove: the error then says what failed first, and how
 /// much was and wasn't removed. As in BackOtter's restic, which reports what
 /// a partial removal deleted.
+///
+/// All but this process's own links' directory and its links, there when
+/// `$TMPDIR` is in `dir`: they stay, not counted, and so do the directories
+/// above them, each an error ("Directory not empty"), as is `dir` if it is
+/// the links' directory itself. Each entry is asked ([`in_links_dir`]), as
+/// the walk gives a directory after its contents: walkdir's `filter_entry`
+/// then held back the directory alone, its links removed before it, and
+/// skipped what the walk had left of the directory above it, neither
+/// removed nor counted (ForkAudit1 G7-01).
 ///
 /// # Errors
 ///
@@ -459,16 +489,16 @@ fn remove_unexpected(
 fn remove_tree(dir: &Path, replaced: &Replaced) -> std::io::Result<()> {
     let (mut removed, mut failed) = (0_u64, 0_u64);
     let mut first = None;
-    // BackOtter: all but this process's own links' directory (paths past
-    // PATH_MAX), there when $TMPDIR is in `dir`: it stays, and so do the
-    // directories above it, each an error (ForkAudit1 G7-01).
-    let entries = WalkDir::new(dir)
-        .follow_links(false)
-        .contents_first(true)
-        .into_iter();
-    for entry in entries.filter_entry(|e| !walkdir::is_short_path_dir(e.path())) {
+    for entry in WalkDir::new(dir).follow_links(false).contents_first(true) {
+        let own = entry.as_ref().is_ok_and(in_links_dir);
+        if own && entry.as_ref().is_ok_and(|entry| entry.depth() > 0) {
+            continue;
+        }
         let result = match &entry {
             Err(err) => Err(std::io::Error::other(err.to_string())),
+            Ok(_) if own => Err(std::io::Error::other(
+                "this process's links to paths past PATH_MAX are in it",
+            )),
             Ok(entry) if entry.file_type().is_dir() => {
                 std::fs::remove_dir(walkdir::short_path(entry.path()))
             }
@@ -1418,5 +1448,163 @@ mod tests {
         let msg = removed.unwrap_err().to_string();
         assert!(msg.contains(&*held.join("f").to_string_lossy()), "{msg}");
         assert!(!msg.contains(".bko-longpath"), "{msg}");
+    }
+
+    /// In the child process, the directory its parent made for it, whose
+    /// `extra/tmp` is its `$TMPDIR`. In the parent, `None`, after it ran the
+    /// test `name` of this module again, alone in such a child process, and
+    /// checked that it ran and passed: a process decides where its links
+    /// are once, and other tests of this binary shorten paths too.
+    #[cfg(target_os = "linux")]
+    fn in_child_with_tmpdir(name: &str) -> Option<PathBuf> {
+        const BASE: &str = "BKO_PREPARE_TEST_BASE";
+
+        if let Some(base) = std::env::var_os(BASE) {
+            return Some(PathBuf::from(base));
+        }
+        let base = tempfile::tempdir().unwrap();
+        let base_path = std::fs::canonicalize(base.path()).unwrap();
+        let tmp = base_path.join("extra/tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let child_test = format!("commands::restore::prepare::tests::{name}");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &child_test, "--nocapture", "--test-threads=1"])
+            .env(BASE, &base_path)
+            .env("TMPDIR", &tmp)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{text}");
+        assert!(text.contains("test result: ok. 1 passed"), "{text}");
+        None
+    }
+
+    /// The names in `dir`, in the order a walk of it gives them.
+    #[cfg(target_os = "linux")]
+    fn listed(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The entries of `dir`, sorted: each one's name, inode and change
+    /// time, which an entry removed and made again hasn't kept.
+    #[cfg(target_os = "linux")]
+    fn entries_of(dir: &Path) -> Vec<(String, u64, i64, i64)> {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut entries: Vec<_> = listed(dir)
+            .into_iter()
+            .map(|name| {
+                let m = std::fs::symlink_metadata(dir.join(&name)).unwrap();
+                (name, m.ino(), m.ctime(), m.ctime_nsec())
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// BackOtter (ForkAudit1 G7-01): `--delete`'s removal of a directory
+    /// that holds `$TMPDIR` leaves this process's links' directory there
+    /// with every link in it, removes every other entry of `$TMPDIR`,
+    /// wherever the directory's listing has it, before the links' directory
+    /// or after, and counts what it removed and what stayed (`$TMPDIR` and
+    /// the directory above it, not empty). The first fix (8ff6881) put
+    /// walkdir's `filter_entry` on the walk, contents first: the links went
+    /// (the links' directory alone stayed, empty), and what the listing of
+    /// `$TMPDIR` had after the links' directory stayed, uncounted. The same
+    /// for `$TMPDIR` as a snapshot's directory under another name
+    /// (`Aliases`), whose links' directory was removed links first, as one
+    /// more of its entries.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn removal_leaves_the_links_directory_and_its_links() {
+        use std::fs;
+
+        let Some(base) = in_child_with_tmpdir("removal_leaves_the_links_directory_and_its_links")
+        else {
+            return;
+        };
+        let extra = base.join("extra");
+        let tmp = extra.join("tmp");
+        assert_eq!(std::env::temp_dir(), tmp);
+        // What `make` makes in $TMPDIR: four files and a directory with a
+        // file in it, six entries to remove.
+        let fill = |made: &str| {
+            for i in 0..4 {
+                fs::write(tmp.join(format!("{made}-{i}")), b"x").unwrap();
+            }
+            fs::create_dir(tmp.join(format!("{made}-dir"))).unwrap();
+            fs::write(tmp.join(format!("{made}-dir/f")), b"x").unwrap();
+        };
+        // Entries older than the links' directory, the links (to prefixes
+        // of a path of 6 KB, which needn't be there), and newer ones.
+        fill("old");
+        let mut deep = base.join("deep");
+        for i in 0..30 {
+            deep.push(format!("d{i:02}{}", "x".repeat(197)));
+        }
+        assert!(walkdir::try_short_path(&deep).unwrap().as_os_str().len() < 4096);
+        fill("new");
+        let name = listed(&tmp)
+            .into_iter()
+            .find(|n| n.starts_with(".bko-longpath-"))
+            .unwrap();
+        let links = tmp.join(&name);
+        assert!(walkdir::is_short_path_dir(&links));
+        // Entries on both sides of it in the listing, whatever order the
+        // file system lists in (by age, one way or the other, as tmpfs and
+        // a small XFS directory do; ext4 by a hash of the name).
+        let mut more = 0;
+        let sides = |names: &[String]| {
+            let at = names.iter().position(|n| *n == name).unwrap();
+            (at, names.len() - 1 - at)
+        };
+        while matches!(sides(&listed(&tmp)), (0, _) | (_, 0)) {
+            assert!(more < 256, "{:?}", listed(&tmp));
+            fs::write(tmp.join(format!("more-{more}")), b"x").unwrap();
+            more += 1;
+        }
+        let before = entries_of(&links);
+        assert!(!before.is_empty());
+        // A link made again in the same tick of the clock would keep its
+        // change time.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // Twelve entries and those of `more` go; $TMPDIR and the directory
+        // above it stay, not empty.
+        let err = remove_tree(&extra, &Replaced::default()).unwrap_err();
+        let msg = err.to_string();
+        assert_eq!(entries_of(&links), before, "{msg}");
+        assert_eq!(listed(&tmp), std::slice::from_ref(&name), "{msg}");
+        assert_eq!(err.kind(), std::io::ErrorKind::DirectoryNotEmpty, "{msg}");
+        let start = format!("2 entries not removed, the first {}: ", tmp.display());
+        assert!(msg.starts_with(&start), "{msg}");
+        assert!(msg.ends_with(&format!("; {} removed", 12 + more)), "{msg}");
+
+        // The links' directory itself: an error, and nothing goes.
+        let err = remove_tree(&links, &Replaced::default()).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("1 entries not removed, the first "),
+            "{err}"
+        );
+        assert!(err.to_string().ends_with("; 0 removed"), "{err}");
+        assert_eq!(entries_of(&links), before);
+
+        // $TMPDIR as a snapshot's directory found under another name: what
+        // is in it goes, but for the links' directory, which is no error.
+        fill("alias");
+        let mut aliases = Aliases::default();
+        aliases.add(&tmp);
+        let (mut dirs, replaced) = (DirChanges::default(), Replaced::default());
+        remove_unexpected(&tmp, true, &aliases, &mut dirs, &replaced).unwrap();
+        assert_eq!(entries_of(&links), before);
+        assert_eq!(listed(&tmp), [name]);
     }
 }

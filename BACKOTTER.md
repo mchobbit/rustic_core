@@ -371,7 +371,10 @@ that either program restores what the other backed up.
   as real directories in `$TMPDIR`, the files past `PATH_MAX` were written
   there and removed at exit, and the restore said "restore done." (exit 0)
   without them (ForkAudit1 G7-01). Where `$TMPDIR` itself is an extra
-  entry, `--delete` removes what is in it but the links' directory and
+  entry, `--delete` removes what is in it but the links' directory and its
+  links (`remove_tree` asks each entry of its walk, which gives a directory
+  after its contents: walkdir's `filter_entry` kept the directory there but
+  not its links, and left what `$TMPDIR` lists after it, uncounted), and
   reports `$TMPDIR` as not removed ("Directory not empty", an error); the
   links go at exit, and the next run removes it. A backup of a source that
   holds `$TMPDIR` leaves the links' directory out the same way

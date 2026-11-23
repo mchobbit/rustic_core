@@ -73,11 +73,12 @@ fn deep_names() -> Vec<String> {
 
 /// Makes, in the new directory `source`: `aaa/` + `names`, one in the other
 /// (through descriptors: the path is too long for a system call), with a
-/// file `leaf` at the bottom, and `tmp/keep`.
+/// file `leaf` at the bottom, and `tmp/keep` and `tmp/old`.
 fn make_source(source: &Path, names: &[String]) -> Result<()> {
     fs::create_dir_all(source.join("aaa"))?;
     fs::create_dir_all(source.join("tmp"))?;
     fs::write(source.join("tmp/keep"), "keep")?;
+    fs::write(source.join("tmp/old"), "old")?;
     for (i, name) in names.iter().enumerate() {
         let fds = open_chain(&source.join("aaa"), &names[..i])?;
         mkdirat(
@@ -115,13 +116,37 @@ fn unlink_leaf(top: &Path, names: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The names in `dir`, in the order a walk of it gives them.
+fn listing(dir: &Path) -> Result<Vec<String>> {
+    Ok(fs::read_dir(dir)?
+        .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<_>>()?)
+}
+
 /// The names in `dir`, sorted.
 fn names_in(dir: &Path) -> Result<Vec<String>> {
-    let mut names: Vec<String> = fs::read_dir(dir)?
-        .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
-        .collect::<std::io::Result<_>>()?;
+    let mut names = listing(dir)?;
     names.sort();
     Ok(names)
+}
+
+/// The entries of `dir`, sorted: each one's name, inode and change time,
+/// which an entry removed and made again hasn't kept (after `pause`).
+fn entries_of(dir: &Path) -> Result<Vec<(String, u64, i64, i64)>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut entries = Vec::new();
+    for name in names_in(dir)? {
+        let m = fs::symlink_metadata(dir.join(&name))?;
+        entries.push((name, m.ino(), m.ctime(), m.ctime_nsec()));
+    }
+    Ok(entries)
+}
+
+/// Waits for the clock that change times are taken from to go on: an entry
+/// made again in the same tick would keep its change time.
+fn pause() {
+    std::thread::sleep(std::time::Duration::from_millis(20));
 }
 
 /// Restores the latest snapshot to `dir` with `opts`: the errors counted
@@ -158,7 +183,12 @@ fn restore_to(
 /// Then with `$TMPDIR` itself an extra entry (a snapshot without it): its
 /// contents go, it stays with the links' directory in it, as one error
 /// ("Directory not empty"), and the files past `PATH_MAX` are still
-/// restored; .1 removed it whole and lost them the same way.
+/// restored; .1 removed it whole and lost them the same way. The links
+/// stay as they are, not removed and made again, and every other entry of
+/// `$TMPDIR` goes, those its listing has before the links' directory and
+/// those after it: the first fix (8ff6881) removed the links, and left what
+/// was listed after the links' directory (on XFS `keep`, so this test
+/// failed there, and passed on tmpfs, which lists the other way).
 #[rstest]
 fn test_restore_delete_with_tmpdir_in_destination(set_up_repo: Result<RepoOpen>) -> Result<()> {
     let name = "test_restore_delete_with_tmpdir_in_destination";
@@ -169,6 +199,10 @@ fn test_restore_delete_with_tmpdir_in_destination(set_up_repo: Result<RepoOpen>)
     let (source, dst) = (base.join("src"), base.join("dst"));
     let tmp = dst.join("test/tmp");
     assert_eq!(std::env::temp_dir(), tmp);
+    // The snapshot's `old` in $TMPDIR, there before the links' directory,
+    // which the backup makes in it (it reads the path past PATH_MAX);
+    // `keep` is made after it, by the restore.
+    fs::write(tmp.join("old"), "old")?;
     make_source(&source, &names)?;
     let want = Some(vec![b'l'; 4900]);
 
@@ -179,7 +213,8 @@ fn test_restore_delete_with_tmpdir_in_destination(set_up_repo: Result<RepoOpen>)
     assert_eq!(snap.summary.as_ref().map(|s| s.items_incomplete), Some(0));
     let repo = repo.to_indexed()?;
 
-    // To the destination, new but for $TMPDIR: the links are made in it.
+    // To the destination, new but for $TMPDIR with `old` and the links'
+    // directory in it.
     let top = dst.join("test/aaa");
     assert_eq!(
         restore_to(&repo, &dst, RestoreOptions::default())?,
@@ -187,13 +222,15 @@ fn test_restore_delete_with_tmpdir_in_destination(set_up_repo: Result<RepoOpen>)
     );
     assert_eq!(leaf_of(&top, &names)?, want);
     let in_tmp = names_in(&tmp)?;
-    assert_eq!(in_tmp.len(), 2, "{in_tmp:?}");
+    assert_eq!(in_tmp.len(), 3, "{in_tmp:?}");
     assert!(
-        in_tmp[0].starts_with(".bko-longpath-") && in_tmp[1] == "keep",
+        in_tmp[0].starts_with(".bko-longpath-") && in_tmp[1..] == ["keep", "old"],
         "{in_tmp:?}"
     );
     let links = tmp.join(&in_tmp[0]);
     assert!(walkdir::is_short_path_dir(&links));
+    let made = entries_of(&links)?;
+    assert!(!made.is_empty());
 
     // The file at the bottom gone: --delete, then --exact, restore it, find
     // nothing additional, and leave $TMPDIR as it is.
@@ -204,13 +241,16 @@ fn test_restore_delete_with_tmpdir_in_destination(set_up_repo: Result<RepoOpen>)
         .numeric_id(true);
     for opts in [delete, exact, RestoreOptions::default()] {
         unlink_leaf(&top, &names)?;
+        pause();
         assert_eq!(restore_to(&repo, &dst, opts)?, (0, 0, 0));
         assert_eq!(leaf_of(&top, &names)?, want, "the file past PATH_MAX");
         assert_eq!(names_in(&tmp)?, in_tmp);
-        // Links only: nothing real was made in it for the path.
+        // Links only: nothing real was made in it for the path. The links
+        // made first, none made again.
         for entry in fs::read_dir(&links)? {
             assert!(entry?.file_type()?.is_symlink());
         }
+        assert_eq!(entries_of(&links)?, made);
     }
 
     // A snapshot without tmp: --delete removes what is in $TMPDIR but the
@@ -221,6 +261,24 @@ fn test_restore_delete_with_tmpdir_in_destination(set_up_repo: Result<RepoOpen>)
     let _snap = repo.backup(&opts, &paths, SnapshotFile::default())?;
     let repo = repo.to_indexed()?;
     unlink_leaf(&top, &names)?;
+    // A directory in $TMPDIR too, and entries on both sides of the links'
+    // directory in $TMPDIR's listing, whatever order the file system lists
+    // in (by age, one way or the other, as tmpfs and a small XFS directory
+    // do: `old` and `keep`; ext4 by a hash of the name: more names).
+    fs::create_dir(tmp.join("sub"))?;
+    fs::write(tmp.join("sub/file"), "file")?;
+    let mut more = 0;
+    loop {
+        let order = listing(&tmp)?;
+        let at = order.iter().position(|n| *n == in_tmp[0]).unwrap();
+        if at > 0 && at + 1 < order.len() {
+            break;
+        }
+        assert!(more < 256, "{order:?}");
+        fs::write(tmp.join(format!("more-{more}")), "more")?;
+        more += 1;
+    }
+    pause();
     let (errors, dirs, files) = restore_to(&repo, &dst, delete)?;
     assert_eq!(
         leaf_of(&top, &names)?,
@@ -228,7 +286,12 @@ fn test_restore_delete_with_tmpdir_in_destination(set_up_repo: Result<RepoOpen>)
         "the file past PATH_MAX, $TMPDIR extra"
     );
     assert_eq!((errors, dirs, files), (1, 1, 0));
-    assert_eq!(names_in(&tmp)?, in_tmp[..1]);
+    // Both at once, for a failure to show both: the links as they were
+    // made, and nothing else left in $TMPDIR.
+    assert_eq!(
+        (entries_of(&links)?, names_in(&tmp)?),
+        (made, in_tmp[..1].to_vec())
+    );
     Ok(())
 }
 
@@ -264,11 +327,12 @@ fn test_backup_with_tmpdir_in_source(set_up_repo: Result<RepoOpen>) -> Result<()
         let paths = PathList::from_iter(Some(source.to_path_buf()));
         let snap = repo.backup(&opts, &paths, SnapshotFile::default())?;
         assert_eq!(snap.summary.as_ref().map(|s| s.items_incomplete), Some(0));
-        // The links' directory is there, beside keep, for the walk to find.
+        // The links' directory is there, beside keep and old, for the walk
+        // to find.
         let in_tmp = names_in(&source.join("tmp"))?;
-        assert_eq!(in_tmp.len(), 2, "{in_tmp:?}");
+        assert_eq!(in_tmp.len(), 3, "{in_tmp:?}");
         assert!(
-            in_tmp[0].starts_with(".bko-longpath-") && in_tmp[1] == "keep",
+            in_tmp[0].starts_with(".bko-longpath-") && in_tmp[1..] == ["keep", "old"],
             "{in_tmp:?}"
         );
 
@@ -285,6 +349,7 @@ fn test_backup_with_tmpdir_in_source(set_up_repo: Result<RepoOpen>) -> Result<()
             listed.len()
         );
         assert!(listed.contains(&test.join("tmp/keep")));
+        assert!(listed.contains(&test.join("tmp/old")));
         let own: Vec<_> = listed
             .iter()
             .filter(|p| p.to_string_lossy().contains(".bko-longpath-"))
@@ -292,8 +357,8 @@ fn test_backup_with_tmpdir_in_source(set_up_repo: Result<RepoOpen>) -> Result<()
         assert!(own.is_empty(), "the backup's own links saved: {own:?}");
         assert_eq!(
             listed.iter().filter(|p| p.starts_with("test/tmp")).count(),
-            2,
-            "tmp and keep"
+            3,
+            "tmp, keep and old"
         );
         repo = indexed.to_indexed_ids()?;
     }
