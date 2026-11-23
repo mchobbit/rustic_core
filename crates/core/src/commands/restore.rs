@@ -1205,11 +1205,8 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
             continue;
         }
         dirs.borrow_mut().change_parent(&target);
-        match remove_held(&target, true, &replaced, |t| std::fs::remove_file(walkdir::short_path(t))) {
-            (Ok(()), Err(err)) => put_back_failed(&target, &err),
-            (Ok(()), Ok(())) => {}
-            (Err(err), _) => debug!("{} not removed early: {err}", target.display()),
-        }
+        let removal = remove_held(&target, true, &replaced, |t| std::fs::remove_file(walkdir::short_path(t)));
+        report_early_removal(&target, removal, put_back_failed);
     }
 
     // BackOtter: --delete, past what it can't remove, each an error: a
@@ -2368,14 +2365,51 @@ fn remove_extra(path: &Path, replaced: &RefCell<Replaced>) -> std::io::Result<()
     }
     let held = osattrs::clear_restricting_flags_held(path);
     let removed = std::fs::remove_file(path);
-    let put_back = held.put_back();
-    removed?;
-    put_back.map_err(|err| {
-        std::io::Error::new(
+    removed_and_put_back(removed, held.put_back())
+}
+
+/// BackOtter: what [`remove_extra`] says of a removal past restricting
+/// flags, held, and of their put-back: the removal's error, and the
+/// put-back's too when that failed as well, since the file then stays
+/// under all its names, outside the destination too, without the flags it
+/// had (as `break_shared` reports it); a put-back that failed after the
+/// name went is an error of its own.
+fn removed_and_put_back(
+    removed: std::io::Result<()>,
+    put_back: std::io::Result<()>,
+) -> std::io::Result<()> {
+    match (removed, put_back) {
+        (removed, Ok(())) => removed,
+        (Ok(()), Err(err)) => Err(std::io::Error::new(
             err.kind(),
             format!("removed, but restricting flags not put back on its other names: {err}"),
-        )
-    })
+        )),
+        (Err(err), Err(perr)) => Err(std::io::Error::new(
+            err.kind(),
+            format!("{err}; its restricting flags not set back: {perr}"),
+        )),
+    }
+}
+
+/// BackOtter: reports how the early removal of `target` went, a later name
+/// of a hard-linked file in the way of the link the metadata pass makes
+/// (`removal`: what [`remove_held`] returned). A name that stays is no
+/// error yet: the metadata pass tries again and reports it. Flags that
+/// didn't go back on the file's other names are reported here
+/// (`put_back_failed`), whether the name went or not: the metadata pass
+/// finds them off already, so its own put-back has nothing to fail on.
+fn report_early_removal(
+    target: &Path,
+    removal: (std::io::Result<()>, std::io::Result<()>),
+    put_back_failed: impl FnOnce(&Path, &std::io::Error),
+) {
+    let (removed, put_back) = removal;
+    if let Err(err) = removed {
+        debug!("{} not removed early: {err}", target.display());
+    }
+    if let Err(err) = put_back {
+        put_back_failed(target, &err);
+    }
 }
 
 /// BackOtter: the snapshot targets (files and directories) a restore found
@@ -2989,6 +3023,50 @@ mod tests {
         assert!(set_metadata(&dest, opts, &path, &node, false, false, &mut tally));
         assert_eq!(stat().mtime(), 1_600_000_000);
         assert_eq!(tally.errors, 0);
+    }
+
+    /// ForkAudit1 G6-03: restricting flags that didn't go back on the
+    /// other names of a file removed early are reported whether its name
+    /// went or not; a name that stays, its flags back, is left to the
+    /// metadata pass.
+    #[test]
+    fn early_removal_reports_a_failed_put_back() {
+        let failed = |msg: &str| Err(std::io::Error::other(msg.to_string()));
+        let reported = |removed, put_back| {
+            let mut said = None;
+            report_early_removal(Path::new("d/b"), (removed, put_back), |path, err| {
+                said = Some(format!("{}: {err}", path.display()));
+            });
+            said
+        };
+        assert_eq!(reported(Ok(()), Ok(())), None);
+        assert_eq!(reported(failed("busy"), Ok(())), None);
+        assert_eq!(reported(Ok(()), failed("EIO")), Some("d/b: EIO".to_string()));
+        // Both failed: this one was dropped.
+        assert_eq!(reported(failed("busy"), failed("EIO")), Some("d/b: EIO".to_string()));
+    }
+
+    /// ForkAudit1 G6-04: `--delete` removing a name past restricting flags
+    /// says so when the flags didn't go back, with the removal's error too
+    /// when the name stayed.
+    #[test]
+    fn removal_and_put_back_errors_both_reported() {
+        use std::io::{Error, ErrorKind};
+
+        let busy = || Err(Error::new(ErrorKind::ResourceBusy, "busy"));
+        let eio = || Err(Error::other("EIO"));
+        assert!(removed_and_put_back(Ok(()), Ok(())).is_ok());
+        let err = removed_and_put_back(busy(), Ok(())).unwrap_err();
+        assert_eq!((err.kind(), err.to_string()), (ErrorKind::ResourceBusy, "busy".to_string()));
+        let err = removed_and_put_back(Ok(()), eio()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "removed, but restricting flags not put back on its other names: EIO"
+        );
+        // Both failed: the put-back's error was dropped.
+        let err = removed_and_put_back(busy(), eio()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ResourceBusy);
+        assert_eq!(err.to_string(), "busy; its restricting flags not set back: EIO");
     }
 
     /// ForkAudit1 G6-02: a step of the metadata that fails (here each of
