@@ -305,16 +305,16 @@ pub(crate) fn unread_size(node: &Node) -> Option<u64> {
     node.meta.generic_attributes.number_u64(ILLUMOS_UNREAD_SIZE)
 }
 
-/// Creates an empty file at `path` with those of `node`'s flags that a file
-/// system only takes while a file is empty (btrfs's no-copy-on-write), for
-/// the restore to write the contents into. Does nothing when there are none,
-/// or when `path` exists already.
+/// BackOtter: gives `dst` the whole contents of `src`, sharing its extents
+/// (Linux's `FICLONE`), where the file system can; for
+/// `restore --clone-from`.
 ///
 /// # Errors
 ///
-/// * If the file can't be created, or the flags set.
-/// BackOtter: `dst` gets `src`'s whole contents, sharing its extents
-/// (Linux's `FICLONE`), where the file system can; `restore --clone-from`.
+/// * `FICLONE`'s: the file system can't clone (`EOPNOTSUPP`, `ENOTTY`), the
+///   two files are on different file systems (`EXDEV`), `dst` isn't open for
+///   writing or is no regular file (`EBADF`, `EINVAL`), and the like.
+/// * `ErrorKind::Unsupported` on every system but Linux.
 pub(crate) fn clone_contents(src: &File, dst: &File) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -351,6 +351,14 @@ pub(crate) fn takes_nothing_before_data(node: &Node) -> bool {
     flags && options
 }
 
+/// Creates an empty file at `path` with those of `node`'s flags that a file
+/// system only takes while a file is empty (btrfs's no-copy-on-write), for
+/// the restore to write the contents into. Does nothing when there are none,
+/// or when `path` exists already.
+///
+/// # Errors
+///
+/// * If the file can't be created, or the flags set.
 pub(crate) fn prepare_file(path: &Path, node: &Node) -> io::Result<()> {
     // BackOtter: past PATH_MAX, through a short path to it.
     let path = &*walkdir::short_path(path);
@@ -385,13 +393,13 @@ pub(crate) fn prepare_file(path: &Path, node: &Node) -> io::Result<()> {
 /// directory keeps what it has or inherited (casefolding from its parent),
 /// as in stock rustic.
 ///
-/// # Errors
-///
-/// * If the flags couldn't be set.
-///
 /// BackOtter: on bcachefs (Linux) it then gives the directory its options
 /// and project ID too, which bcachefs passes only to entries created after
 /// them, as BackOtter's restic does (`linux::prepare_dir_for_options`).
+///
+/// # Errors
+///
+/// * If the flags couldn't be set.
 pub(crate) fn prepare_dir(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
     // BackOtter: past PATH_MAX, through a short path to it.
     let path = &*walkdir::short_path(path);
@@ -1263,10 +1271,6 @@ pub(crate) fn restore_owner(path: &Path, node: &Node) -> io::Result<()> {
 /// attributes' own metadata and ZFS project IDs, Haiku's typed attributes),
 /// and warns once about each generic attribute that isn't known at all.
 ///
-/// # Errors
-///
-/// * If an attribute couldn't be set.
-///
 /// On Linux a node without a project ID had 0 in a snapshot of BackOtter's
 /// (`known_bko`), which bcachefs then gets where the file inherited another;
 /// in any other snapshot the file keeps the one it has or inherited. On
@@ -1279,6 +1283,10 @@ pub(crate) fn restore_owner(path: &Path, node: &Node) -> io::Result<()> {
 /// `owners` says whether the restore sets owners (not `--no-ownership`): on
 /// illumos each extended attribute has an owner and group of its own, set
 /// only then.
+///
+/// # Errors
+///
+/// * If an attribute couldn't be set.
 pub(crate) fn restore_attributes(
     path: &Path,
     node: &Node,
