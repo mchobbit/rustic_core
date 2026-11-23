@@ -15,11 +15,11 @@ use std::{
 };
 
 use jiff::Timestamp;
-use log::{debug, warn};
+use log::debug;
 
 use super::{
-    XattrErrors, check,
-    haiku_attrs::{self, Attr, AttrFile, Attrs, Stat},
+    XattrErrors, XattrsRead, check,
+    haiku_attrs::{self, Attr, AttrFile, Attrs, Kept, Stat, Unreadable},
     path_error,
 };
 use crate::backend::node::{
@@ -176,40 +176,67 @@ impl AttrFile for Attributes {
 }
 
 /// The attributes of the file at `path` that are extended attributes
-/// (`xattrs`) or those that aren't, by name, or `None` for a type of file
-/// that isn't kept with attributes, or on a file system without them. One
-/// whose name isn't UTF-8 is left out with a warning.
-fn kept(path: &Path, xattrs: bool) -> io::Result<Option<BTreeMap<String, Attr>>> {
+/// (`xattrs`) or those that aren't, by name, and those of that kind left
+/// out, each with why ([`haiku_attrs::read_kind`]: one that can't be read,
+/// is too large, or whose name isn't UTF-8 doesn't lose the file its
+/// others); or `None` for a type of file that isn't kept with attributes,
+/// or on a file system without them.
+///
+/// # Errors
+///
+/// * If the file couldn't be opened or its attributes listed.
+fn kept(path: &Path, xattrs: bool) -> io::Result<Option<Kept>> {
     let read = match open(path)? {
         Some(f) => haiku_attrs::read_kind(&f, xattrs)
             .map_err(|err| path_error("attributes of", path, &err))?,
         None => None,
     };
-    let Some((kept, bad_names)) = read else {
+    if read.is_none() {
         debug!("no attributes for {}", path.display());
-        return Ok(None);
-    };
-    for name in bad_names {
-        warn!(
-            "ignoring attribute {} of {}: its name isn't UTF-8",
-            String::from_utf8_lossy(&name),
-            path.display()
-        );
     }
-    Ok(Some(kept))
+    Ok(read)
+}
+
+/// How a warning names the attribute `name`.
+fn shown(name: &[u8]) -> String {
+    String::from_utf8_lossy(name).into_owned()
 }
 
 /// The extended attributes of the file at `path`: its attributes of type
-/// `B_XATTR_TYPE`.
-pub(super) fn xattrs(path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
-    Ok(kept(path, true)?
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(name, attr)| ExtendedAttribute {
-            name,
-            value: Some(attr.value),
-        })
-        .collect())
+/// `B_XATTR_TYPE`. One left out is named in `unreadable`, for the backup to
+/// warn about and count each, as on every other system.
+///
+/// # Errors
+///
+/// * If the file couldn't be opened or its attributes listed.
+pub(super) fn xattrs_read(path: &Path) -> io::Result<XattrsRead> {
+    let (attrs, unreadable) = kept(path, true)?.unwrap_or_default();
+    Ok(XattrsRead {
+        attrs: attrs
+            .into_iter()
+            .map(|(name, attr)| ExtendedAttribute {
+                name,
+                value: Some(attr.value),
+            })
+            .collect(),
+        unreadable: unreadable
+            .into_iter()
+            .map(|(name, err)| (shown(&name), err))
+            .collect(),
+    })
+}
+
+/// The error for the attributes `unreadable` that a backup left out of
+/// `haiku.attributes`, which names each with why; none, no error.
+fn left_out(unreadable: &Unreadable) -> io::Result<()> {
+    if unreadable.is_empty() {
+        return Ok(());
+    }
+    let each: Vec<_> = unreadable
+        .iter()
+        .map(|(name, err)| format!("{}: {err}", shown(name)))
+        .collect();
+    Err(io::Error::other(format!("{}; its others are kept", each.join("; "))))
 }
 
 /// Gives the file at `path` exactly the extended attributes `attrs`, as
@@ -251,14 +278,23 @@ pub(super) fn file_flags(
 /// types, as `haiku.attributes`: an empty object for a file that has none,
 /// so that a restore removes any it has then, as from a snapshot that
 /// doesn't know (one made on another system) it doesn't.
+///
+/// # Errors
+///
+/// * If the file couldn't be opened or its attributes listed: none are
+///   kept, and no `haiku.attributes`.
+/// * If one or more couldn't be read, are too large or have names that
+///   aren't UTF-8: the error names each, and `haiku.attributes` has the
+///   others. The backup warns with it and counts the file as incomplete.
 pub(super) fn fill_attributes(path: &Path, node: &mut Node, _f: Option<&File>) -> io::Result<()> {
-    let Some(attrs) = kept(path, false)? else {
+    let Some((attrs, unreadable)) = kept(path, false)? else {
         return Ok(());
     };
     node.meta
         .generic_attributes
         .set(HAIKU_ATTRIBUTES, &Attrs(attrs))
-        .map_err(io::Error::other)
+        .map_err(io::Error::other)?;
+    left_out(&unreadable)
 }
 
 pub(super) fn prepare_file_for_flags(_path: &Path, _flags: u32) -> io::Result<()> {
@@ -420,11 +456,11 @@ mod tests {
         )
         .unwrap();
         round_trip(&file, &want);
-        let x = xattrs(&file).unwrap();
+        let x = xattrs_read(&file).unwrap().attrs;
         assert_eq!(x.len(), 1);
         assert_eq!(x[0].value.as_deref(), Some(&b"hi"[..]));
         set_xattrs(&file, &[]).unwrap();
-        assert!(xattrs(&file).unwrap().is_empty());
+        assert!(xattrs_read(&file).unwrap().attrs.is_empty());
         round_trip(&file, &want);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -453,7 +489,7 @@ mod tests {
             }],
         )
         .unwrap();
-        let x = xattrs(&file).unwrap();
+        let x = xattrs_read(&file).unwrap().attrs;
         assert_eq!(x.len(), 1);
         assert_eq!(x[0].value.as_deref(), Some(&b""[..]));
         std::fs::remove_dir_all(dir).unwrap();
@@ -506,10 +542,26 @@ mod tests {
         let mut node = Node::default();
         fill_attributes(&fifo, &mut node, None).unwrap();
         assert!(node.meta.generic_attributes.is_empty());
-        assert!(xattrs(&fifo).unwrap().is_empty());
+        assert!(xattrs_read(&fifo).unwrap().attrs.is_empty());
         restore_attributes(&fifo, &node_with(&BTreeMap::new())).unwrap();
         assert!(restore_attributes(&fifo, &node_with(&want)).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// ForkAudit1 G5-04: the attributes a backup leaves out of
+    /// `haiku.attributes` are one error that names each, after the others
+    /// are kept.
+    #[test]
+    fn left_out_names_each() {
+        assert!(left_out(&Vec::new()).is_ok());
+        let unreadable = vec![
+            (b"big".to_vec(), io::Error::other("no")),
+            (b"bad\xff".to_vec(), io::Error::other("its name isn't UTF-8")),
+        ];
+        assert_eq!(
+            left_out(&unreadable).unwrap_err().to_string(),
+            "big: no; bad\u{fffd}: its name isn't UTF-8; its others are kept"
+        );
     }
 
     #[test]
@@ -521,7 +573,7 @@ mod tests {
         _ = want.insert("user.x".to_string(), attr(haiku_attrs::XATTR_TYPE, b"x"));
         let err = restore_attributes(&file, &node_with(&want)).unwrap_err();
         assert!(err.to_string().contains("skipped user.x"), "{err}");
-        assert!(xattrs(&file).unwrap().is_empty());
+        assert!(xattrs_read(&file).unwrap().attrs.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

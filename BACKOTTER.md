@@ -725,8 +725,11 @@ that either program restores what the other backed up.
   system, or of a file system without attributes) leaves a file's typed
   attributes as they are, as FreeBSD's system extended attributes. An
   attribute whose name isn't UTF-8 is left out of a backup with a
-  warning, and left on the file by a restore. Empty attributes are
-  restored too, though BFS makes none of a write of no data: such a one
+  warning, counted as one that couldn't be read (0.14.0+backotter.2;
+  before, not counted), and left on the file by a restore. A restore goes
+  on past an attribute whose `fs_stat_attr(3)` fails: the error names it,
+  and the others are set and removed. Empty attributes are restored too,
+  though BFS makes none of a write of no data: such a one
   is written with 16 KiB of zeros first, which BFS moves out of the inode,
   then truncated; a file system on which that doesn't work either gets a
   warning naming the attribute. The attributes are restored before the
@@ -754,7 +757,13 @@ that either program restores what the other backed up.
   dropped them all, with one warning (`ignoring error obtaining xargs`),
   which is still what a list of them that can't be read gives
   (`LocalSourceSaveOptions::xattrs_with` in `backend/ignore/mapper.rs`; on
-  illumos `xattrs_read` in `osattrs/illumos.rs`; Haiku's are read whole).
+  illumos `xattrs_read` in `osattrs/illumos.rs`; on Haiku `read_kind` in
+  `osattrs/haiku_attrs.rs`, for both kinds of attribute: one of
+  `haiku.attributes` that can't be read, or whose `fs_stat_attr(3)` fails,
+  is named with its error in one warning for the file, `ignoring
+  attributes of PATH: NAME: ERR; ...; its others are kept`, and
+  `haiku.attributes` holds the others; 0.14.0+backotter.2, before which
+  the first failure lost a Haiku file all its attributes of that kind).
 - bcachefs' `bcachefs_effective.*` extended attributes aren't kept, nor
   set or removed by a restore (one in a snapshot of stock restic's is
   skipped): they show the options a file has, its own (`bcachefs.*`, kept
@@ -1104,6 +1113,19 @@ that either program restores what the other backed up.
   file system without one permissions `0000` in a restic or BackOtter
   snapshot (above). Accepted difference: the two tools' nodes differ
   there, not in value.
+- An extended attribute is a file of any size on illumos (a named
+  attribute, an SMB alternate data stream) and on Haiku (a BFS attribute
+  in an inode of its own), and a node holds its value inline, in base64:
+  a backup keeps one of at most 16 MiB (`osattrs::NATIVE_XATTR_MAX`,
+  twice the largest data blob). A larger one is left out by its size,
+  before any of it is read, with the warning of an attribute that couldn't
+  be read (`ignoring extended attribute NAME of PATH: too large to keep (N
+  bytes, over 16777216)`; on Haiku one that isn't an extended attribute is
+  named in `ignoring attributes of PATH: ...`), counted the same, and the
+  file's others are kept (0.14.0+backotter.2; before, any size was read
+  whole into memory, and a damaged BFS that claimed a huge size aborted
+  the backup). BackOtter's restic has no such limit yet: above it the two
+  tools' nodes differ.
 - Extended attributes are read whole, however large, on Linux
   (`osattrs::xattr_get`, `xattr_list`: `lgetxattr(2)` and `llistxattr(2)`
   with the size they give, again on `ERANGE`). The xattr crate 1.6 (1.6.1,
@@ -1281,7 +1303,7 @@ that either program restores what the other backed up.
   an SMB/CIFS mount gives: no attributes listed, or one kept without a
   value, as restic's `handleXattrErr`), `idmap offline: SID owners not
   kept`, `av_quarantined: contents not
-  backed up`, a Haiku attribute name that isn't UTF-8, errors of the size
+  backed up`, errors of the size
   scan, `--exclude-if-xattr` errors (the entry is still backed up), sockets
   and doors skipped, and the errors of opening a file for its flags, which
   are only logged at debug level. On restore,

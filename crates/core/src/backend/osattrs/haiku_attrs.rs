@@ -100,30 +100,53 @@ fn named(op: &str, name: &[u8], err: &io::Error) -> io::Error {
     )
 }
 
+/// The attributes a file has that couldn't be read, each by its name's
+/// bytes with the error: the others are read all the same.
+pub(super) type Unreadable = Vec<(Vec<u8>, io::Error)>;
+
 /// The type and size of each of the file's attributes, without their data,
-/// or `None` on a file system without attributes.
-pub(super) fn stats(file: &impl AttrFile) -> io::Result<Option<Stats>> {
+/// and those whose `fs_stat_attr(3)` failed, of which not even the type is
+/// known; or `None` on a file system without attributes.
+///
+/// # Errors
+///
+/// * If the attributes couldn't be listed.
+pub(super) fn stats(file: &impl AttrFile) -> io::Result<Option<(Stats, Unreadable)>> {
     let Some(names) = file.names()? else {
         return Ok(None);
     };
     let mut stats = Stats::new();
+    let mut unreadable = Unreadable::new();
     for name in names {
-        let c_name = CString::new(name.clone())?;
-        if let Some(stat) = file
-            .stat(&c_name)
-            .map_err(|err| named("stat", &name, &err))?
-        {
-            _ = stats.insert(name, stat);
+        let stat = CString::new(name.clone())
+            .map_err(io::Error::from)
+            .and_then(|c_name| file.stat(&c_name));
+        match stat {
+            Ok(Some(stat)) => _ = stats.insert(name, stat),
+            Ok(None) => {}
+            Err(err) => unreadable.push((name, err)),
         }
     }
-    Ok(Some(stats))
+    Ok(Some((stats, unreadable)))
 }
 
 /// The attribute `name`, which `fs_stat_attr(3)` said is `stat`. One that
 /// grew since is read again: a single read of its old size would give only
-/// the start of it.
-fn read_attr(file: &impl AttrFile, name: &CStr, mut stat: Stat) -> io::Result<Option<Attr>> {
+/// the start of it. One of more than `max` bytes, as its size says before
+/// any of it is read, or once it has grown past that, is an error
+/// ([`xattr_too_large`](super::xattr_too_large)), and no memory is taken
+/// for it: an attribute in an inode of its own has any size, and a damaged
+/// file system can claim any.
+fn read_attr(
+    file: &impl AttrFile,
+    name: &CStr,
+    mut stat: Stat,
+    max: u64,
+) -> io::Result<Option<Attr>> {
     for _ in 0..READ_TRIES {
+        if stat.size > max {
+            return Err(super::xattr_too_large(stat.size));
+        }
         let size = usize::try_from(stat.size).map_err(io::Error::other)?;
         // A byte more, to see whether there is more.
         let mut value = vec![0_u8; size + 1];
@@ -145,19 +168,29 @@ fn read_attr(file: &impl AttrFile, name: &CStr, mut stat: Stat) -> io::Result<Op
     Err(io::Error::other("it keeps growing as it's read"))
 }
 
-/// A file's attributes of one kind, by name, and the names of those left
-/// out because they aren't UTF-8, which a node can't hold.
-pub(super) type Kept = (BTreeMap<String, Attr>, Vec<Vec<u8>>);
+/// A file's attributes of one kind, by name, and those of that kind left
+/// out, each with why: its name isn't UTF-8, which a node can't hold, it
+/// couldn't be read, or it is larger than a backup keeps
+/// ([`NATIVE_XATTR_MAX`](super::NATIVE_XATTR_MAX)).
+pub(super) type Kept = (BTreeMap<String, Attr>, Unreadable);
 
 /// The file's attributes that are extended attributes (`xattrs`) or those
 /// that aren't, or `None` on a file system without attributes. Only the
-/// data of that kind is read.
+/// data of that kind is read. One that can't be read is left out and named
+/// in the result, and the others are kept, as an extended attribute is on
+/// every other system. An attribute whose `fs_stat_attr(3)` failed is of
+/// neither kind: it is named with those that aren't extended attributes,
+/// which every backup reads, so once.
+///
+/// # Errors
+///
+/// * If the attributes couldn't be listed.
 pub(super) fn read_kind(file: &impl AttrFile, xattrs: bool) -> io::Result<Option<Kept>> {
-    let Some(stats) = stats(file)? else {
+    let Some((stats, unstatted)) = stats(file)? else {
         return Ok(None);
     };
     let mut kept = BTreeMap::new();
-    let mut bad_names = Vec::new();
+    let mut unreadable = if xattrs { Unreadable::new() } else { unstatted };
     for (name, stat) in stats {
         if (stat.type_code == XATTR_TYPE) != xattrs {
             continue;
@@ -165,18 +198,22 @@ pub(super) fn read_kind(file: &impl AttrFile, xattrs: bool) -> io::Result<Option
         let name = match String::from_utf8(name) {
             Ok(name) => name,
             Err(err) => {
-                bad_names.push(err.into_bytes());
+                let why = io::Error::new(io::ErrorKind::InvalidData, "its name isn't UTF-8");
+                unreadable.push((err.into_bytes(), why));
                 continue;
             }
         };
-        let c_name = CString::new(name.clone())?;
-        if let Some(attr) =
-            read_attr(file, &c_name, stat).map_err(|err| named("read", name.as_bytes(), &err))?
-        {
-            _ = kept.insert(name, attr);
+        let read = CString::new(name.clone())
+            .map_err(io::Error::from)
+            .and_then(|c_name| read_attr(file, &c_name, stat, super::NATIVE_XATTR_MAX));
+        match read {
+            Ok(Some(attr)) => _ = kept.insert(name, attr),
+            Ok(None) => {}
+            Err(err) => unreadable.push((name.into_bytes(), err)),
         }
     }
-    Ok(Some((kept, bad_names)))
+    unreadable.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(Some((kept, unreadable)))
 }
 
 /// Extended attributes as the attributes they are on Haiku.
@@ -254,13 +291,15 @@ pub(super) fn plan<'a>(
 /// Gives the file exactly the attributes `want` of one kind, extended
 /// attributes (`xattrs`) or the rest, each with its type, and leaves the
 /// others alone. One that is already as wanted isn't written. Goes on after
-/// an error, and returns the first.
+/// an error, and returns the first. An attribute whose `fs_stat_attr(3)`
+/// fails is such an error, and no reason to leave the others: it is written
+/// if wanted, and left if not (its kind isn't known).
 pub(super) fn apply(
     file: &impl AttrFile,
     want: &BTreeMap<String, Attr>,
     xattrs: bool,
 ) -> io::Result<()> {
-    let Some(current) = stats(file)? else {
+    let Some((current, unstatted)) = stats(file)? else {
         return if want.is_empty() {
             Ok(())
         } else {
@@ -277,6 +316,9 @@ pub(super) fn apply(
             _ = first_err.get_or_insert(err);
         }
     };
+    for (name, err) in &unstatted {
+        note(Err(named("stat", name, err)));
+    }
     for name in &plan.remove {
         note(
             CString::new(name.clone())
@@ -288,7 +330,8 @@ pub(super) fn apply(
     for (name, attr) in plan.compare {
         let set = || {
             let n = CString::new(name)?;
-            match read_attr(file, &n, attr.stat())? {
+            // No larger than the node's own, which is in memory.
+            match read_attr(file, &n, attr.stat(), u64::MAX)? {
                 Some(have) if have == *attr => Ok(()),
                 _ => write_attr(file, &n, attr),
             }
@@ -370,6 +413,9 @@ mod tests {
 
     const MIMS: u32 = u32::from_be_bytes(*b"MIMS");
     const RAWT: u32 = u32::from_be_bytes(*b"RAWT");
+    /// What the fake BFS's failed stats and reads say (not an errno: Haiku's
+    /// aren't the numbers they are elsewhere).
+    const BAD_BLOCK: &str = "bad block";
 
     fn attr(type_code: u32, value: &[u8]) -> Attr {
         Attr {
@@ -380,6 +426,11 @@ mod tests {
 
     fn stat(type_code: u32, size: u64) -> Stat {
         Stat { type_code, size }
+    }
+
+    /// The names of the attributes left out.
+    fn names(unreadable: &Unreadable) -> Vec<&[u8]> {
+        unreadable.iter().map(|(name, _)| name.as_slice()).collect()
     }
 
     fn want(attrs: &[(&str, Attr)]) -> BTreeMap<String, Attr> {
@@ -414,6 +465,12 @@ mod tests {
         /// Data another program gives the attribute just before the next
         /// read, after its stat.
         grow: RefCell<Option<Vec<u8>>>,
+        /// The attributes whose stat, and those whose read, fails (`EIO`),
+        /// as one in an attribute inode with a bad block.
+        bad_stat: RefCell<Vec<Vec<u8>>>,
+        bad_read: RefCell<Vec<Vec<u8>>>,
+        /// The sizes `fs_stat_attr(3)` claims, where not the data's.
+        claimed: RefCell<BTreeMap<Vec<u8>, u64>>,
     }
 
     impl FakeBfs {
@@ -448,11 +505,24 @@ mod tests {
         }
 
         fn stat(&self, name: &CStr) -> io::Result<Option<Stat>> {
-            Ok(self.get(name.to_bytes()).map(|a| a.attr.stat()))
+            let name = name.to_bytes();
+            if self.bad_stat.borrow().iter().any(|n| n == name) {
+                return Err(io::Error::other(BAD_BLOCK));
+            }
+            Ok(self.get(name).map(|a| {
+                let stat = a.attr.stat();
+                Stat {
+                    size: self.claimed.borrow().get(name).copied().unwrap_or(stat.size),
+                    ..stat
+                }
+            }))
         }
 
         fn read(&self, name: &CStr, _type_code: u32, buf: &mut [u8]) -> io::Result<Option<usize>> {
             self.reads.set(self.reads.get() + 1);
+            if self.bad_read.borrow().iter().any(|n| n == name.to_bytes()) {
+                return Err(io::Error::other(BAD_BLOCK));
+            }
             let mut attrs = self.attrs.borrow_mut();
             let Some(a) = attrs.get_mut(name.to_bytes()) else {
                 return Ok(None);
@@ -621,13 +691,88 @@ mod tests {
                 ("empty", attr(RAWT, b"")),
             ])
         );
-        assert_eq!(bad, [b"bad\xff".to_vec()]);
+        assert_eq!(names(&bad), [b"bad\xff"]);
+        assert_eq!(bad[0].1.to_string(), "its name isn't UTF-8");
         assert_eq!(bfs.reads.get(), 2);
 
         let (xattrs, bad) = read_kind(&bfs, true).unwrap().unwrap();
         assert_eq!(xattrs, want(&[("user.comment", attr(XATTR_TYPE, b"hi"))]));
-        assert_eq!(bad, [b"bad\xfe".to_vec()]);
+        assert_eq!(names(&bad), [b"bad\xfe"]);
         assert_eq!(bfs.reads.get(), 3);
+    }
+
+    /// ForkAudit1 G5-04: an attribute that can't be read, or whose stat
+    /// fails, is left out and named, and the file's others are kept, of
+    /// both kinds. Before, the first failure lost them all. A restore goes
+    /// on past one too.
+    #[test]
+    fn one_unreadable_attribute_leaves_the_others() {
+        let bfs = FakeBfs::with(&[
+            (b"BEOS:TYPE", attr(MIMS, b"text/plain\0")),
+            (b"big", attr(RAWT, &[7; 2 * SMALL_DATA])),
+            (b"user.a", attr(XATTR_TYPE, b"a")),
+            (b"user.bad", attr(XATTR_TYPE, b"b")),
+        ]);
+        *bfs.bad_read.borrow_mut() = vec![b"big".to_vec(), b"user.bad".to_vec()];
+        let (typed, bad) = read_kind(&bfs, false).unwrap().unwrap();
+        assert_eq!(typed, want(&[("BEOS:TYPE", attr(MIMS, b"text/plain\0"))]));
+        assert_eq!(names(&bad), [b"big"]);
+        assert_eq!(bad[0].1.to_string(), BAD_BLOCK);
+        let (xattrs, bad) = read_kind(&bfs, true).unwrap().unwrap();
+        assert_eq!(xattrs, want(&[("user.a", attr(XATTR_TYPE, b"a"))]));
+        assert_eq!(names(&bad), [&b"user.bad"[..]]);
+
+        // One whose stat fails is of neither kind: named once, with those
+        // every backup reads.
+        *bfs.bad_stat.borrow_mut() = vec![b"user.a".to_vec()];
+        let (typed, bad) = read_kind(&bfs, false).unwrap().unwrap();
+        assert_eq!(typed.len(), 1);
+        assert_eq!(names(&bad), [&b"big"[..], b"user.a"]);
+        let (xattrs, bad) = read_kind(&bfs, true).unwrap().unwrap();
+        assert!(xattrs.is_empty());
+        assert_eq!(names(&bad), [&b"user.bad"[..]]);
+
+        // A restore: the error names it, and the rest is done all the same.
+        let w = want(&[("new", attr(RAWT, b"n"))]);
+        let err = apply(&bfs, &w, false).unwrap_err();
+        assert!(err.to_string().starts_with("stat attribute user.a: "), "{err}");
+        assert!(bfs.get(b"BEOS:TYPE").is_none() && bfs.get(b"big").is_none());
+        assert_eq!(bfs.get(b"new").unwrap().attr, attr(RAWT, b"n"));
+        assert!(bfs.get(b"user.a").is_some() && bfs.get(b"user.bad").is_some());
+    }
+
+    /// ForkAudit1 G5-07 (RustAudit1 R4-06): an attribute whose size is over
+    /// `NATIVE_XATTR_MAX` is left out by that size, without being read (or
+    /// memory taken for it), and the others are kept; one that grows past
+    /// it while read too. A restore still reads one of any size the node
+    /// has.
+    #[test]
+    fn an_attribute_too_large_is_left_out() {
+        let max = crate::backend::osattrs::NATIVE_XATTR_MAX;
+        let bfs = FakeBfs::with(&[
+            (b"huge", attr(RAWT, b"claims more")),
+            (b"small", attr(RAWT, b"s")),
+        ]);
+        _ = bfs.claimed.borrow_mut().insert(b"huge".to_vec(), u64::MAX);
+        let (got, bad) = read_kind(&bfs, false).unwrap().unwrap();
+        assert_eq!(got, want(&[("small", attr(RAWT, b"s"))]));
+        assert_eq!(names(&bad), [b"huge"]);
+        assert_eq!(bad[0].1.kind(), io::ErrorKind::FileTooLarge);
+        assert!(bad[0].1.to_string().starts_with("too large to keep (18446744073709551615 bytes"));
+        assert_eq!(bfs.reads.get(), 1);
+
+        _ = bfs.claimed.borrow_mut().insert(b"huge".to_vec(), max + 1);
+        let (_, bad) = read_kind(&bfs, false).unwrap().unwrap();
+        assert_eq!(names(&bad), [b"huge"]);
+        assert_eq!(bfs.reads.get(), 2);
+
+        // Past the largest while it's read: the second stat says so.
+        let grows = FakeBfs::with(&[(b"a", attr(RAWT, b"short"))]);
+        *grows.grow.borrow_mut() = Some(b"longer now".to_vec());
+        let stat = grows.stat(c"a").unwrap().unwrap();
+        let err = read_attr(&grows, c"a", stat, 7).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(read_attr(&grows, c"a", stat, 10).unwrap().unwrap().value, b"longer now");
     }
 
     #[test]
@@ -743,7 +888,7 @@ mod tests {
         assert_eq!(bfs.removes.get(), 1);
         let (got, bad) = read_kind(&bfs, false).unwrap().unwrap();
         assert_eq!(got, w);
-        assert_eq!(bad, [b"extra\xff".to_vec()]);
+        assert_eq!(names(&bad), [b"extra\xff"]);
         assert_eq!(bfs.get(b"user.xattr").unwrap().attr, attr(XATTR_TYPE, b"x"));
 
         // Again: nothing to write.

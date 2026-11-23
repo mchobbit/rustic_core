@@ -1499,17 +1499,16 @@ pub(crate) fn restore_symlink_mode(path: &Path, node: &Node) -> io::Result<()> {
 ///
 /// # Errors
 ///
-/// * If they can't be listed (on illumos) or read (on Haiku), or this is
-///   neither illumos nor Haiku.
+/// * If they can't be listed, or this is neither illumos nor Haiku.
 #[cfg_attr(not(any(target_os = "illumos", target_os = "haiku")), allow(dead_code))]
 pub(crate) fn native_xattrs(path: &Path) -> io::Result<XattrsRead> {
     // BackOtter: past PATH_MAX, through a short path to it.
     let path = &*walkdir::short_path(path);
-    // BackOtter: on illumos, one whose value can't be read is left out
-    // alone (in `unreadable`), as BackOtter's restic does.
-    #[cfg(target_os = "illumos")]
+    // BackOtter: on illumos and Haiku, one whose value can't be read is
+    // left out alone (in `unreadable`), as BackOtter's restic does.
+    #[cfg(any(target_os = "illumos", target_os = "haiku"))]
     return os::xattrs_read(path);
-    #[cfg(not(target_os = "illumos"))]
+    #[cfg(not(any(target_os = "illumos", target_os = "haiku")))]
     os::xattrs(path).map(XattrsRead::from)
 }
 
