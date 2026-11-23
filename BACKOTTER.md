@@ -1492,11 +1492,12 @@ commit but for these:
   dependency pins (0.14.0's lock has the same or newer releases: zstd
   0.14.3, zstd-safe 8.3.0, zstd-sys 2.1.3, still zstd 1.5.7, so the same
   compressed bytes; rustls 0.23.46, rustls-webpki 0.103.17, ctutils 0.4.8,
-  chacha20 0.10.2; suppaftp 10.0.2 with opendal 0.59.5). One line of
-  them is left: tempfile's dependency list has `getrandom 0.4.3` where
-  0.14.0's lock has `0.3.4`, from 708f1c9, which undid a side effect of
-  the pins (ForkAudit1 G9-06; tempfile 3.27.0 takes either, and only this
-  workspace's own tests build with this lock). Of #590's and
+  chacha20 0.10.2; suppaftp 10.0.2 with opendal 0.59.5). The one line
+  of them the rebase left, tempfile's dependency on `getrandom 0.4.3`
+  from 708f1c9, which undid a side effect of the pins, is 0.14.0's
+  `0.3.4` again (ForkAudit1 G8-06, G9-06; tempfile 3.27.0 takes either):
+  the lock differs from 0.14.0's by the fork's version, libc and the
+  vendored walkdir only. Of #590's and
   #634's picks, which had conflicts, the fork's own part stays, as its own
   commit: the paths the fork's restore code touches are checked, and
   `hard_link`'s note.
