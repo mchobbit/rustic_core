@@ -24,16 +24,13 @@ use super::{
     bsd_flags::{
         FREEBSD_KEPT_FLAGS as KEPT_FLAGS, FREEBSD_RESTRICTING_FLAGS, freebsd_file_flags,
     },
-    c_path, check, freebsd_netbsd,
+    c_path, check, chmod_symlink, freebsd_netbsd,
     illumos_project::ZfsProject,
     lower_birthtime, path_error, set_flags_best_effort,
 };
-use crate::backend::{
-    ignore::mapper::nix_mapper::map_mode_from_go,
-    node::{
-        ExtendedAttribute, Node, NodeType,
-        generic_attributes::{FREEBSD_FILE_FLAGS, FREEBSD_ZFS_PROJECT},
-    },
+use crate::backend::node::{
+    ExtendedAttribute, Node, NodeType,
+    generic_attributes::{FREEBSD_FILE_FLAGS, FREEBSD_ZFS_PROJECT},
 };
 
 pub(super) const FILE_FLAGS: Option<&str> = Some(FREEBSD_FILE_FLAGS);
@@ -42,10 +39,6 @@ pub(super) const FLAGS_BEFORE_ENTRIES: u32 = 0;
 pub(super) const FLAGS_XATTRS: &[&str] = &[];
 // ZFS keeps its DOS flags in the file flags here (`uarch`, `uhidden`, ...).
 pub(super) const ZFS_DOS_FLAGS: Option<&str> = None;
-
-unsafe extern "C" {
-    fn lchmod(path: *const libc::c_char, mode: libc::mode_t) -> libc::c_int;
-}
 
 /// Opens a regular file or directory on ZFS for its ZFS project
 /// ([`fill_attributes`]). `None` for other types of file, on other file
@@ -315,19 +308,10 @@ pub(super) fn restore_acls(path: &Path, node: &Node, known_bko: bool) -> io::Res
     freebsd_netbsd::restore_acls(path, node, known_bko)
 }
 
-/// Gives a symlink its own permissions back: FreeBSD keeps them
-/// (`lchmod(2)`), and `ls(1)` and `mtree(8)` show them, though access doesn't
-/// depend on them. Without this a restored symlink gets 0755.
+/// Gives a symlink its own permissions back, which FreeBSD keeps, as the
+/// other BSDs' modules do ([`chmod_symlink`]).
 pub(super) fn restore_symlink_mode(path: &Path, node: &Node) -> io::Result<()> {
-    let Some(mode) = node.meta.mode else {
-        return Ok(());
-    };
-    let p = c_path(path)?;
-    let mode = libc::mode_t::try_from(map_mode_from_go(mode) & 0o7777).unwrap_or(0o755);
-    // SAFETY: p is a C string.
-    _ = check(unsafe { lchmod(p.as_ptr(), mode) })
-        .map_err(|err| path_error("lchmod", path, &err))?;
-    Ok(())
+    chmod_symlink(path, node)
 }
 
 /// Sets the birth time as an earlier mtime, which the final times replace
@@ -394,5 +378,24 @@ mod tests {
         // ZFS gave the new file its archive flag: nothing to record there.
         let flags = file_flags(&file, &NodeType::File, &m, None).unwrap();
         assert_eq!(flags, None, "{name}: st_flags {:#x}", m.st_flags());
+    }
+
+    /// G4-06: a symlink gets its node's permissions as on the other BSDs,
+    /// and a file system that keeps none for it (`EOPNOTSUPP`, `EINVAL`) is
+    /// no error of the restore's; FreeBSD's own copy made each an error.
+    #[test]
+    fn symlink_mode_as_on_the_other_bsds() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("l");
+        std::os::unix::fs::symlink("f", &link).unwrap();
+        let mode = || std::fs::symlink_metadata(&link).unwrap().mode() & 0o7777;
+        let before = mode();
+        let meta = crate::backend::node::Metadata { mode: Some(0o700), ..Default::default() };
+        let typ = NodeType::from_link(Path::new("f"));
+        let node = Node::new_node(std::ffi::OsStr::new("l"), typ, meta);
+        restore_symlink_mode(&link, &node).unwrap();
+        let fs = fs_type(dir.path()).unwrap();
+        eprintln!("symlink_mode_as_on_the_other_bsds: {fs}: {before:o} -> {:o}", mode());
+        assert!(mode() == 0o700 || mode() == before, "{fs}: {:o}", mode());
     }
 }

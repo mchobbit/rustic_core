@@ -1774,12 +1774,17 @@ fn check<T: Copy + Default + PartialOrd>(r: T) -> io::Result<T> {
 }
 
 /// Gives the symlink at `path` the permissions of `node`'s mode, which
-/// OpenBSD, NetBSD and DragonFly keep (`fchmodat(2)` with
+/// FreeBSD, OpenBSD, NetBSD and DragonFly keep (`fchmodat(2)` with
 /// `AT_SYMLINK_NOFOLLOW`; OpenBSD has no `lchmod(2)`), and `ls(1)` and
 /// `mtree(8)` show, though access doesn't depend on them. Without this a
 /// restored symlink gets 0755. A file system that keeps none only goes to
 /// the debug log.
-#[cfg(any(target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))]
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
 fn chmod_symlink(path: &Path, node: &Node) -> io::Result<()> {
     use crate::backend::ignore::mapper::nix_mapper::map_mode_from_go;
 

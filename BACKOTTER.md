@@ -1299,11 +1299,13 @@ that either program restores what the other backed up.
   the attribute is only noted in the debug log, in either tool (both had
   reported each file on tmpfs, restic as an error). A failure
   (`EPERM` as neither owner nor root) is warned about, as for the times.
-- A restored symlink keeps its own permissions on FreeBSD (`lchmod(2)`) and
-  on OpenBSD, NetBSD and DragonFly (`fchmodat(2)` with
-  `AT_SYMLINK_NOFOLLOW`; OpenBSD has no `lchmod`), where stock rustic
-  leaves the 0755 a new symlink gets. A file system that refuses
-  (`EOPNOTSUPP`, `EINVAL`) is only noted in the debug log.
+- A restored symlink keeps its own permissions on FreeBSD, OpenBSD, NetBSD
+  and DragonFly (`fchmodat(2)` with `AT_SYMLINK_NOFOLLOW`, one function for
+  the four; OpenBSD has no `lchmod`), where stock rustic leaves the 0755 a
+  new symlink gets. A file system that refuses (`EOPNOTSUPP`, `EINVAL`) is
+  only noted in the debug log, on FreeBSD too since 0.14.0+backotter.2
+  (it had its own `lchmod(2)` call, whose every failure was a warning for
+  the symlink, and `EINVAL` an error of the restore).
 - On DragonFly the restore sets atimes and mtimes with `utimensat(2)`
   (`AT_SYMLINK_NOFOLLOW`), to the nanosecond, as BackOtter's restic does:
   the filetime crate goes through `utimes(2)` and `lutimes(2)` there, which
