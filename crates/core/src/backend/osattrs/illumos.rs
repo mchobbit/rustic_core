@@ -968,16 +968,18 @@ fn attr_has_value(dir: &File, name: &CStr, want: &[u8]) -> bool {
 /// node holds no such name).
 pub(super) fn set_xattrs(path: &Path, attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
     let Some(dir) = attr_dir(path)? else {
+        // Which of the two reasons attr_dir has for none: a symlink, FIFO
+        // or device has none kept on any file system.
+        let kept_type = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() || m.is_dir());
+        let why = if kept_type {
+            "no extended attributes on this file system"
+        } else {
+            "no extended attributes are kept for this type of file"
+        };
         // Each one named, as those that can't be set are.
         let mut errors = XattrErrors::default();
         for attr in attrs {
-            errors.push(
-                attr.name.as_str(),
-                io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "no extended attributes on this file system",
-                ),
-            );
+            errors.push(attr.name.as_str(), io::Error::new(io::ErrorKind::Unsupported, why));
         }
         return errors.into_result();
     };
@@ -1536,6 +1538,23 @@ mod tests {
         restore_file_flags(&file, &NodeType::File, automatic, &[]).unwrap();
         reset.unwrap();
         assert_eq!(kept, Some(automatic | immutable));
+    }
+
+    /// ForkAudit1 G5-12: a symlink's extended attributes (a Linux
+    /// snapshot's `security.selinux`) are refused for its type, not blamed
+    /// on the file system; none wanted is no error.
+    #[test]
+    fn set_xattrs_names_the_type_of_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("l");
+        std::os::unix::fs::symlink("nowhere", &link).unwrap();
+        set_xattrs(&link, &[]).unwrap();
+        let err = set_xattrs(&link, &[xattr("security.selinux", b"x")]).unwrap_err();
+        assert!(
+            err.to_string().contains("no extended attributes are kept for this type of file"),
+            "{err}"
+        );
+        assert!(!err.counts(true), "{err}");
     }
 
     /// The node of a file with the mode `mode`, owned by `uid`:`gid`.
