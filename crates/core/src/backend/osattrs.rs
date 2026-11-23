@@ -319,8 +319,6 @@ pub(crate) fn clone_contents(src: &File, dst: &File) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
-        /// `_IOW(0x94, 9, int)`
-        const FICLONE: libc::Ioctl = 0x4004_9409;
         // SAFETY: FICLONE takes the source's descriptor as its argument;
         // both are open for the call's duration.
         if unsafe { libc::ioctl(dst.as_raw_fd(), FICLONE, src.as_raw_fd()) } < 0 {
@@ -334,6 +332,12 @@ pub(crate) fn clone_contents(src: &File, dst: &File) -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 }
+
+/// `FICLONE` from `<linux/fs.h>`, `_IOW(0x94, 9, int)`: built as the
+/// architecture encodes an ioctl's direction and size (powerpc, mips and
+/// sparc not as the others).
+#[cfg(target_os = "linux")]
+const FICLONE: libc::Ioctl = libc::_IOW::<libc::c_int>(0x94, 9);
 
 /// BackOtter: whether [`prepare_file`] has nothing to do for `node`: no flag
 /// or option that goes on before the data, so that its contents may come
@@ -1980,6 +1984,15 @@ fn unsupported(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // BackOtter (ForkAudit1 G3-07): FICLONE as <linux/fs.h> gives it where
+    // an ioctl's direction is asm-generic's. Its low 32 bits: musl's ioctl
+    // takes an int and glibc's an unsigned long.
+    #[test]
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    fn ficlone_is_the_headers() {
+        assert_eq!(i128::from(FICLONE) & 0xffff_ffff, 0x4004_9409);
+    }
 
     /// BackOtter: what `--strict-exit` counts of the failures a restore
     /// warns about, as BackOtter's restic does: not unsupported metadata nor
