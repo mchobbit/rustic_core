@@ -12,10 +12,8 @@ use std::{io, os::netbsd::fs::MetadataExt, path::Path};
 use jiff::Timestamp;
 
 use super::{
-    RestoreErrors, XattrErrors, bsd_held::restore_no_flags,
-    bsd_flags::NETBSD_KEPT_FLAGS,
-    c_path, check, chmod_symlink, freebsd_netbsd,
-    lower_birthtime, path_error, set_flags_best_effort,
+    RestoreErrors, XattrErrors, bsd_flags::NETBSD_KEPT_FLAGS, bsd_held::restore_no_flags, c_path,
+    check, chmod_symlink, freebsd_netbsd, lower_birthtime, path_error, set_flags_best_effort,
 };
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType, generic_attributes::NETBSD_FILE_FLAGS,
@@ -107,12 +105,23 @@ pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
 ///   that holds both ([`RestoreErrors`]).
 pub(super) fn restore_attributes(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
     let extattrs = freebsd_netbsd::restore_system_extattrs(path, node);
-    let flags = if known_bko && node.meta.generic_attributes.value(NETBSD_FILE_FLAGS).is_none() {
+    let flags = if known_bko
+        && node
+            .meta
+            .generic_attributes
+            .value(NETBSD_FILE_FLAGS)
+            .is_none()
+    {
         restore_no_flags(path, NETBSD_FILE_FLAGS, NETBSD_KEPT_FLAGS, 0)
     } else {
         Ok(())
     };
-    RestoreErrors::result([extattrs, flags].into_iter().filter_map(Result::err).collect())
+    RestoreErrors::result(
+        [extattrs, flags]
+            .into_iter()
+            .filter_map(Result::err)
+            .collect(),
+    )
 }
 
 /// Restores the ACLs, a symlink's too; in a snapshot of BackOtter's
@@ -136,10 +145,17 @@ pub(super) fn fill_xattr_meta(_path: &Path, _node: &mut Node) {}
 
 /// Extended attributes go through the xattr crate here.
 pub(super) fn xattrs(_path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "extended attributes go through xattr",
+    ))
 }
 
 /// Extended attributes go through the xattr crate here.
 pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr").into())
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "extended attributes go through xattr",
+    )
+    .into())
 }

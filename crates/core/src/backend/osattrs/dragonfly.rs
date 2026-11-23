@@ -92,7 +92,13 @@ pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
 /// `dragonfly.file_flags` had none, and loses those it has now
 /// ([`restore_no_flags`]). Nothing else to restore here.
 pub(super) fn restore_attributes(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
-    if known_bko && node.meta.generic_attributes.value(DRAGONFLY_FILE_FLAGS).is_none() {
+    if known_bko
+        && node
+            .meta
+            .generic_attributes
+            .value(DRAGONFLY_FILE_FLAGS)
+            .is_none()
+    {
         return restore_no_flags(path, DRAGONFLY_FILE_FLAGS, DRAGONFLY_KEPT_FLAGS, 0);
     }
     Ok(())
@@ -108,7 +114,10 @@ pub(super) fn restore_symlink_mode(path: &Path, node: &Node) -> io::Result<()> {
 
 /// The `struct stat` here has no birth time.
 pub(super) fn restore_birthtime(_path: &Path, _node: &Node, _birth: Timestamp) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "DragonFly keeps no birth times"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "DragonFly keeps no birth times",
+    ))
 }
 
 /// Extended attributes have no metadata of their own here.
@@ -116,10 +125,17 @@ pub(super) fn fill_xattr_meta(_path: &Path, _node: &mut Node) {}
 
 /// Extended attributes go through the xattr crate here.
 pub(super) fn xattrs(_path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "extended attributes go through xattr",
+    ))
 }
 
 /// Extended attributes go through the xattr crate here.
 pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr").into())
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "extended attributes go through xattr",
+    )
+    .into())
 }

@@ -131,7 +131,11 @@ fn fill_zfs_project(path: &Path, node: &mut Node, f: &File) {
 /// in, as on illumos. It goes before the file flags. A file system other
 /// than ZFS (UFS: `ENOTTY`) gives an [`Unsupported`] error.
 fn restore_zfs_project(path: &Path, node: &Node) -> io::Result<()> {
-    let Some(p) = node.meta.generic_attributes.get::<ZfsProject>(FREEBSD_ZFS_PROJECT) else {
+    let Some(p) = node
+        .meta
+        .generic_attributes
+        .get::<ZfsProject>(FREEBSD_ZFS_PROJECT)
+    else {
         return Ok(());
     };
     let p = p.map_err(io::Error::other)?;
@@ -148,7 +152,8 @@ fn restore_zfs_project(path: &Path, node: &Node) -> io::Result<()> {
         }
     };
     let mut zx = ZfsXattr::default();
-    zfs_xattr(&f, ZFS_IOC_FSGETXATTR, &mut zx).map_err(|err| error("ioctl get ZFS project", err))?;
+    zfs_xattr(&f, ZFS_IOC_FSGETXATTR, &mut zx)
+        .map_err(|err| error("ioctl get ZFS project", err))?;
     let mut want = ZfsXattr {
         xflags: p.xflags(zx.xflags),
         projid: p.id,
@@ -182,7 +187,10 @@ pub(super) fn file_flags(
 fn on_zfs(path: &Path, typ: &NodeType, m: &std::fs::Metadata) -> bool {
     static ZFS: Mutex<BTreeMap<u64, bool>> = Mutex::new(BTreeMap::new());
     // Not held while the file system is asked: two threads may both ask.
-    let known = || ZFS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let known = || {
+        ZFS.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
     if let Some(&zfs) = known().get(&m.st_dev()) {
         return zfs;
     }
@@ -191,7 +199,11 @@ fn on_zfs(path: &Path, typ: &NodeType, m: &std::fs::Metadata) -> bool {
         Some(dir) => dir.to_path_buf(),
         None => path.to_path_buf(),
     };
-    let on = if m.file_type().is_symlink() { dir() } else { path.to_path_buf() };
+    let on = if m.file_type().is_symlink() {
+        dir()
+    } else {
+        path.to_path_buf()
+    };
     let named_zfs = fs_type(&on)
         .inspect_err(|err| debug!("statfs {}: {err}", on.display()))
         .is_ok_and(|name| name == "zfs");
@@ -306,7 +318,13 @@ pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
 pub(super) fn restore_attributes(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
     let extattrs = freebsd_netbsd::restore_system_extattrs(path, node);
     let project = restore_zfs_project(path, node);
-    let flags = if known_bko && node.meta.generic_attributes.value(FREEBSD_FILE_FLAGS).is_none() {
+    let flags = if known_bko
+        && node
+            .meta
+            .generic_attributes
+            .value(FREEBSD_FILE_FLAGS)
+            .is_none()
+    {
         std::fs::symlink_metadata(path)
             .map_err(|err| path_error("lstat", path, &err))
             .and_then(|m| {
@@ -316,7 +334,12 @@ pub(super) fn restore_attributes(path: &Path, node: &Node, known_bko: bool) -> i
     } else {
         Ok(())
     };
-    RestoreErrors::result([project, extattrs, flags].into_iter().filter_map(Result::err).collect())
+    RestoreErrors::result(
+        [project, extattrs, flags]
+            .into_iter()
+            .filter_map(Result::err)
+            .collect(),
+    )
 }
 
 pub(super) use super::bsd_held::clear_restricting_flags;
@@ -344,12 +367,19 @@ pub(super) fn fill_xattr_meta(_path: &Path, _node: &mut Node) {}
 
 /// Extended attributes go through the xattr crate here.
 pub(super) fn xattrs(_path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "extended attributes go through xattr",
+    ))
 }
 
 /// Extended attributes go through the xattr crate here.
 pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr").into())
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "extended attributes go through xattr",
+    )
+    .into())
 }
 
 #[cfg(test)]
@@ -369,7 +399,9 @@ mod tests {
         let lower = std::env::var("BKO_TEST_NULLFS_LOWER").ok();
         let zfs = match (name.as_str(), lower.as_deref()) {
             ("nullfs", None) => {
-                eprintln!("on_zfs_by_what_the_file_answers: TMPDIR on nullfs, BKO_TEST_NULLFS_LOWER not set: nothing tested");
+                eprintln!(
+                    "on_zfs_by_what_the_file_answers: TMPDIR on nullfs, BKO_TEST_NULLFS_LOWER not set: nothing tested"
+                );
                 return;
             }
             ("nullfs", Some(lower)) => lower == "zfs",
@@ -382,18 +414,39 @@ mod tests {
 
         // Not through on_zfs's memory of the device: each asked itself.
         let m = lstat(&file);
-        assert_eq!(answers_as_zfs(&file, &NodeType::File, &m), Some(zfs), "{name}");
-        assert_eq!(answers_as_zfs(dir.path(), &NodeType::Dir, &m), Some(zfs), "{name}");
+        assert_eq!(
+            answers_as_zfs(&file, &NodeType::File, &m),
+            Some(zfs),
+            "{name}"
+        );
+        assert_eq!(
+            answers_as_zfs(dir.path(), &NodeType::Dir, &m),
+            Some(zfs),
+            "{name}"
+        );
         // Not the file `m` is of, by its type or its device.
         assert_eq!(answers_as_zfs(&file, &NodeType::Dir, &m), None);
         assert_eq!(answers_as_zfs(Path::new("/dev"), &NodeType::Dir, &m), None);
 
         let symlink = NodeType::from_link(Path::new("f"));
         for (path, typ) in [(&link, &symlink), (&file, &NodeType::File)] {
-            assert_eq!(on_zfs(path, typ, &lstat(path)), zfs, "{name}: {}", path.display());
+            assert_eq!(
+                on_zfs(path, typ, &lstat(path)),
+                zfs,
+                "{name}: {}",
+                path.display()
+            );
         }
-        assert_eq!(on_zfs(dir.path(), &NodeType::Dir, &lstat(dir.path())), zfs, "{name}");
-        assert_eq!(open_for_attrs(&file, &NodeType::File, &m).is_some(), zfs, "{name}");
+        assert_eq!(
+            on_zfs(dir.path(), &NodeType::Dir, &lstat(dir.path())),
+            zfs,
+            "{name}"
+        );
+        assert_eq!(
+            open_for_attrs(&file, &NodeType::File, &m).is_some(),
+            zfs,
+            "{name}"
+        );
         // ZFS gave the new file its archive flag: nothing to record there.
         let flags = file_flags(&file, &NodeType::File, &m, None).unwrap();
         assert_eq!(flags, None, "{name}: st_flags {:#x}", m.st_flags());
@@ -409,12 +462,18 @@ mod tests {
         std::os::unix::fs::symlink("f", &link).unwrap();
         let mode = || std::fs::symlink_metadata(&link).unwrap().mode() & 0o7777;
         let before = mode();
-        let meta = crate::backend::node::Metadata { mode: Some(0o700), ..Default::default() };
+        let meta = crate::backend::node::Metadata {
+            mode: Some(0o700),
+            ..Default::default()
+        };
         let typ = NodeType::from_link(Path::new("f"));
         let node = Node::new_node(std::ffi::OsStr::new("l"), typ, meta);
         restore_symlink_mode(&link, &node).unwrap();
         let fs = fs_type(dir.path()).unwrap();
-        eprintln!("symlink_mode_as_on_the_other_bsds: {fs}: {before:o} -> {:o}", mode());
+        eprintln!(
+            "symlink_mode_as_on_the_other_bsds: {fs}: {before:o} -> {:o}",
+            mode()
+        );
         assert!(mode() == 0o700 || mode() == before, "{fs}: {:o}", mode());
     }
 }

@@ -12,7 +12,10 @@
 //! `sys/sys/acl.h`, netbsd-10 and netbsd-11, has the same struct and the
 //! same value for every `ACL_` name.
 
-#![cfg_attr(not(any(target_os = "freebsd", target_os = "netbsd")), allow(dead_code))]
+#![cfg_attr(
+    not(any(target_os = "freebsd", target_os = "netbsd")),
+    allow(dead_code)
+)]
 
 use serde::{Deserialize, Serialize};
 
@@ -325,7 +328,10 @@ mod tests {
             0o644, 0o755, 0o600, 0o000, 0o777, 0o604, 0o070, 0o007, 0o460,
         ] {
             let acl = nfs4_trivial_acl(mode);
-            assert!(nfs4_is_trivial(&acl), "trivial ACL for {mode:o} not trivial");
+            assert!(
+                nfs4_is_trivial(&acl),
+                "trivial ACL for {mode:o} not trivial"
+            );
             assert_eq!(mode, nfs4_mode_from_acl(&acl));
         }
         // What getfacl(1) shows ZFS giving a new 0644 file:
@@ -345,7 +351,10 @@ mod tests {
             entry(GROUP_OBJ, UNDEFINED_ID, read, ENTRY_TYPE_ALLOW),
             entry(EVERYONE, UNDEFINED_ID, read, ENTRY_TYPE_ALLOW),
         ];
-        assert!(nfs4_is_trivial(&zfs), "ZFS's trivial ACL for 0644 not trivial");
+        assert!(
+            nfs4_is_trivial(&zfs),
+            "ZFS's trivial ACL for 0644 not trivial"
+        );
         assert_eq!(0o644, nfs4_mode_from_acl(&zfs));
 
         let mut named = vec![entry(USER, 65534, READ_DATA, ENTRY_TYPE_ALLOW)];
@@ -354,11 +363,17 @@ mod tests {
 
         let mut inherit = zfs.clone();
         inherit[2].flags = 0x0001; // file_inherit
-        assert!(!nfs4_is_trivial(&inherit), "ACL with an inheritable entry is trivial");
+        assert!(
+            !nfs4_is_trivial(&inherit),
+            "ACL with an inheritable entry is trivial"
+        );
 
         let mut deny = vec![entry(GROUP_OBJ, UNDEFINED_ID, WRITE_ACL, ENTRY_TYPE_DENY)];
         deny.extend(&zfs);
-        assert!(!nfs4_is_trivial(&deny), "ACL with an extra deny entry is trivial");
+        assert!(
+            !nfs4_is_trivial(&deny),
+            "ACL with an extra deny entry is trivial"
+        );
     }
 
     #[test]
@@ -394,7 +409,13 @@ mod tests {
         );
         for mode in [0, 0o640, 0o777] {
             let mut attrs = GenericAttributes::default();
-            keep_acl(&FREEBSD, &mut attrs, AclType::Access, &posix_trivial_acl(mode)).unwrap();
+            keep_acl(
+                &FREEBSD,
+                &mut attrs,
+                AclType::Access,
+                &posix_trivial_acl(mode),
+            )
+            .unwrap();
             assert_eq!(attrs.names().count(), 0, "{mode:o}");
         }
     }
@@ -440,7 +461,11 @@ mod tests {
             );
             let back: Vec<AclEntry> = attrs.get(os.acl_nfs4).unwrap().unwrap();
             assert_eq!(back, nfs4);
-            json.push(serde_json::to_string(&attrs).unwrap().replace(prefix, "PREFIX"));
+            json.push(
+                serde_json::to_string(&attrs)
+                    .unwrap()
+                    .replace(prefix, "PREFIX"),
+            );
         }
         assert_eq!(json[0], json[1]);
         // A generic attribute's object keys come out sorted.

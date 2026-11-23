@@ -65,7 +65,10 @@ pub(super) const FREEBSD_RESTRICTING_FLAGS: u32 = UF_IMMUTABLE
 
 /// As [`FREEBSD_RESTRICTING_FLAGS`], on NetBSD and OpenBSD, which have no
 /// undeletable or read-only flags.
-#[cfg_attr(not(any(target_os = "netbsd", target_os = "openbsd")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "netbsd", target_os = "openbsd")),
+    allow(dead_code)
+)]
 pub(super) const NETBSD_OPENBSD_RESTRICTING_FLAGS: u32 =
     UF_IMMUTABLE | UF_APPEND | SF_IMMUTABLE | SF_APPEND;
 

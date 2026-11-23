@@ -63,7 +63,8 @@ fn set_path_flags_raw(path: &Path, flags: u32) -> io::Result<()> {
     let p = c_path(path)?;
     #[cfg(target_os = "openbsd")]
     // SAFETY: p is a C string.
-    let r = unsafe { libc::chflagsat(libc::AT_FDCWD, p.as_ptr(), flags, libc::AT_SYMLINK_NOFOLLOW) };
+    let r =
+        unsafe { libc::chflagsat(libc::AT_FDCWD, p.as_ptr(), flags, libc::AT_SYMLINK_NOFOLLOW) };
     #[cfg(not(target_os = "openbsd"))]
     // SAFETY: p is a C string.
     let r = unsafe { libc::lchflags(p.as_ptr(), flags.into()) };
@@ -120,9 +121,14 @@ pub(super) fn restore_no_flags(
         return Ok(());
     }
     let own = current & !kept;
-    set_flags_best_effort(attr, path, PATH_OP, Some(current & kept), none & kept, |bits| {
-        set_path_flags_raw(path, own | bits)
-    })
+    set_flags_best_effort(
+        attr,
+        path,
+        PATH_OP,
+        Some(current & kept),
+        none & kept,
+        |bits| set_path_flags_raw(path, own | bits),
+    )
 }
 
 /// Clears the restricting flags of the file at `path`, held for putting
@@ -226,8 +232,14 @@ mod tests {
     #[test]
     fn restore_takes_off_flags_the_node_lacks() {
         let dir = tempfile::tempdir().unwrap();
-        for typ in [NodeType::File, NodeType::Dir, NodeType::from_link(Path::new("f"))] {
-            let path = dir.path().join(format!("{typ:?}").split(' ').next().unwrap());
+        for typ in [
+            NodeType::File,
+            NodeType::Dir,
+            NodeType::from_link(Path::new("f")),
+        ] {
+            let path = dir
+                .path()
+                .join(format!("{typ:?}").split(' ').next().unwrap());
             match typ {
                 NodeType::File => std::fs::write(&path, "x").unwrap(),
                 NodeType::Dir => std::fs::create_dir(&path).unwrap(),
@@ -242,12 +254,20 @@ mod tests {
             let restore = |known_bko| super::super::os::restore_attributes(&path, &node, known_bko);
 
             restore(false).unwrap();
-            assert_eq!(flags_and_ctime(&path).0, new_file | UF_NODUMP, "not BackOtter's: kept");
+            assert_eq!(
+                flags_and_ctime(&path).0,
+                new_file | UF_NODUMP,
+                "not BackOtter's: kept"
+            );
             restore(true).unwrap();
             let after = flags_and_ctime(&path);
             assert_eq!(after.0, new_file, "{}", path.display());
             restore(true).unwrap();
-            assert_eq!(flags_and_ctime(&path), after, "a second restore wrote to the file");
+            assert_eq!(
+                flags_and_ctime(&path),
+                after,
+                "a second restore wrote to the file"
+            );
         }
     }
 }

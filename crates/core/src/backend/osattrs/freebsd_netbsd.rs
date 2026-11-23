@@ -54,7 +54,10 @@ impl std::fmt::Debug for RawAcl {
         f.debug_struct("RawAcl")
             .field("maxcnt", &self.maxcnt)
             .field("cnt", &self.cnt)
-            .field("entries", &self.entries.iter().take(used).collect::<Vec<_>>())
+            .field(
+                "entries",
+                &self.entries.iter().take(used).collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -245,9 +248,7 @@ fn extattr_size(f: impl Fn(*mut libc::c_void, usize) -> libc::ssize_t) -> io::Re
 ///
 /// * If `f` fails (its errno, without the path), or the size changed with
 ///   each read.
-fn extattr_read(
-    f: impl Fn(*mut libc::c_void, usize) -> libc::ssize_t,
-) -> io::Result<Vec<u8>> {
+fn extattr_read(f: impl Fn(*mut libc::c_void, usize) -> libc::ssize_t) -> io::Result<Vec<u8>> {
     let mut size = extattr_size(&f)?;
     for _ in 0..EXTATTR_READS {
         if size == 0 {
@@ -301,7 +302,13 @@ fn get_system_extattr(path: &Path, name: &[u8]) -> io::Result<Vec<u8>> {
     extattr_read(|data, size| {
         // SAFETY: data is null or points to size bytes.
         unsafe {
-            libc::extattr_get_link(p.as_ptr(), libc::EXTATTR_NAMESPACE_SYSTEM, n.as_ptr(), data, size)
+            libc::extattr_get_link(
+                p.as_ptr(),
+                libc::EXTATTR_NAMESPACE_SYSTEM,
+                n.as_ptr(),
+                data,
+                size,
+            )
         }
     })
 }
@@ -319,7 +326,8 @@ fn set_system_extattr(path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
             value.len(),
         )
     };
-    _ = check(r).map_err(|err| path_error(&format!("extattr_set_link system.{name}"), path, &err))?;
+    _ = check(r)
+        .map_err(|err| path_error(&format!("extattr_set_link system.{name}"), path, &err))?;
     Ok(())
 }
 
@@ -334,7 +342,10 @@ fn delete_system_extattr(path: &Path, name: &[u8]) -> io::Result<()> {
         Ok(_) => Ok(()),
         Err(err) if err.raw_os_error() == Some(libc::ENOATTR) => Ok(()), // gone already
         Err(err) => {
-            let op = format!("extattr_delete_link system.{}", bsd_extattr::node_name(name));
+            let op = format!(
+                "extattr_delete_link system.{}",
+                bsd_extattr::node_name(name)
+            );
             Err(path_error(&op, path, &err))
         }
     }
@@ -345,7 +356,9 @@ fn delete_system_extattr(path: &Path, name: &[u8]) -> io::Result<()> {
 #[serde_as]
 #[derive(Serialize, Deserialize, Debug, Default)]
 #[serde(transparent)]
-struct SystemExtattrs(#[serde_as(as = "BTreeMap<_, DefaultOnNull<Base64>>")] BTreeMap<String, Vec<u8>>);
+struct SystemExtattrs(
+    #[serde_as(as = "BTreeMap<_, DefaultOnNull<Base64>>")] BTreeMap<String, Vec<u8>>,
+);
 
 /// Records the system extended attributes and ACLs of the file at `path`
 /// in `node`.
@@ -358,7 +371,12 @@ struct SystemExtattrs(#[serde_as(as = "BTreeMap<_, DefaultOnNull<Base64>>")] BTr
 pub(super) fn fill_attributes(path: &Path, node: &mut Node) -> io::Result<()> {
     let extattrs = fill_system_extattrs(path, node);
     let acls = fill_acls(path, node);
-    RestoreErrors::result([extattrs, acls].into_iter().filter_map(Result::err).collect())
+    RestoreErrors::result(
+        [extattrs, acls]
+            .into_iter()
+            .filter_map(Result::err)
+            .collect(),
+    )
 }
 
 fn fill_system_extattrs(path: &Path, node: &mut Node) -> io::Result<()> {
@@ -366,7 +384,10 @@ fn fill_system_extattrs(path: &Path, node: &mut Node) -> io::Result<()> {
         Ok(names) => names,
         Err(err) if unsupported(&err) => {
             // Not root, or no extended attributes on this file system.
-            debug!("no system extended attributes for {}: {err}", path.display());
+            debug!(
+                "no system extended attributes for {}: {err}",
+                path.display()
+            );
             return Ok(());
         }
         Err(err) => return Err(path_error("extattr_list_link system", path, &err)),
@@ -519,7 +540,8 @@ pub(super) fn restore_acls(path: &Path, node: &Node, known_bko: bool) -> io::Res
     };
     restore(AclType::Nfs4, &|_| Ok(()));
     restore(AclType::Access, &|acl| {
-        let (Some(perms), Some(mode)) = (freebsd_acl::posix_owning_group_perms(acl), node.meta.mode)
+        let (Some(perms), Some(mode)) =
+            (freebsd_acl::posix_owning_group_perms(acl), node.meta.mode)
         else {
             return Ok(());
         };
@@ -556,7 +578,12 @@ pub(super) fn restore_acls(path: &Path, node: &Node, known_bko: bool) -> io::Res
 ///   set or removed: the access ACL's error, the default ACL's, or one that
 ///   holds both ([`RestoreErrors`]).
 fn strip_acls(path: &Path, node: &Node) -> io::Result<()> {
-    let has = |typ| node.meta.generic_attributes.value(sys::OS.attribute(typ)).is_some();
+    let has = |typ| {
+        node.meta
+            .generic_attributes
+            .value(sys::OS.attribute(typ))
+            .is_some()
+    };
     let current = |typ| match get_acl(path, typ) {
         Ok(acl) => Ok(acl),
         Err(err) if no_acls(&err) => Ok(Vec::new()),
@@ -587,7 +614,11 @@ fn strip_acls(path: &Path, node: &Node) -> io::Result<()> {
             if acl.len() <= 3 {
                 return Ok(());
             }
-            set_acl(path, AclType::Access, &freebsd_acl::posix_trivial_acl(mode()?))
+            set_acl(
+                path,
+                AclType::Access,
+                &freebsd_acl::posix_trivial_acl(mode()?),
+            )
         })
     };
     if !node.is_dir() || has(AclType::Default) {
@@ -599,7 +630,12 @@ fn strip_acls(path: &Path, node: &Node) -> io::Result<()> {
         }
         delete_default_acl(path)
     });
-    RestoreErrors::result([access, default].into_iter().filter_map(Result::err).collect())
+    RestoreErrors::result(
+        [access, default]
+            .into_iter()
+            .filter_map(Result::err)
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -631,7 +667,10 @@ mod tests {
         } else if path_conf(dir.path(), sys::OS.pc_acl_extended).ok() == Some(1) {
             AclType::Access
         } else {
-            eprintln!("{test}: no ACLs on {}: nothing tested", dir.path().display());
+            eprintln!(
+                "{test}: no ACLs on {}: nothing tested",
+                dir.path().display()
+            );
             return None;
         };
         Some((dir, typ))
@@ -640,7 +679,13 @@ mod tests {
     /// An ACL of type `typ` that gives user 4242 read access on top of
     /// `mode`: more than the mode says.
     fn acl_with_a_user(typ: AclType, mode: u32) -> Vec<AclEntry> {
-        let entry = |tag, id, perm, entry_type| AclEntry { tag, id, perm, entry_type, flags: 0 };
+        let entry = |tag, id, perm, entry_type| AclEntry {
+            tag,
+            id,
+            perm,
+            entry_type,
+            flags: 0,
+        };
         if typ == AclType::Nfs4 {
             // user:4242:r-----:allow, ahead of the mode's own entries.
             let mut acl = vec![entry(0x02, 4242, 0x08, 0x0100)];
@@ -659,7 +704,10 @@ mod tests {
     }
 
     fn node_of(name: &str, typ: NodeType, mode: u32) -> Node {
-        let meta = crate::backend::node::Metadata { mode: Some(mode), ..Default::default() };
+        let meta = crate::backend::node::Metadata {
+            mode: Some(mode),
+            ..Default::default()
+        };
         Node::new_node(std::ffi::OsStr::new(name), typ, meta)
     }
 
@@ -675,8 +723,11 @@ mod tests {
         let Some((dir, typ)) = acl_dir("symlink_acls_are_kept_and_restored") else {
             return;
         };
-        let (target, link, restored) =
-            (dir.path().join("target"), dir.path().join("link"), dir.path().join("restored"));
+        let (target, link, restored) = (
+            dir.path().join("target"),
+            dir.path().join("link"),
+            dir.path().join("restored"),
+        );
         std::fs::write(&target, "x").unwrap();
         std::os::unix::fs::symlink("target", &link).unwrap();
         std::os::unix::fs::symlink("target", &restored).unwrap();
@@ -687,8 +738,15 @@ mod tests {
 
         let mut node = symlink_node();
         fill_acls(&link, &mut node).unwrap();
-        let kept = node.meta.generic_attributes.get::<Vec<AclEntry>>(sys::OS.attribute(typ));
-        assert_eq!(kept.map(Result::unwrap), Some(acl.clone()), "the symlink's ACL not kept");
+        let kept = node
+            .meta
+            .generic_attributes
+            .get::<Vec<AclEntry>>(sys::OS.attribute(typ));
+        assert_eq!(
+            kept.map(Result::unwrap),
+            Some(acl.clone()),
+            "the symlink's ACL not kept"
+        );
 
         restore_acls(&restored, &node, true).unwrap();
         assert_eq!(get_acl(&restored, typ).unwrap(), acl);
@@ -699,7 +757,10 @@ mod tests {
         std::os::unix::fs::symlink("target", &bare).unwrap();
         let mut plain = symlink_node();
         fill_acls(&bare, &mut plain).unwrap();
-        let kept = plain.meta.generic_attributes.get::<Vec<AclEntry>>(sys::OS.attribute(typ));
+        let kept = plain
+            .meta
+            .generic_attributes
+            .get::<Vec<AclEntry>>(sys::OS.attribute(typ));
         assert!(kept.is_none(), "a symlink without an ACL got one: {kept:?}");
     }
 
@@ -756,7 +817,11 @@ mod tests {
         let after_chmod = get_acl(&file, typ).unwrap();
 
         restore_acls(&file, &node, false).unwrap();
-        assert_eq!(get_acl(&file, typ).unwrap(), after_chmod, "not BackOtter's: kept");
+        assert_eq!(
+            get_acl(&file, typ).unwrap(),
+            after_chmod,
+            "not BackOtter's: kept"
+        );
 
         restore_acls(&file, &node, true).unwrap();
         assert!(only_the_mode(&file, typ), "{:?}", get_acl(&file, typ));
@@ -766,7 +831,11 @@ mod tests {
 
         // A node with the ACL sets it, as before.
         let mut keeps = node.clone();
-        keeps.meta.generic_attributes.set(sys::OS.attribute(typ), &with_user).unwrap();
+        keeps
+            .meta
+            .generic_attributes
+            .set(sys::OS.attribute(typ), &with_user)
+            .unwrap();
         restore_acls(&file, &keeps, true).unwrap();
         assert_eq!(get_acl(&file, typ).unwrap(), with_user);
     }
@@ -791,7 +860,10 @@ mod tests {
 
         let node = node_of("d", NodeType::Dir, 0o750);
         restore_acls(&d, &node, false).unwrap();
-        assert!(!get_acl(&d, AclType::Default).unwrap().is_empty(), "not BackOtter's: kept");
+        assert!(
+            !get_acl(&d, AclType::Default).unwrap().is_empty(),
+            "not BackOtter's: kept"
+        );
         restore_acls(&d, &node, true).unwrap();
         assert!(get_acl(&d, AclType::Default).unwrap().is_empty());
         let before = ctime(&d);
@@ -831,7 +903,11 @@ mod tests {
         set_system_extattr(&file, "bko.extra", b"x").unwrap();
         let bare = node_of("f", NodeType::File, 0o644);
         restore_system_extattrs(&file, &bare).unwrap();
-        assert_eq!(system_names(&file), ["bko.extra", "bko.kept"], "no attribute: left");
+        assert_eq!(
+            system_names(&file),
+            ["bko.extra", "bko.kept"],
+            "no attribute: left"
+        );
         assert!(absent_is_unknown(sys::OS.system_extattrs));
         assert!(!absent_is_unknown(sys::OS.acl_access));
 
@@ -839,7 +915,10 @@ mod tests {
         _ = attrs.0.insert("bko.kept".to_string(), b"new".to_vec());
         _ = attrs.0.insert("bko.made".to_string(), b"m".to_vec());
         let mut node = bare.clone();
-        node.meta.generic_attributes.set(sys::OS.system_extattrs, &attrs).unwrap();
+        node.meta
+            .generic_attributes
+            .set(sys::OS.system_extattrs, &attrs)
+            .unwrap();
         restore_system_extattrs(&file, &node).unwrap();
         assert_eq!(system_names(&file), ["bko.kept", "bko.made"]);
         assert_eq!(get_system_extattr(&file, b"bko.kept").unwrap(), b"new");
@@ -883,14 +962,29 @@ mod tests {
         // Grown from 10 to 20 bytes between the size and the read: the read
         // that filled its 10 bytes is done again with 20.
         let (short, long) = ("0123456789", "0123456789abcdefghij");
-        assert_eq!(extattr_read(fake_extattr(&[short, long])).unwrap(), long.as_bytes());
+        assert_eq!(
+            extattr_read(fake_extattr(&[short, long])).unwrap(),
+            long.as_bytes()
+        );
         // Shrunk: what was read is all there is.
-        assert_eq!(extattr_read(fake_extattr(&[short, "01234"])).unwrap(), b"01234");
+        assert_eq!(
+            extattr_read(fake_extattr(&[short, "01234"])).unwrap(),
+            b"01234"
+        );
         // Gone after the size: nothing.
         assert!(extattr_read(fake_extattr(&[short, ""])).unwrap().is_empty());
         // Growing with each call: given up on, not kept cut short.
-        let growing =
-            ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh", "abcdefghi"];
+        let growing = [
+            "a",
+            "ab",
+            "abc",
+            "abcd",
+            "abcde",
+            "abcdef",
+            "abcdefg",
+            "abcdefgh",
+            "abcdefghi",
+        ];
         let err = extattr_read(fake_extattr(&growing)).unwrap_err();
         assert!(err.to_string().contains("changed with each"), "{err}");
     }
@@ -900,7 +994,10 @@ mod tests {
         let mut attrs = SystemExtattrs::default();
         _ = attrs.0.insert("a".to_string(), b"hi".to_vec());
         _ = attrs.0.insert("b".to_string(), Vec::new());
-        assert_eq!(serde_json::to_string(&attrs).unwrap(), r#"{"a":"aGk=","b":""}"#);
+        assert_eq!(
+            serde_json::to_string(&attrs).unwrap(),
+            r#"{"a":"aGk=","b":""}"#
+        );
         let back: SystemExtattrs = serde_json::from_str(r#"{"a":"aGk=","b":null}"#).unwrap();
         assert_eq!(back.0["a"], b"hi");
         assert!(back.0["b"].is_empty());

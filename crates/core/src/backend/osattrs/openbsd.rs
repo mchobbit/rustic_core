@@ -67,13 +67,20 @@ pub(super) fn restore_file_flags(
     _xattrs: &[ExtendedAttribute],
 ) -> io::Result<()> {
     let p = c_path(path)?;
-    set_flags_best_effort(OPENBSD_FILE_FLAGS, path, "chflagsat", None, flags & KEPT_FLAGS, |bits| {
-        // SAFETY: p is a C string.
-        let r = unsafe {
-            libc::chflagsat(libc::AT_FDCWD, p.as_ptr(), bits, libc::AT_SYMLINK_NOFOLLOW)
-        };
-        check(r).map(drop)
-    })
+    set_flags_best_effort(
+        OPENBSD_FILE_FLAGS,
+        path,
+        "chflagsat",
+        None,
+        flags & KEPT_FLAGS,
+        |bits| {
+            // SAFETY: p is a C string.
+            let r = unsafe {
+                libc::chflagsat(libc::AT_FDCWD, p.as_ptr(), bits, libc::AT_SYMLINK_NOFOLLOW)
+            };
+            check(r).map(drop)
+        },
+    )
 }
 
 pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) -> io::Result<()> {
@@ -90,7 +97,13 @@ pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
 /// `openbsd.file_flags` had none, and loses those it has now
 /// ([`restore_no_flags`]). Nothing else to restore here.
 pub(super) fn restore_attributes(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
-    if known_bko && node.meta.generic_attributes.value(OPENBSD_FILE_FLAGS).is_none() {
+    if known_bko
+        && node
+            .meta
+            .generic_attributes
+            .value(OPENBSD_FILE_FLAGS)
+            .is_none()
+    {
         return restore_no_flags(path, OPENBSD_FILE_FLAGS, KEPT_FLAGS, 0);
     }
     Ok(())
@@ -106,7 +119,10 @@ pub(super) fn restore_symlink_mode(path: &Path, node: &Node) -> io::Result<()> {
 
 /// OpenBSD's FFS2 reports a birth time of 0.
 pub(super) fn restore_birthtime(_path: &Path, _node: &Node, _birth: Timestamp) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "OpenBSD keeps no birth times"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "OpenBSD keeps no birth times",
+    ))
 }
 
 /// Extended attributes have no metadata of their own here.
@@ -115,10 +131,17 @@ pub(super) fn fill_xattr_meta(_path: &Path, _node: &mut Node) {}
 /// OpenBSD has no extended attributes: nothing reads them here, nor
 /// through the xattr crate, which has no OpenBSD backend.
 pub(super) fn xattrs(_path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "OpenBSD has no extended attributes"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "OpenBSD has no extended attributes",
+    ))
 }
 
 /// OpenBSD has no extended attributes: there are none to set.
 pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "OpenBSD has no extended attributes").into())
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "OpenBSD has no extended attributes",
+    )
+    .into())
 }
