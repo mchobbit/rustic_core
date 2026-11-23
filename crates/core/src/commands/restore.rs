@@ -1695,16 +1695,16 @@ fn set_metadata(
         tally.always();
         return false;
     }
-    // BackOtter: by name, unless numeric ids are asked for (--numeric-id);
-    // then on illumos the ids an owner and group that are SIDs have here,
-    // before the mode, which a change of owner can clear the setuid bit of.
-    // A change of owner refused to a restore not running as root is no
-    // warning, as in restic.
     // create_special refused (and warned of) a path that leaves the
     // destination, so this is one in it.
     let Ok(target) = dest.path(path) else {
         return false;
     };
+    // BackOtter: by name, unless numeric ids are asked for (--numeric-id);
+    // then on illumos the ids an owner and group that are SIDs have here,
+    // before the mode, which a change of owner can clear the setuid bit of.
+    // A change of owner refused to a restore not running as root is no
+    // warning, as in restic.
     let chown_failed = |what: &str,
                         err: &local_destination::LocalDestinationErrorKind,
                         tally: &mut RestoreTally| {
