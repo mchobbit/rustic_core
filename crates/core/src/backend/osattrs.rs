@@ -1015,6 +1015,7 @@ impl XattrErrors {
     /// `security.*` attributes, a file someone else owns), which restic's
     /// restore not running as root only warns about (S2). Setting, removing
     /// and listing alike.
+    #[cfg_attr(any(windows, target_os = "openbsd"), allow(dead_code))]
     pub(crate) fn counts(&self, root: bool) -> bool {
         self.0
             .iter()
@@ -1023,7 +1024,10 @@ impl XattrErrors {
 
     /// Adds the failure of `what`: an attribute's name, for setting it, or
     /// what else was done (`removing NAME`, `listing`).
-    #[cfg_attr(any(windows, target_os = "openbsd"), allow(dead_code))]
+    #[cfg_attr(
+        any(windows, target_os = "openbsd", target_os = "haiku"),
+        allow(dead_code)
+    )]
     pub(crate) fn push(&mut self, what: impl Into<String>, err: io::Error) {
         self.0.push((what.into(), err));
     }
@@ -1033,7 +1037,10 @@ impl XattrErrors {
     /// # Errors
     ///
     /// * These failures, if there are any.
-    #[cfg_attr(any(windows, target_os = "openbsd"), allow(dead_code))]
+    #[cfg_attr(
+        any(windows, target_os = "openbsd", target_os = "haiku"),
+        allow(dead_code)
+    )]
     pub(crate) fn into_result(self) -> Result<(), Self> {
         if self.0.is_empty() { Ok(()) } else { Err(self) }
     }
@@ -1043,6 +1050,7 @@ impl XattrErrors {
 /// `ENOTSUP`/`EOPNOTSUPP`, or `ENOATTR` (`ENODATA` on Linux), which an
 /// SMB/CIFS mount can give instead, as BackOtter's restic takes them all
 /// (`handleXattrErr`, `xattrUnsupported`).
+#[cfg_attr(any(windows, target_os = "openbsd"), allow(dead_code))]
 pub(crate) fn xattr_unsupported(err: &io::Error) -> bool {
     if err.kind() == io::ErrorKind::Unsupported {
         return true;
