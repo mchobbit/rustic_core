@@ -40,6 +40,11 @@ pub(super) const AV_QUARANTINED: u32 = 1 << 8;
 /// attributes.
 pub(super) const AUTOMATIC: u32 = 1 << 3 | 1 << 9; // archive, av_modified
 
+/// The attributes that keep a file from being changed, which a restore
+/// doesn't take off a file it finds (BACKOTTER.md): what it then does to
+/// the file fails, with its error.
+pub(super) const RESTRICTING: u32 = 1 << 4 | 1 << 5 | 1 << 6; // nounlink, immutable, appendonly
+
 const NV_ENCODE_XDR: u8 = 1;
 const NV_UNIQUE_NAME: u32 = 1;
 
@@ -150,12 +155,26 @@ impl<'a> View<'a> {
     /// view has. So a mask of 0 is kept where the view has them, for a file
     /// whose archive and av_modified were cleared, which ZFS would set again.
     pub(super) fn kept_mask(&self) -> Option<u32> {
-        let automatic = BITS
-            .iter()
-            .filter(|(name, bit)| bit & AUTOMATIC != 0 && self.has_boolean(name))
-            .fold(0, |mask, (_, bit)| mask | bit);
         let mask = self.mask();
-        (mask != automatic).then_some(mask)
+        (mask != self.automatic()).then_some(mask)
+    }
+
+    /// The automatic attributes the view has: what a new file's mask is.
+    fn automatic(&self) -> u32 {
+        BITS.iter()
+            .filter(|(name, bit)| bit & AUTOMATIC != 0 && self.has_boolean(name))
+            .fold(0, |mask, (_, bit)| mask | bit)
+    }
+
+    /// The mask that gives a file a new file's system attributes, those
+    /// [`kept_mask`](Self::kept_mask) keeps nothing for, but for those in
+    /// `left`, which stay as the file has them; `None` if it has that mask
+    /// already. For a file whose node holds no system attributes in a
+    /// snapshot of BackOtter's: it had a new file's at backup.
+    pub(super) fn reset_mask(&self, left: u32) -> Option<u32> {
+        let mask = self.mask();
+        let want = self.automatic() | mask & left;
+        (want != mask).then_some(want)
     }
 
     /// The nvlist that sets the system attributes to those in `mask`: a
@@ -415,6 +434,37 @@ mod tests {
             assert_eq!(View::parse(buf).unwrap().kept_mask(), kept, "{what}");
         }
         assert_eq!(plain.kept_mask(), None);
+    }
+
+    /// ForkAudit1 G5-08: what a file whose node holds no system attributes
+    /// is reset to, a new file's, and what is left as it is.
+    #[test]
+    fn reset_masks() {
+        let left = AV_QUARANTINED | RESTRICTING;
+        let plain = unhex(SUNWATTR_PLAIN);
+        let plain = View::parse(&plain).unwrap();
+        // A new file: nothing to do.
+        assert_eq!(plain.reset_mask(left), None);
+        let reset = |mask: u32| View::parse(&plain.mask_nvlist(mask)).unwrap().reset_mask(left);
+        // hidden, nodump and readonly set since: cleared.
+        assert_eq!(reset(AUTOMATIC | bit("hidden") | bit("nodump") | bit("readonly")), Some(AUTOMATIC));
+        // The automatic ones cleared since: set again.
+        assert_eq!(reset(bit("archive")), Some(AUTOMATIC));
+        assert_eq!(reset(0), Some(AUTOMATIC));
+        // immutable, appendonly, nounlink and av_quarantined stay; alone,
+        // nothing to do.
+        let stays = bit("immutable") | bit("appendonly") | bit("nounlink") | AV_QUARANTINED;
+        assert_eq!(stays, left);
+        assert_eq!(reset(AUTOMATIC | stays), None);
+        assert_eq!(reset(AUTOMATIC | stays | bit("hidden")), Some(AUTOMATIC | stays));
+        // What the file is reset to keeps nothing at the next backup.
+        let after = plain.mask_nvlist(AUTOMATIC);
+        assert_eq!(View::parse(&after).unwrap().kept_mask(), None);
+        // A view without the automatic attributes: none set.
+        let crtime_only = unhex(NVLIST_CRTIME);
+        assert_eq!(View::parse(&crtime_only).unwrap().reset_mask(left), None);
+        let hidden = unhex(NVLIST_HIDDEN);
+        assert_eq!(View::parse(&hidden).unwrap().reset_mask(left), Some(0));
     }
 
     #[test]

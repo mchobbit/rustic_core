@@ -482,9 +482,13 @@ fn fill_zfs_project(path: &Path, node: &mut Node) {
 /// in. It goes before the file flags, as Linux's project ID does, though ZFS
 /// gives an immutable file one all the same. A file system other than ZFS
 /// gives an [`Unsupported`] error.
-fn restore_zfs_project(path: &Path, node: &Node) -> io::Result<()> {
+///
+/// A node without one had none in a snapshot of BackOtter's (`known_bko`):
+/// the file then loses the one it has ([`reset_zfs_project`]). In any other
+/// snapshot it is unknown, and the file keeps it.
+fn restore_zfs_project(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
     let Some(p) = node.meta.generic_attributes.get::<ZfsProject>(ILLUMOS_ZFS_PROJECT) else {
-        return Ok(());
+        return if known_bko { reset_zfs_project(path, &node.node_type) } else { Ok(()) };
     };
     let p = p.map_err(io::Error::other)?;
     let Some(f) = open_for_project(path, &node.node_type, None)? else {
@@ -507,6 +511,36 @@ fn restore_zfs_project(path: &Path, node: &Node) -> io::Result<()> {
         return Ok(());
     }
     zfs_xattr(&f, ZFS_IOC_FSSETXATTR, &mut want).map_err(|err| error("ioctl set ZFS project", err))
+}
+
+/// Takes the ZFS project off the regular file or directory at `path`, which
+/// had none at backup: ID 0 and no inheritance, where it has another, got
+/// from the directory it was made in or given since. Where there is none
+/// to take off, nothing, and no error: a file that can't be opened (one
+/// illumos quarantined), a file system other than ZFS (`ENOTTY`).
+fn reset_zfs_project(path: &Path, typ: &NodeType) -> io::Result<()> {
+    let f = match open_for_project(path, typ, None) {
+        Ok(Some(f)) => f,
+        Ok(None) => return Ok(()),
+        Err(err) => {
+            debug!("no ZFS project for {}: {err}", path.display());
+            return Ok(());
+        }
+    };
+    let mut zx = ZfsXattr::default();
+    if let Err(err) = zfs_xattr(&f, ZFS_IOC_FSGETXATTR, &mut zx) {
+        debug!("no ZFS project for {}: {err}", path.display());
+        return Ok(());
+    }
+    if ZfsProject::of(zx.xflags, zx.projid).is_none() {
+        return Ok(());
+    }
+    let mut want = ZfsXattr {
+        xflags: ZfsProject::default().xflags(zx.xflags),
+        projid: 0,
+    };
+    zfs_xattr(&f, ZFS_IOC_FSSETXATTR, &mut want)
+        .map_err(|err| path_error("ioctl set ZFS project", path, &err))
 }
 
 pub(super) fn prepare_file_for_flags(_path: &Path, _flags: u32) -> io::Result<()> {
@@ -541,6 +575,39 @@ pub(super) fn restore_file_flags(
         flags,
         |mask| f.write_all_at(&view.mask_nvlist(mask), 0),
     )
+}
+
+/// The system attributes a restore leaves on a file whose node holds none:
+/// `av_quarantined`, which keeps closed a file whose contents the restore
+/// may not have replaced, and those that keep a file from being changed,
+/// which a restore doesn't take off here ([`clear_restricting_flags`]).
+const LEFT_ON_RESET: u32 = illumos_sysattr::AV_QUARANTINED | illumos_sysattr::RESTRICTING;
+
+/// Gives the regular file or directory at `path`, which had a new file's
+/// system attributes at backup (its node holds none, in a snapshot of
+/// BackOtter's), a new file's again: the automatic ones set and the others
+/// cleared, where it has others, set on it since or cleared since (hidden,
+/// nodump, readonly, a cleared `av_modified`), but for those in
+/// [`LEFT_ON_RESET`]. Without this nothing took them off: the late flags
+/// pass sets a node's mask, and such a node has none. Clearing them needs
+/// no late pass: nothing a restore does after is refused for it. A file
+/// without the view (UFS), or whose view can't be read, is left alone.
+fn reset_file_flags(path: &Path, typ: &NodeType) -> io::Result<()> {
+    if !matches!(typ, NodeType::File | NodeType::Dir) {
+        return Ok(());
+    }
+    let want = {
+        let f = match sysattr_view(path, typ, false) {
+            Ok(f) => f,
+            Err(err) => {
+                debug!("no system attributes for {}: {err}", path.display());
+                return Ok(());
+            }
+        };
+        let buf = read_view(&f, path)?;
+        parse_view(&buf, path)?.reset_mask(LEFT_ON_RESET)
+    };
+    want.map_or(Ok(()), |want| restore_file_flags(path, typ, want, &[]))
 }
 
 pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) -> io::Result<()> {
@@ -585,9 +652,26 @@ pub(super) fn restore_owner(path: &Path, node: &Node) -> io::Result<()> {
 /// Restores the metadata of the extended attributes, whose values are
 /// restored by now, and the ZFS project. `owners`: the restore sets owners
 /// (not `--no-ownership`), so the attributes get theirs too.
-pub(super) fn restore_attributes(path: &Path, node: &Node, owners: bool) -> io::Result<()> {
+///
+/// In a snapshot of BackOtter's (`known_bko`), a node without a ZFS project
+/// or without system attributes had none, or a new file's: the file loses
+/// the project and the system attributes it has otherwise
+/// ([`reset_zfs_project`], [`reset_file_flags`]). A node with system
+/// attributes gets them in the late flags pass ([`restore_file_flags`]).
+pub(super) fn restore_attributes(
+    path: &Path,
+    node: &Node,
+    known_bko: bool,
+    owners: bool,
+) -> io::Result<()> {
     let xattr_meta = restore_xattr_meta(path, node, owners);
-    restore_zfs_project(path, node).and(xattr_meta)
+    let has_mask = node.meta.generic_attributes.value(ILLUMOS_SYSTEM_ATTRIBUTES).is_some();
+    let flags = if known_bko && !has_mask {
+        reset_file_flags(path, &node.node_type)
+    } else {
+        Ok(())
+    };
+    restore_zfs_project(path, node, known_bko).and(xattr_meta).and(flags)
 }
 
 /// Gives `of`, which has no ACL to restore, the trivial ACL of `mode` (a
@@ -1358,6 +1442,92 @@ mod tests {
         assert_eq!(name, "too-large");
         assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
         assert_eq!(err.to_string(), "too large to keep (16777217 bytes, over 16777216)");
+    }
+
+    /// The system attributes a backup would keep for `path`, and its ZFS
+    /// project.
+    fn kept_now(path: &Path, typ: &NodeType) -> (Option<u32>, Option<ZfsProject>) {
+        let f = sysattr_view(path, typ, false).unwrap();
+        let mask = parse_view(&read_view(&f, path).unwrap(), path).unwrap().kept_mask();
+        let mut zx = ZfsXattr::default();
+        let f = open_for_project(path, typ, None).unwrap().unwrap();
+        zfs_xattr(&f, ZFS_IOC_FSGETXATTR, &mut zx).unwrap();
+        (mask, ZfsProject::of(zx.xflags, zx.projid))
+    }
+
+    /// ForkAudit1 G5-08: a file and a directory whose nodes hold no system
+    /// attributes and no ZFS project, in a snapshot of BackOtter's, lose
+    /// those set on them since the backup (hidden, nodump, a cleared
+    /// `av_modified`; a project, inheritance) and are then as a backup
+    /// would keep nothing for; in any other snapshot they keep them.
+    /// Before, nothing took them off. As root, on ZFS.
+    #[test]
+    fn attributes_the_node_has_not_are_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, sub) = (dir.path().join("f"), dir.path().join("d"));
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::create_dir(&sub).unwrap();
+        let on_zfs = open_for_project(&file, &NodeType::File, None)
+            .ok()
+            .flatten()
+            .is_some_and(|f| zfs_xattr(&f, ZFS_IOC_FSGETXATTR, &mut ZfsXattr::default()).is_ok());
+        if !is_root() || !on_zfs {
+            eprintln!("not root, or not ZFS: {}", dir.path().display());
+            return;
+        }
+        let (hidden, nodump, archive) = (1 << 0, 1 << 7, 1 << 3);
+        let node = |typ: NodeType| {
+            Node::new_node(std::ffi::OsStr::new("n"), typ, crate::backend::node::Metadata::default())
+        };
+        for (path, typ, inherit) in [(&file, NodeType::File, false), (&sub, NodeType::Dir, true)] {
+            assert_eq!(kept_now(path, &typ), (None, None), "{}", path.display());
+            let set = || {
+                // hidden and nodump set, av_modified cleared; project 77.
+                restore_file_flags(path, &typ, hidden | nodump | archive, &[]).unwrap();
+                let f = open_for_project(path, &typ, None).unwrap().unwrap();
+                let p = ZfsProject { id: 77, inherit };
+                let mut zx = ZfsXattr {
+                    xflags: p.xflags(0),
+                    projid: p.id,
+                };
+                zfs_xattr(&f, ZFS_IOC_FSSETXATTR, &mut zx).unwrap();
+                assert_eq!(
+                    kept_now(path, &typ),
+                    (Some(hidden | nodump | archive), Some(p)),
+                    "{}",
+                    path.display()
+                );
+            };
+            set();
+            // Not BackOtter's snapshot: unknown, left.
+            restore_attributes(path, &node(typ.clone()), false, true).unwrap();
+            assert!(kept_now(path, &typ).0.is_some() && kept_now(path, &typ).1.is_some());
+            restore_attributes(path, &node(typ.clone()), true, true).unwrap();
+            assert_eq!(kept_now(path, &typ), (None, None), "{}", path.display());
+            // Again: nothing to do, and nothing written (the ctime stays).
+            let ctime = std::fs::metadata(path).unwrap().ctime_nsec();
+            restore_attributes(path, &node(typ.clone()), true, true).unwrap();
+            assert_eq!(std::fs::metadata(path).unwrap().ctime_nsec(), ctime);
+
+            // A node with a mask: the late flags pass's, not reset here.
+            set();
+            let mut with_mask = node(typ.clone());
+            with_mask.meta.generic_attributes.set_u64(ILLUMOS_SYSTEM_ATTRIBUTES, hidden.into());
+            restore_attributes(path, &with_mask, true, true).unwrap();
+            assert_eq!(kept_now(path, &typ), (Some(hidden | nodump | archive), None));
+            restore_attributes(path, &node(typ.clone()), true, true).unwrap();
+        }
+
+        // immutable stays, with what else the file has cleared; the test
+        // takes it off again.
+        let immutable = 1 << 5;
+        let automatic = illumos_sysattr::AUTOMATIC;
+        restore_file_flags(&file, &NodeType::File, automatic | immutable | hidden, &[]).unwrap();
+        let reset = restore_attributes(&file, &node(NodeType::File), true, true);
+        let kept = kept_now(&file, &NodeType::File).0;
+        restore_file_flags(&file, &NodeType::File, automatic, &[]).unwrap();
+        reset.unwrap();
+        assert_eq!(kept, Some(automatic | immutable));
     }
 
     /// The node of a file with the mode `mode`, owned by `uid`:`gid`.

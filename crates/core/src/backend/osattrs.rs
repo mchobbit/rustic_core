@@ -1254,7 +1254,9 @@ pub(crate) fn restore_owner(path: &Path, node: &Node) -> io::Result<()> {
 ///
 /// On Linux a node without a project ID had 0 in a snapshot of BackOtter's
 /// (`known_bko`), which bcachefs then gets where the file inherited another;
-/// in any other snapshot the file keeps the one it has or inherited.
+/// in any other snapshot the file keeps the one it has or inherited. On
+/// illumos such a node's file loses its ZFS project, and one without system
+/// attributes gets a new file's, where it has others.
 ///
 /// `owners` says whether the restore sets owners (not `--no-ownership`): on
 /// illumos each extended attribute has an owner and group of its own, set
@@ -1275,8 +1277,7 @@ pub(crate) fn restore_attributes(
     }
     #[cfg(target_os = "illumos")]
     {
-        let _ = known_bko;
-        os::restore_attributes(path, node, owners)
+        os::restore_attributes(path, node, known_bko, owners)
     }
     #[cfg(not(any(target_os = "linux", target_os = "illumos")))]
     {

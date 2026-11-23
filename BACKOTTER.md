@@ -609,6 +609,23 @@ that either program restores what the other backed up.
   rescue system's is -1); where it is refused (only logged), what the
   restore does next fails, with its error. illumos' immutable, appendonly
   and nounlink system attributes are not cleared yet, in either tool.
+- On illumos, in a snapshot of BackOtter's, a regular file or directory
+  whose node has no `illumos.system_attributes` had a new file's at backup,
+  and one without `illumos.zfs_project` no project: where the file at the
+  destination has other system attributes (hidden, nodump, readonly,
+  system, offline or sparse set since, `archive` or `av_modified` cleared)
+  it gets a new file's again, and where it has a project ID or inheritance
+  (given since, or got from the directory it was made in) that is taken
+  off, with the extended attributes' metadata (`osattrs::
+  restore_attributes`). Left as they are: `av_quarantined` (the file's
+  contents may not have been replaced), and immutable, appendonly and
+  nounlink (above), with which what the restore does to the file fails. A
+  file whose view or project can't be read (UFS, tmpfs, a quarantined
+  file) is left alone, silently. In any other snapshot they are unknown
+  and stay (0.14.0+backotter.2; before, nothing took them off: the late
+  flags pass sets only a node's own mask, so a restore, `--exact` too,
+  left them, exit 0, and `--exact` set such a file's metadata again on
+  every run). BackOtter's restic doesn't do this yet.
 - `--delete` (plain or under `--exact`) removes what the snapshot hasn't
   got once the walk of the destination is done (0.13.0+backotter.13;
   before, as the walk met it), so that every file the restore replaced a
