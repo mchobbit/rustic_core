@@ -143,10 +143,12 @@ that either program restores what the other backed up.
     (`newfs -O 2ea`) mounted with `posix1eacls` or `nfs4acls`; plain FFSv2
     has neither ACLs nor extended attributes, and gets none, quietly.
     As on FreeBSD, symlinks have ACLs of their own, which are kept and
-    restored. The ACL system calls go by their numbers
-    (`__acl_get_link` 487, `__acl_set_link` 488, `lpathconf` 499), and
+    restored. The ACL system calls go by their names in libc
+    (`__acl_get_link`, `__acl_set_link`, `__acl_delete_link`, `lpathconf`,
+    which NetBSD's libc exports since NetBSD 10, the first with ACLs), and
     NetBSD's `pathconf(2)` names are its own (`_PC_ACL_EXTENDED` 14,
-    `_PC_ACL_NFS4` 17, where FreeBSD has 59 and 64); the rest is one module,
+    `_PC_ACL_NFS4` 17 in `sys/sys/unistd.h` of netbsd-10 and netbsd-11,
+    where FreeBSD has 59 and 64); the rest is one module,
     `osattrs/freebsd_netbsd.rs`, for both.
   - `dragonfly.file_flags`: DragonFly's `chflags(1)` flags, all 32 bits
     (root can set each of them on HAMMER2 and UFS). DragonFly's file

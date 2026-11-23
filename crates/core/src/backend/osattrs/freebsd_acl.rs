@@ -92,6 +92,7 @@ pub(super) const NETBSD: Os = Os {
     acl_default: NETBSD_ACL_DEFAULT,
     acl_nfs4: NETBSD_ACL_NFS4,
     system_extattrs: NETBSD_SYSTEM_EXTATTRS,
+    // NetBSD's sys/sys/unistd.h, netbsd-10 and netbsd-11, lines 215, 222.
     pc_acl_extended: 14,
     pc_acl_nfs4: 17,
 };

@@ -30,11 +30,6 @@ use crate::backend::{
     node::{Node, NodeType},
 };
 
-#[cfg(target_os = "freebsd")]
-use freebsd_sys as sys;
-#[cfg(target_os = "netbsd")]
-use netbsd_sys as sys;
-
 /// The system extended attributes UFS and FFSv2ea store ACLs in. They are
 /// kept as ACLs instead, and set through the ACL system calls, which check
 /// them.
@@ -60,11 +55,21 @@ struct RawAclEntry {
     flags: u16,
 }
 
-#[cfg(target_os = "freebsd")]
-mod freebsd_sys {
+/// The ACL system calls and `lpathconf(2)`, by name: FreeBSD's libc and
+/// NetBSD's export them (NetBSD 10 and later, the first with ACLs:
+/// `lib/libc/sys/Makefile.inc` builds their stubs; seen with `nm -D` in
+/// NetBSD 11.1's `libc.so.12.224`). Each takes `path` as a NUL-terminated C
+/// string and doesn't follow a symlink; `acl` must point to a writable
+/// `struct acl` ([`RawAcl`]) whose `acl_maxcnt` is `ACL_MAX_ENTRIES` (the
+/// kernel says `EINVAL` otherwise), and to set one, `acl_cnt` entries of it
+/// filled in.
+mod sys {
     use super::RawAcl;
 
+    #[cfg(target_os = "freebsd")]
     pub(super) const OS: &super::Os = &super::freebsd_acl::FREEBSD;
+    #[cfg(target_os = "netbsd")]
+    pub(super) const OS: &super::Os = &super::freebsd_acl::NETBSD;
 
     unsafe extern "C" {
         #[link_name = "__acl_get_link"]
@@ -82,47 +87,6 @@ mod freebsd_sys {
         pub(super) fn lpathconf(path: *const libc::c_char, name: libc::c_int) -> libc::c_long;
         #[link_name = "__acl_delete_link"]
         pub(super) fn acl_delete_link(path: *const libc::c_char, typ: libc::c_int) -> libc::c_int;
-    }
-}
-
-/// NetBSD's ACL system calls, by their numbers in `<sys/syscall.h>`.
-#[cfg(target_os = "netbsd")]
-mod netbsd_sys {
-    use super::RawAcl;
-
-    pub(super) const OS: &super::Os = &super::freebsd_acl::NETBSD;
-
-    const SYS_ACL_GET_LINK: libc::c_int = 487;
-    const SYS_ACL_SET_LINK: libc::c_int = 488;
-    const SYS_ACL_DELETE_LINK: libc::c_int = 489;
-    const SYS_LPATHCONF: libc::c_int = 499;
-
-    pub(super) unsafe fn acl_get_link(
-        path: *const libc::c_char,
-        typ: libc::c_int,
-        acl: *mut RawAcl,
-    ) -> libc::c_int {
-        // SAFETY: as __acl_get_link(2), for which the caller vouches.
-        unsafe { libc::syscall(SYS_ACL_GET_LINK, path, typ, acl) }
-    }
-
-    pub(super) unsafe fn acl_set_link(
-        path: *const libc::c_char,
-        typ: libc::c_int,
-        acl: *mut RawAcl,
-    ) -> libc::c_int {
-        // SAFETY: as __acl_set_link(2), for which the caller vouches.
-        unsafe { libc::syscall(SYS_ACL_SET_LINK, path, typ, acl) }
-    }
-
-    pub(super) unsafe fn lpathconf(path: *const libc::c_char, name: libc::c_int) -> libc::c_long {
-        // SAFETY: as lpathconf(2), for which the caller vouches.
-        libc::c_long::from(unsafe { libc::syscall(SYS_LPATHCONF, path, name) })
-    }
-
-    pub(super) unsafe fn acl_delete_link(path: *const libc::c_char, typ: libc::c_int) -> libc::c_int {
-        // SAFETY: as __acl_delete_link(2), for which the caller vouches.
-        unsafe { libc::syscall(SYS_ACL_DELETE_LINK, path, typ) }
     }
 }
 
@@ -145,7 +109,7 @@ fn new_raw_acl() -> Box<RawAcl> {
 fn get_acl(path: &Path, typ: AclType) -> io::Result<Vec<AclEntry>> {
     let p = c_path(path)?;
     let mut raw = new_raw_acl();
-    // SAFETY: raw is a struct acl with maxcnt set.
+    // SAFETY: p is a C string, raw a struct acl with maxcnt set.
     _ = check(unsafe { sys::acl_get_link(p.as_ptr(), typ as libc::c_int, &raw mut *raw) })?;
     let n = usize::try_from(raw.cnt).unwrap_or(usize::MAX);
     let entries = raw.entries.get(..n).ok_or_else(|| {
@@ -191,7 +155,8 @@ fn set_acl(path: &Path, typ: AclType, acl: &[AclEntry]) -> io::Result<()> {
             flags: e.flags,
         };
     }
-    // SAFETY: raw is a struct acl holding cnt entries.
+    // SAFETY: p is a C string, raw a struct acl with maxcnt set, holding
+    // cnt entries.
     _ = check(unsafe { sys::acl_set_link(p.as_ptr(), typ as libc::c_int, &raw mut *raw) })
         .map_err(|err| acl_set_error(path_error("__acl_set_link", path, &err), &err))?;
     Ok(())
