@@ -224,9 +224,11 @@ impl LocalSourceSaveOptions {
             incomplete.add();
         }
         // BackOtter: a file illumos quarantined (av_quarantined) can't be
-        // read, by root either, nor its extended attributes: its node is
-        // kept without them or its contents, with a warning, as in
-        // BackOtter's restic (the archiver reads no contents for it).
+        // read, by root either: its node is kept without its contents,
+        // with a warning, and without its extended attributes, which both
+        // tools reach through the open file (left out by choice: the
+        // attribute directory can be opened without it), as in BackOtter's
+        // restic (the archiver reads no contents for it).
         if osattrs::is_quarantined(&node) && osattrs::open_refused(path) {
             osattrs::keep_unread(path, &mut node);
         } else {

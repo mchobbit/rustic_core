@@ -793,17 +793,20 @@ that either program restores what the other backed up.
   that holds it (from an earlier build) skips it, as BackOtter's restic
   does.
 - A file with illumos' `av_quarantined` can't be opened for reading, by
-  root either (`EACCES`), nor its extended attributes, but its metadata can
-  be read: a backup keeps its node without its contents, as BackOtter's
-  restic does. Where opening a regular file is refused with `EACCES` and
+  root either (`EACCES`), but its metadata can be read: a backup keeps its
+  node without its contents, as BackOtter's restic does. Where opening a
+  regular file is refused with `EACCES` and
   its system attributes (read through its attribute directory, opened with
   libc's `__openattrdirat` as `getattrat(3C)` and `ls -/ v` open it,
   without opening the file) have `av_quarantined`, the node has its mode,
   owner, times, links, inode, device, SID owners, ACL, system attributes
   (`av_quarantined` included) and birth time, no `content` and size 0, and
   `illumos.unread_size`, the file's real size; its extended attributes and
-  `illumos.xattr_meta` are left out (they can't be read), as is its ZFS
-  project (reading it opens the file). One warning names it
+  `illumos.xattr_meta` are left out, by choice, as BackOtter's restic
+  leaves them out: both tools reach an attribute directory through the
+  open file, which is refused, though `__openattrdirat` would reach it and
+  the attribute files themselves aren't quarantined. So is its ZFS project
+  (reading it opens the file). One warning names it
   (`PATH: av_quarantined: contents not backed up (N bytes)`) and the backup
   exits 0. Any other file that can't be opened is left out, as before,
   reported as upstream's archiver reports it since 0.14.0 (#561: `error:
