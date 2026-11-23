@@ -7,6 +7,7 @@ doc-valid-idents = [
     "DragonFly",
     "ForkAudit1",
     "NFSv4",
+    "OmniOS",
     "RustAudit1",
     "SELinux",
     "..",

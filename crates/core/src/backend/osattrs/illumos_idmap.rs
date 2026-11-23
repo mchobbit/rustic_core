@@ -82,19 +82,24 @@ fn open() -> Result<Idmap, String> {
         let f = unsafe { libc::dlsym(lib, name.as_ptr()) };
         if f.is_null() { Err(dl_error()) } else { Ok(f) }
     };
-    // SAFETY: each is the function of that name in libidmap, which has
-    // that type in idmap.h.
-    unsafe {
-        Ok(Idmap {
-            create: std::mem::transmute::<*mut c_void, GetCreate>(sym(c"idmap_get_create")?),
-            destroy: std::mem::transmute::<*mut c_void, GetDestroy>(sym(c"idmap_get_destroy")?),
-            mappings: std::mem::transmute::<*mut c_void, GetMappings>(sym(c"idmap_get_mappings")?),
-            sid_by_uid: std::mem::transmute::<*mut c_void, GetSidById>(sym(c"idmap_get_sidbyuid")?),
-            sid_by_gid: std::mem::transmute::<*mut c_void, GetSidById>(sym(c"idmap_get_sidbygid")?),
-            uid_by_sid: std::mem::transmute::<*mut c_void, GetIdBySid>(sym(c"idmap_get_uidbysid")?),
-            gid_by_sid: std::mem::transmute::<*mut c_void, GetIdBySid>(sym(c"idmap_get_gidbysid")?),
-        })
+    /// The function `$name` of libidmap as the type `$as`.
+    macro_rules! function {
+        ($name:literal as $as:ty) => {{
+            let f = sym($name)?;
+            // SAFETY: f is the function of that name in libidmap, which
+            // has that type in idmap.h.
+            unsafe { std::mem::transmute::<*mut c_void, $as>(f) }
+        }};
     }
+    Ok(Idmap {
+        create: function!(c"idmap_get_create" as GetCreate),
+        destroy: function!(c"idmap_get_destroy" as GetDestroy),
+        mappings: function!(c"idmap_get_mappings" as GetMappings),
+        sid_by_uid: function!(c"idmap_get_sidbyuid" as GetSidById),
+        sid_by_gid: function!(c"idmap_get_sidbygid" as GetSidById),
+        uid_by_sid: function!(c"idmap_get_uidbysid" as GetIdBySid),
+        gid_by_sid: function!(c"idmap_get_gidbysid" as GetIdBySid),
+    })
 }
 
 fn check_stat(stat: Stat) -> io::Result<()> {
@@ -144,12 +149,11 @@ pub(super) fn sid_of_id(id: u32, group: bool) -> io::Result<String> {
         unsafe { get(gh, id, 0, &raw mut prefix, &raw mut rid, stat) }
     });
     let prefix = (!prefix.is_null()).then(|| {
-        // SAFETY: libidmap gave a C string, malloc(3C)ed, freed once here.
-        unsafe {
-            let s = CStr::from_ptr(prefix).to_string_lossy().into_owned();
-            libc::free(prefix.cast());
-            s
-        }
+        // SAFETY: libidmap gave a C string.
+        let s = unsafe { CStr::from_ptr(prefix) }.to_string_lossy().into_owned();
+        // SAFETY: it was malloc(3C)ed, and is freed once, here, read.
+        unsafe { libc::free(prefix.cast()) };
+        s
     });
     result?;
     let sid = format!(

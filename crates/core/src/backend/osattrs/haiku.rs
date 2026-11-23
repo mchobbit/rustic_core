@@ -79,8 +79,10 @@ fn open(path: &Path) -> io::Result<Option<Attributes>> {
 
 /// Sets errno, which `fs_read_attr_dir(3)` sets only on an error.
 fn set_errno(errno: libc::c_int) {
-    // SAFETY: _errnop gives this thread's errno.
-    unsafe { *libc::_errnop() = errno };
+    // SAFETY: _errnop has no preconditions.
+    let errnop = unsafe { libc::_errnop() };
+    // SAFETY: it gave this thread's errno, which is always there to write.
+    unsafe { *errnop = errno };
 }
 
 impl AttrFile for Attributes {
@@ -271,6 +273,7 @@ pub(super) fn open_for_attrs(_path: &Path, _typ: &NodeType, _m: &std::fs::Metada
     None
 }
 
+#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
 pub(super) fn file_flags(
     _path: &Path,
     _typ: &NodeType,
@@ -303,14 +306,17 @@ pub(super) fn fill_attributes(path: &Path, node: &mut Node, _f: Option<&File>) -
     left_out(&unreadable)
 }
 
+#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
 pub(super) fn prepare_file_for_flags(_path: &Path, _flags: u32) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
 pub(super) fn prepare_dir_for_flags(_path: &Path, _flags: u32) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
 pub(super) fn restore_file_flags(
     _path: &Path,
     _typ: &NodeType,
@@ -353,24 +359,29 @@ pub(super) fn restore_attributes(path: &Path, node: &Node) -> io::Result<()> {
     }
 }
 
+#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
 pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) -> io::Result<()> {
     Ok(())
 }
 
 /// No flags here keep a restore from changing a file.
+#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
 pub(super) fn clear_restricting_flags(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
 pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
 pub(super) fn restore_acls(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
 
 /// A symlink's own permissions don't matter on Haiku.
+#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
 pub(super) fn restore_symlink_mode(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }

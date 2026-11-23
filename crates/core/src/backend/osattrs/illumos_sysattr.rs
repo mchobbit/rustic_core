@@ -162,7 +162,8 @@ impl<'a> View<'a> {
     /// The system attributes in the view, as a mask, if they are worth
     /// keeping: unless they are what a new file gets, the automatic ones the
     /// view has. So a mask of 0 is kept where the view has them, for a file
-    /// whose archive and av_modified were cleared, which ZFS would set again.
+    /// whose `archive` and `av_modified` were cleared, which ZFS would set
+    /// again.
     pub(super) fn kept_mask(&self) -> Option<u32> {
         let mask = self.mask();
         (mask != self.automatic()).then_some(mask)
@@ -308,8 +309,9 @@ mod tests {
     use super::*;
 
     /// The start of a real `SUNWattr_rw` view, from OmniOS r151058, of a file
-    /// with nodump and immutable set (and archive and av_modified, as ZFS
-    /// sets them), up to and including av_modified, then the end of the list.
+    /// with nodump and immutable set (and `archive` and `av_modified`, as
+    /// ZFS sets them), up to and including `av_modified`, then the end of
+    /// the list.
     const SUNWATTR_RW: &str = "010100000000000000000001000000200000002800000008726561646f6e6c79\
         00000015000000010000000000000020000000200000000668696464656e0000\
         00000015000000010000000000000020000000200000000673797374656d0000\

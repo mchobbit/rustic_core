@@ -560,10 +560,12 @@ fn reset_zfs_project(path: &Path, typ: &NodeType) -> io::Result<()> {
         .map_err(|err| path_error("ioctl set ZFS project", path, &err))
 }
 
+#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
 pub(super) fn prepare_file_for_flags(_path: &Path, _flags: u32) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
 pub(super) fn prepare_dir_for_flags(_path: &Path, _flags: u32) -> io::Result<()> {
     Ok(())
 }
@@ -635,6 +637,7 @@ fn reset_file_flags(path: &Path, typ: &NodeType) -> io::Result<()> {
     want.map_or(Ok(()), |want| restore_file_flags(path, typ, want, &[]))
 }
 
+#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
 pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) -> io::Result<()> {
     Ok(())
 }
@@ -642,6 +645,7 @@ pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) 
 /// No flags keep a restore from changing a file here that it clears
 /// (illumos' immutable, appendonly and nounlink system attributes are left
 /// as they are: see BACKOTTER.md).
+#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
 pub(super) fn clear_restricting_flags(_path: &Path) -> io::Result<()> {
     Ok(())
 }
@@ -784,6 +788,7 @@ pub(super) fn restore_acls(path: &Path, node: &Node, known_bko: bool) -> io::Res
 }
 
 /// A symlink's own permissions don't matter on illumos.
+#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
 pub(super) fn restore_symlink_mode(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
@@ -859,8 +864,10 @@ fn attr_dir(path: &Path) -> io::Result<Option<File>> {
 
 /// Sets errno, which `readdir(3C)` sets only on an error.
 fn set_errno(errno: libc::c_int) {
-    // SAFETY: ___errno gives this thread's errno.
-    unsafe { *libc::___errno() = errno };
+    // SAFETY: ___errno has no preconditions.
+    let errnop = unsafe { libc::___errno() };
+    // SAFETY: it gave this thread's errno, which is always there to write.
+    unsafe { *errnop = errno };
 }
 
 /// One step of a `readdir(3C)` loop: what `read` gives, `None` at the end of
