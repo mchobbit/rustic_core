@@ -688,6 +688,8 @@ mod tests {
         assert_eq!(names, ["a-file", "sub"]);
     }
 
+    // Not on Haiku: BFS has no hard links.
+    #[cfg(not(target_os = "haiku"))]
     #[test]
     fn device_id_only_for_hard_links() {
         // BackOtter: by default (--set-devid hardlink) a device ID only for

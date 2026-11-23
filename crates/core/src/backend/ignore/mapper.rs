@@ -456,6 +456,8 @@ mod tests {
 
     /// BackOtter: as stock rustic, a backup stores the mtime as the atime
     /// by default; `--set-atime yes` (BackOtter's) the real one.
+    // Not on Haiku: BFS keeps no access time, and gives the time now.
+    #[cfg(not(target_os = "haiku"))]
     #[test]
     fn atime_is_mtime_by_default() {
         let dir = tempfile::tempdir().unwrap();
@@ -479,6 +481,7 @@ mod tests {
     /// BackOtter: extended attributes are stored in the byte order of their
     /// names, whatever order the file system lists them in, as BackOtter's
     /// restic stores them.
+    #[cfg(not(target_os = "haiku"))]
     #[test]
     fn xattrs_sorted() {
         let dir = tempfile::tempdir().unwrap();
