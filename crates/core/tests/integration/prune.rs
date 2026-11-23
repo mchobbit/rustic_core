@@ -192,7 +192,13 @@ fn test_prune_parallel_and_backup(
     // Fixtures
     let (source, repo) = (tar_gz_testdata?, set_up_repo?.to_indexed_ids()?);
 
-    let opts = BackupOptions::default();
+    // BackOtter: under a fixed name, so that the three backups give one
+    // tree, as the comments below expect ("reuse", "same data"). Under its
+    // own path the snapshot holds the directories above the file with their
+    // own times (archiver/tree.rs with_dir_nodes), TMPDIR among them, whose
+    // mtime moves as other tests make and remove their directories: a
+    // second tree then meets what a stale prune plan leaves in the index.
+    let opts = BackupOptions::default().as_path(std::path::PathBuf::from("test"));
     let check_opts = CheckOptions::default().read_data(true);
     let prune_opts = PruneOptions::default().keep_marked(Span::default());
 

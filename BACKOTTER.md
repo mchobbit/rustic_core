@@ -1038,7 +1038,15 @@ that either program restores what the other backed up.
   node without an mtime (the directory keeps those the restore gave it),
   in either tool, so snapshots stock rustic made restore so; restic-bko
   used to set the zero time, which DragonFly refuses. A node without an
-  atime gets its mtime as its atime, in either tool.
+  atime gets its mtime as its atime, in either tool. One upstream test
+  backs its file up `--as-path` for it (`test_prune_parallel_and_backup`,
+  `tests/integration/prune.rs`): it expects three backups of one file to
+  give one tree, and a directory above the file is the shared `$TMPDIR`,
+  whose times other tests move. A second tree there meets what upstream's
+  `prune` and `repair index` do with a stale prune plan (the plan's new
+  index is written before its old index files are found gone; a pack
+  listed both unmarked and marked keeps whichever entry is read first),
+  and `check` then misses a tree that is still in the repository.
 - A block or character device whose device number is 0 (`/dev/console`
   and `/dev/wd0a` on NetBSD and OpenBSD, or `mknod c 0 0`) has no
   `device` in its node, as restic leaves it out (Go's `omitempty`), so
