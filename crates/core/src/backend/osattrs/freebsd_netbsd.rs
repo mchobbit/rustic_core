@@ -36,7 +36,9 @@ use crate::backend::{
 const UFS_ACL_EXTATTRS: [&str; 3] = ["posix1e.acl_access", "posix1e.acl_default", "nfs4.acl"];
 
 /// `struct acl` from `<sys/acl.h>`, as `__acl_get_link(2)` and
-/// `__acl_set_link(2)` take it.
+/// `__acl_set_link(2)` take it: FreeBSD releng/15.0 `sys/sys/acl.h` (its
+/// integer types from `sys/sys/_types.h`), and the same in NetBSD's,
+/// netbsd-10 and netbsd-11. 4088 bytes.
 #[repr(C)]
 struct RawAcl {
     maxcnt: u32,

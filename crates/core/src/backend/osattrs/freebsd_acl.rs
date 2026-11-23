@@ -4,6 +4,13 @@
 //! FreeBSD's ACL code: the same `struct acl`, kept in the same form under
 //! its own names ([`Os`]). Portable, so that it is tested on any system;
 //! the system calls are in `freebsd_netbsd.rs`.
+//!
+//! The numbers are those of FreeBSD releng/15.0, `sys/sys/acl.h`
+//! (`ACL_MAX_ENTRIES`, the tags, entry types, permissions, flags and
+//! `ACL_UNDEFINED_ID`) and `sys/kern/subr_acl_nfs4.c` (the mode of an ACL,
+//! the trivial ACL of a mode, and the test for one); NetBSD's
+//! `sys/sys/acl.h`, netbsd-10 and netbsd-11, has the same struct and the
+//! same value for every `ACL_` name.
 
 #![cfg_attr(not(any(target_os = "freebsd", target_os = "netbsd")), allow(dead_code))]
 
@@ -83,6 +90,7 @@ pub(super) const FREEBSD: Os = Os {
     acl_default: FREEBSD_ACL_DEFAULT,
     acl_nfs4: FREEBSD_ACL_NFS4,
     system_extattrs: FREEBSD_SYSTEM_EXTATTRS,
+    // FreeBSD's sys/sys/unistd.h, releng/15.0.
     pc_acl_extended: 59,
     pc_acl_nfs4: 64,
 };

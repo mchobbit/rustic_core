@@ -57,7 +57,11 @@ pub(super) fn open_for_attrs(path: &Path, typ: &NodeType, m: &std::fs::Metadata)
 }
 
 /// `zfsxattr`, the struct OpenZFS's project ioctls take on FreeBSD: Linux's
-/// `struct fsxattr`, 28 bytes, with ioctls `'X'` 31 and 32, as `truss(1)`
+/// `struct fsxattr`, 28 bytes, with ioctls `'X'` 31 and 32. OpenZFS's
+/// `include/sys/zfs_project.h` defines them so for systems other than Linux
+/// (zfs-2.4-release and 2.4.4: `struct zfsxattr`, `ZFS_IOC_FSGETXATTR`,
+/// `ZFS_IOC_FSSETXATTR`, and `FS_PROJINHERIT_FL` 0x20000000; the ioctl
+/// numbers by FreeBSD's `sys/sys/ioccom.h`, releng/15.0), and `truss(1)`
 /// shows `zfs project` calling them on FreeBSD 15.1. Of the flags, only
 /// inheritance (`ZFS_PROJINHERIT_FL`) is changed; the others are given back
 /// as read.

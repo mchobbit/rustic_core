@@ -3,7 +3,8 @@
 //! that they are tested on any system; the system calls are in `freebsd.rs`,
 //! `netbsd.rs` and `dragonfly.rs`.
 
-// FreeBSD's <sys/stat.h>.
+// FreeBSD's sys/sys/stat.h, releng/14.3 and releng/15.0 (the UF_ and SF_
+// definitions).
 const FREEBSD_UF_SETTABLE: u32 = 0x0000_ffff; // the flags an owner may set
 const FREEBSD_SF_SETTABLE: u32 = 0xffff_0000; // the flags only root may set
 const FREEBSD_UF_ARCHIVE: u32 = 0x0000_0800; // "uarch"
@@ -38,8 +39,9 @@ pub(super) const fn freebsd_no_flags(zfs: bool) -> u32 {
 }
 
 // The flags that keep a file from being written, appended to only, or
-// removed and renamed (<sys/stat.h>), the same bits on every BSD that has
-// them.
+// removed and renamed, the same bits on every BSD that has them: sys/sys/stat.h
+// of FreeBSD releng/15.0, NetBSD netbsd-10 and netbsd-11, OpenBSD (stat.h 1.29)
+// and DragonFly master.
 const UF_IMMUTABLE: u32 = 0x0000_0002; // "uchg"
 const UF_APPEND: u32 = 0x0000_0004; // "uappnd"
 const UF_NOUNLINK: u32 = 0x0000_0010; // "uunlnk" (FreeBSD, DragonFly)
@@ -73,7 +75,8 @@ pub(super) const NETBSD_OPENBSD_RESTRICTING_FLAGS: u32 =
 pub(super) const DRAGONFLY_RESTRICTING_FLAGS: u32 =
     UF_IMMUTABLE | UF_APPEND | UF_NOUNLINK | SF_IMMUTABLE | SF_APPEND | SF_NOUNLINK;
 
-// NetBSD's <sys/stat.h>: the flags the kernel manages.
+// NetBSD's sys/sys/stat.h, netbsd-10 and netbsd-11: the flags the kernel
+// manages.
 const NETBSD_SF_SNAPSHOT: u32 = 0x0020_0000; // an FFS snapshot
 const NETBSD_SF_LOG: u32 = 0x0040_0000; // the WAPBL journal
 const NETBSD_SF_SNAPINVAL: u32 = 0x0080_0000; // an invalid snapshot
@@ -86,12 +89,13 @@ const NETBSD_SF_SNAPINVAL: u32 = 0x0080_0000; // an invalid snapshot
 pub(super) const NETBSD_KEPT_FLAGS: u32 =
     !(NETBSD_SF_SNAPSHOT | NETBSD_SF_LOG | NETBSD_SF_SNAPINVAL);
 
-/// The flags kept on DragonFly: all. Root can set every bit, on HAMMER2 and
-/// UFS, and none is the kernel's (FreeBSD's snapshot bit is unused there).
+/// The flags kept on DragonFly (`sys/sys/stat.h`, master): all. Root can set
+/// every bit, on HAMMER2 and UFS, and none is the kernel's (FreeBSD's snapshot
+/// bit is unused there).
 #[cfg_attr(not(target_os = "dragonfly"), allow(dead_code))]
 pub(super) const DRAGONFLY_KEPT_FLAGS: u32 = 0xffff_ffff;
 
-/// The flags kept on OpenBSD, from its `<sys/stat.h>`: all those an owner
+/// The flags kept on OpenBSD, from its `sys/sys/stat.h` (1.29): all those an owner
 /// may set (`UF_SETTABLE`: nodump, immutable, append, opaque) and those only
 /// root may (`SF_SETTABLE`: archived, immutable, append; the last two can't
 /// be cleared again above securelevel 0). None is the kernel's.
