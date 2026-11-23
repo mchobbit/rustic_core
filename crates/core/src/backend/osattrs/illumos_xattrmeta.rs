@@ -7,10 +7,11 @@
 
 #![cfg_attr(not(target_os = "illumos"), allow(dead_code))]
 
-use std::io;
+use std::{collections::BTreeMap, io};
 
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::illumos_acl::AceEntry;
 
@@ -58,11 +59,98 @@ pub(super) struct XattrMeta {
     pub acl: Vec<AceEntry>,
 }
 
+/// The owner and group a restore that sets owners gives the attribute file
+/// with the metadata `meta`: those of `meta`, but where the file's own were
+/// the same at backup (`node`, its node's uid and gid), what the file has
+/// at the destination (`now`). The restore gave the file those by name, or
+/// as the ids its SIDs have here, so they can be other numbers than the
+/// snapshot's, and the snapshot's can be someone else's here: an attribute
+/// its file's owner owned is its file's owner's again, never a stranger's.
+/// An attribute that was another user's or group's keeps its number: a node
+/// has no name for it.
+pub(super) fn restored_owner(
+    meta: &XattrMeta,
+    node: (Option<u32>, Option<u32>),
+    now: (u32, u32),
+) -> (u32, u32) {
+    let id = |attr: u32, node: Option<u32>, now: u32| if node == Some(attr) { now } else { attr };
+    (id(meta.uid, node.0, now.0), id(meta.gid, node.1, now.1))
+}
+
+/// Whether `now` and `want`, two values of `illumos.xattr_meta`, are the
+/// same but for the attributes' owners and groups, which a restore that sets
+/// no owners (`--no-ownership`, or not running as root) leaves as they are.
+pub(super) fn same_but_owners(now: &Value, want: &Value) -> bool {
+    let without_owners = |v: &Value| {
+        let mut metas = BTreeMap::<String, XattrMeta>::deserialize(v).ok()?;
+        for meta in metas.values_mut() {
+            (meta.uid, meta.gid) = (0, 0);
+        }
+        Some(metas)
+    };
+    now == want
+        || without_owners(now)
+            .zip(without_owners(want))
+            .is_some_and(|(now, want)| now == want)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
+
+    fn meta(uid: u32, gid: u32) -> XattrMeta {
+        XattrMeta {
+            uid,
+            gid,
+            mode: 0o600,
+            mtime: Timestamp::new(1_000_000_000, 0).unwrap(),
+            atime: Timestamp::new(1_000_000_000, 0).unwrap(),
+            acl: Vec::new(),
+        }
+    }
+
+    /// BackOtter: an attribute its file's owner (group) owned follows the
+    /// file to the owner (group) it has at the destination; another's keeps
+    /// its number (ForkAudit1 G5-01).
+    #[test]
+    fn restored_owners() {
+        let node = (Some(1001), Some(10));
+        // alice is 1500 here, and staff 20.
+        let now = (1500, 20);
+        assert_eq!(restored_owner(&meta(1001, 10), node, now), (1500, 20));
+        // By number, or the same here: as in the snapshot.
+        assert_eq!(restored_owner(&meta(1001, 10), node, (1001, 10)), (1001, 10));
+        // Another user's attribute, the file's group's; and the reverse.
+        assert_eq!(restored_owner(&meta(1002, 10), node, now), (1002, 20));
+        assert_eq!(restored_owner(&meta(1001, 11), node, now), (1500, 11));
+        // The file owner's number here as another user's attribute's: kept.
+        assert_eq!(restored_owner(&meta(1500, 20), node, now), (1500, 20));
+        // A node without an owner (not a Unix file's): the numbers.
+        assert_eq!(restored_owner(&meta(1001, 10), (None, None), now), (1001, 10));
+    }
+
+    /// BackOtter: without ownership, two `illumos.xattr_meta` that differ
+    /// only in the attributes' owners are the same to `--exact`; anything
+    /// else still differs (ForkAudit1 G5-01).
+    #[test]
+    fn xattr_meta_same_but_owners() {
+        let value = |metas: &[(&str, XattrMeta)]| {
+            let metas: BTreeMap<_, _> = metas.iter().cloned().collect();
+            serde_json::to_value(metas).unwrap()
+        };
+        let want = value(&[("a", meta(1001, 10)), ("b", meta(1002, 11))]);
+        assert!(same_but_owners(&want, &want));
+        assert!(same_but_owners(&value(&[("a", meta(0, 0)), ("b", meta(0, 3))]), &want));
+        let mut mode = meta(0, 0);
+        mode.mode = 0o644;
+        assert!(!same_but_owners(&value(&[("a", mode), ("b", meta(0, 0))]), &want));
+        assert!(!same_but_owners(&value(&[("a", meta(0, 0))]), &want));
+        assert!(!same_but_owners(&value(&[("a", meta(0, 0)), ("c", meta(0, 0))]), &want));
+        // What isn't an `illumos.xattr_meta` is the same only as itself.
+        assert!(same_but_owners(&Value::from(1), &Value::from(1)));
+        assert!(!same_but_owners(&Value::from(1), &Value::from(2)));
+        assert!(!same_but_owners(&Value::from(1), &want));
+    }
 
     #[test]
     fn attr_names_refused() {

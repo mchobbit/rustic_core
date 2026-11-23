@@ -38,8 +38,8 @@ use super::{
     illumos_idmap,
     illumos_project::ZfsProject,
     illumos_sysattr::{self, View},
-    illumos_xattrmeta::{SYSTEM_VIEWS, XattrMeta, attr_name_refused},
-    path_error, set_flags_best_effort, unix_time,
+    illumos_xattrmeta::{SYSTEM_VIEWS, XattrMeta, attr_name_refused, restored_owner},
+    is_root, path_error, permission_refused, set_flags_best_effort, unix_time,
 };
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType,
@@ -583,9 +583,10 @@ pub(super) fn restore_owner(path: &Path, node: &Node) -> io::Result<()> {
 }
 
 /// Restores the metadata of the extended attributes, whose values are
-/// restored by now, and the ZFS project.
-pub(super) fn restore_attributes(path: &Path, node: &Node) -> io::Result<()> {
-    let xattr_meta = restore_xattr_meta(path, node);
+/// restored by now, and the ZFS project. `owners`: the restore sets owners
+/// (not `--no-ownership`), so the attributes get theirs too.
+pub(super) fn restore_attributes(path: &Path, node: &Node, owners: bool) -> io::Result<()> {
+    let xattr_meta = restore_xattr_meta(path, node, owners);
     restore_zfs_project(path, node).and(xattr_meta)
 }
 
@@ -917,7 +918,12 @@ fn read_xattr_meta(dir: &File, path: &Path, name: &str, sids: &mut SidNamer) -> 
 /// restore left it out) is left alone, as is a file system without them.
 /// Each attribute's are tried even when another's failed; the error is the
 /// first failure, or a [`SidUnmapped`] one about an ACL entry.
-fn restore_xattr_meta(path: &Path, node: &Node) -> io::Result<()> {
+///
+/// Its owner and group only with `owners`, as the file's own: not under
+/// `--no-ownership`, and one that was its file's owner's or group's follows
+/// the file to the owner or group the restore gave it, by name or as a
+/// SID's id here ([`restored_owner`]).
+fn restore_xattr_meta(path: &Path, node: &Node, owners: bool) -> io::Result<()> {
     let Some(metas) = node
         .meta
         .generic_attributes
@@ -929,12 +935,20 @@ fn restore_xattr_meta(path: &Path, node: &Node) -> io::Result<()> {
     let Some(dir) = attr_dir(path)? else {
         return Ok(());
     };
+    // The owner and group the restore gave the file itself.
+    let file_now = if owners {
+        let m = std::fs::symlink_metadata(path).map_err(|err| path_error("lstat", path, &err))?;
+        Some((m.uid(), m.gid()))
+    } else {
+        None
+    };
     let (mut failed, mut unmapped) = (None, None);
     for (name, meta) in &metas {
         if !node.meta.extended_attributes.iter().any(|a| a.name == *name) {
             continue;
         }
-        if let Err(err) = restore_one_xattr_meta(&dir, path, name, meta, &mut unmapped) {
+        let owner = file_now.map(|now| restored_owner(meta, (node.meta.uid, node.meta.gid), now));
+        if let Err(err) = restore_one_xattr_meta(&dir, path, name, meta, owner, &mut unmapped) {
             _ = failed.get_or_insert(err);
         }
     }
@@ -942,15 +956,18 @@ fn restore_xattr_meta(path: &Path, node: &Node) -> io::Result<()> {
 }
 
 /// Gives the attribute `name` in `dir`, the attribute directory of `path`,
-/// the metadata `meta`: owner, mode, ACL (after the mode, which rewrites
-/// it), then the times, last, as for the file itself. Each is tried even
-/// when one before it failed; the error is the first. A warning about a SID
-/// in the ACL that idmap couldn't map goes to `unmapped`.
+/// the metadata `meta`: the owner and group `owner`, if any (none: they are
+/// left as they are), mode, ACL (after the mode, which rewrites it), then
+/// the times, last, as for the file itself. Each is tried even when one
+/// before it failed; the error is the first. A warning about a SID in the
+/// ACL that idmap couldn't map goes to `unmapped`. A change of owner refused
+/// to a restore not running as root is no error, as for the file itself.
 fn restore_one_xattr_meta(
     dir: &File,
     path: &Path,
     name: &str,
     meta: &XattrMeta,
+    owner: Option<(u32, u32)>,
     unmapped: &mut Option<io::Error>,
 ) -> io::Result<()> {
     let at = attr_path(path, name);
@@ -960,18 +977,30 @@ fn restore_one_xattr_meta(
     }
     let n = CString::new(name)?;
     let fd = dir.as_raw_fd();
-    // SAFETY: n is a C string.
-    let owner = match check(unsafe { libc::fchownat(fd, n.as_ptr(), meta.uid, meta.gid, 0) }) {
-        Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {
+    let gone = |err: &io::Error| {
+        let gone = err.raw_os_error() == Some(libc::ENOENT);
+        if gone {
             debug!("{} not restored: {err}", at.display());
-            return Ok(());
         }
-        r => r.map(drop).map_err(|err| path_error("fchownat", &at, &err)),
+        gone
+    };
+    let owner = match owner.map(|(uid, gid)| {
+        // SAFETY: n is a C string.
+        check(unsafe { libc::fchownat(fd, n.as_ptr(), uid, gid, 0) })
+    }) {
+        None => Ok(()),
+        Some(Err(err)) if gone(&err) => return Ok(()),
+        Some(Err(err)) if !is_root() && permission_refused(&err) => {
+            debug!("not running as root, owner of {} not set: {err}", at.display());
+            Ok(())
+        }
+        Some(r) => r.map(drop).map_err(|err| path_error("fchownat", &at, &err)),
     };
     // SAFETY: n is a C string.
-    let mode = check(unsafe { libc::fchmodat(fd, n.as_ptr(), meta.mode & 0o7777, 0) })
-        .map(drop)
-        .map_err(|err| path_error("fchmodat", &at, &err));
+    let mode = match check(unsafe { libc::fchmodat(fd, n.as_ptr(), meta.mode & 0o7777, 0) }) {
+        Err(err) if gone(&err) => return Ok(()),
+        r => r.map(drop).map_err(|err| path_error("fchmodat", &at, &err)),
+    };
     let acl = if meta.acl.is_empty() {
         Ok(())
     } else {
@@ -1093,5 +1122,81 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         assert!(set_xattrs(&sub, &[xattr("../x", b"y")]).is_err());
         assert!(!dir.path().join("x").exists());
+    }
+
+    /// The node of a file with the mode `mode`, owned by `uid`:`gid`.
+    fn file_node(mode: u32, uid: u32, gid: u32) -> Node {
+        let meta = crate::backend::node::Metadata {
+            mode: Some(mode),
+            uid: Some(uid),
+            gid: Some(gid),
+            ..Default::default()
+        };
+        Node::new_node(std::ffi::OsStr::new("f"), NodeType::File, meta)
+    }
+
+    /// The owner and group of the attribute `name` of `file`.
+    fn attr_owner(file: &Path, name: &str) -> (u32, u32) {
+        let adir = attr_dir(file).unwrap().unwrap();
+        let m = open_attr(&adir, name, libc::O_RDONLY).unwrap().metadata().unwrap();
+        (m.uid(), m.gid())
+    }
+
+    /// ForkAudit1 G5-01: an attribute file gets an owner only when the
+    /// restore sets owners, and one its file's owner owned follows the file
+    /// to the owner it has here (restored by name); another's keeps its
+    /// number. Before, each got the snapshot's numbers in every mode. As
+    /// root, on a file system with extended attributes.
+    #[test]
+    fn xattr_meta_owners_as_the_restore_sets_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"").unwrap();
+        let attrs = [xattr("mine", b"m"), xattr("other", b"o")];
+        if !is_root() || set_xattrs(&file, &attrs).is_err() {
+            eprintln!("not root, or no extended attributes in {}", dir.path().display());
+            return;
+        }
+        let t = Timestamp::new(1_000_000_000, 0).unwrap();
+        let meta = |uid, gid| XattrMeta {
+            uid,
+            gid,
+            mode: 0o640,
+            mtime: t,
+            atime: t,
+            acl: Vec::new(),
+        };
+        // At backup the file and "mine" were 1001:1001's, "other" 1002's.
+        let mut node = file_node(0o644, 1001, 1001);
+        node.meta.extended_attributes = attrs.to_vec();
+        let metas = BTreeMap::from([
+            ("mine".to_string(), meta(1001, 1001)),
+            ("other".to_string(), meta(1002, 1001)),
+        ]);
+        node.meta.generic_attributes.set(ILLUMOS_XATTR_META, &metas).unwrap();
+        let mode = |name: &str| {
+            let adir = attr_dir(&file).unwrap().unwrap();
+            open_attr(&adir, name, libc::O_RDONLY).unwrap().metadata().unwrap().mode() & 0o7777
+        };
+
+        // --no-ownership: the attributes stay the restore's own (root's),
+        // as the file does; the rest of their metadata is set.
+        restore_xattr_meta(&file, &node, false).unwrap();
+        assert_eq!(attr_owner(&file, "mine"), (0, 0));
+        assert_eq!(attr_owner(&file, "other"), (0, 0));
+        assert_eq!(mode("mine"), 0o640);
+
+        // By name: the file's owner is 1500:1501 here. Hers follow it; the
+        // other user's attribute keeps his number, with the file's group.
+        std::os::unix::fs::chown(&file, Some(1500), Some(1501)).unwrap();
+        restore_xattr_meta(&file, &node, true).unwrap();
+        assert_eq!(attr_owner(&file, "mine"), (1500, 1501));
+        assert_eq!(attr_owner(&file, "other"), (1002, 1501));
+
+        // By number: as in the snapshot.
+        std::os::unix::fs::chown(&file, Some(1001), Some(1001)).unwrap();
+        restore_xattr_meta(&file, &node, true).unwrap();
+        assert_eq!(attr_owner(&file, "mine"), (1001, 1001));
+        assert_eq!(attr_owner(&file, "other"), (1002, 1001));
     }
 }

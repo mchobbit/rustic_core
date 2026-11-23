@@ -499,7 +499,7 @@ fn same_metadata(now: &Node, node: &Node, how: Compared) -> bool {
         && (!how.ownership || (a.uid == b.uid && a.gid == b.gid))
         && a.size == b.size
         && sorted(&a.extended_attributes) == sorted(&b.extended_attributes)
-        && same_generic_attributes(now, node, how.origin.known_bko())
+        && same_generic_attributes(now, node, how.ownership, how.origin.known_bko())
 }
 
 /// Whether `now`, what a backup would record for a file, has the mode a
@@ -526,15 +526,19 @@ fn same_mode(now: &Node, node: &Node, origin: SnapshotOrigin) -> bool {
 /// every file, which a node from elsewhere hasn't got), nor, unless the
 /// snapshot is BackOtter's (`known_bko`), one that `node` hasn't got: that
 /// is unknown, and the restore leaves what the file has. As in BackOtter's
-/// restic (`sameGenericAttributes`).
-fn same_generic_attributes(now: &Node, node: &Node, known_bko: bool) -> bool {
+/// restic (`sameGenericAttributes`). Without `ownership`, nor the owners of
+/// illumos' extended attributes ([`osattrs::same_generic_attribute`]).
+fn same_generic_attributes(now: &Node, node: &Node, ownership: bool, known_bko: bool) -> bool {
     let (a, b) = (&now.meta.generic_attributes, &node.meta.generic_attributes);
     let skipped = |name: &str| name == UNIX_SPARSE || name == UNIX_BIRTHTIME;
-    b.names().all(|name| skipped(name) || a.value(name).is_some())
-        && a
-            .names()
-            .filter(|name| !skipped(name))
-            .all(|name| b.value(name).map_or(!known_bko, |want| a.value(name) == Some(want)))
+    b.names()
+        .all(|name| skipped(name) || a.value(name).is_some())
+        && a.names().filter(|name| !skipped(name)).all(|name| {
+            b.value(name).map_or(!known_bko, |want| {
+                a.value(name)
+                    .is_some_and(|now| osattrs::same_generic_attribute(name, now, want, ownership))
+            })
+        })
         && same_birth_time(now, node, BIRTH_TIME_LOWERED)
 }
 
@@ -730,6 +734,34 @@ mod tests {
         let mut want = node_;
         want.meta.generic_attributes.set_number("linux.project_id", 3);
         assert!(!same_metadata(&now, &want, how(true, false)));
+    }
+
+    /// ForkAudit1 G5-01: the owners of illumos' extended attributes, in
+    /// `illumos.xattr_meta`, are compared only with ownership, as the file's
+    /// own are: a restore that sets no owners leaves them, and its `--exact`
+    /// matches a file whose attributes belong to whoever restored it.
+    #[test]
+    fn xattr_meta_owners_only_with_ownership() {
+        let meta = |id: u32, mode: u32| {
+            serde_json::json!({"note": {
+                "uid": id, "gid": id, "mode": mode,
+                "mtime": "2001-09-09T01:46:40Z", "atime": "2001-09-09T01:46:40Z",
+            }})
+        };
+        let with = |id, mode| {
+            let mut n = node(0o644, &[]);
+            n.meta
+                .generic_attributes
+                .set("illumos.xattr_meta", &meta(id, mode))
+                .unwrap();
+            n
+        };
+        let (want, now) = (with(1001, 0o600), with(0, 0o600));
+        assert!(same_metadata(&now, &want, how(false, true)));
+        assert!(!same_metadata(&now, &want, how(true, true)));
+        assert!(same_metadata(&want, &want, how(true, true)));
+        // Anything else of an attribute's still counts.
+        assert!(!same_metadata(&with(0, 0o644), &want, how(false, true)));
     }
 
     /// D9: where a restore can only lower a birth time (FreeBSD, NetBSD),

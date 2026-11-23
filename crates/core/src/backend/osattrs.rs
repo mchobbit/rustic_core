@@ -42,8 +42,8 @@ use log::{debug, warn};
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType,
     generic_attributes::{
-        ILLUMOS_SYSTEM_ATTRIBUTES, ILLUMOS_UNREAD_SIZE, KNOWN, LINUX_FAT_ATTRS, LINUX_XFS_OPTIONS,
-        UNIX_BIRTHTIME, UNIX_SPARSE, XfsOptions,
+        ILLUMOS_SYSTEM_ATTRIBUTES, ILLUMOS_UNREAD_SIZE, ILLUMOS_XATTR_META, KNOWN, LINUX_FAT_ATTRS,
+        LINUX_XFS_OPTIONS, UNIX_BIRTHTIME, UNIX_SPARSE, XfsOptions,
     },
 };
 
@@ -1232,17 +1232,51 @@ pub(crate) fn restore_owner(path: &Path, node: &Node) -> io::Result<()> {
 /// On Linux a node without a project ID had 0 in a snapshot of BackOtter's
 /// (`known_bko`), which bcachefs then gets where the file inherited another;
 /// in any other snapshot the file keeps the one it has or inherited.
-pub(crate) fn restore_attributes(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
+///
+/// `owners` says whether the restore sets owners (not `--no-ownership`): on
+/// illumos each extended attribute has an owner and group of its own, set
+/// only then.
+pub(crate) fn restore_attributes(
+    path: &Path,
+    node: &Node,
+    known_bko: bool,
+    owners: bool,
+) -> io::Result<()> {
     // BackOtter: past PATH_MAX, through a short path to it.
     let path = &*walkdir::short_path(path);
     warn_unknown(node);
     #[cfg(target_os = "linux")]
-    return os::restore_attributes(path, node, known_bko);
-    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = owners;
+        os::restore_attributes(path, node, known_bko)
+    }
+    #[cfg(target_os = "illumos")]
     {
         let _ = known_bko;
+        os::restore_attributes(path, node, owners)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "illumos")))]
+    {
+        let _ = (known_bko, owners);
         os::restore_attributes(path, node)
     }
+}
+
+/// BackOtter: whether `now`, the value of the generic attribute `name` a
+/// backup would record for a file, is `want`, a node's, as a restore leaves
+/// it: the same, or, where the restore sets no owners (`ownership` false:
+/// `--no-ownership`, or not running as root), illumos' extended attributes'
+/// metadata the same but for their owners and groups, which it leaves.
+pub(crate) fn same_generic_attribute(
+    name: &str,
+    now: &serde_json::Value,
+    want: &serde_json::Value,
+    ownership: bool,
+) -> bool {
+    now == want
+        || (!ownership
+            && name == ILLUMOS_XATTR_META
+            && illumos_xattrmeta::same_but_owners(now, want))
 }
 
 /// Restores the ACLs. This goes after the mode: `chmod(2)` rewrites an

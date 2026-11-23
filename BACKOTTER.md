@@ -509,8 +509,20 @@ that either program restores what the other backed up.
   attribute directory, in that order, once the values are written (in
   `osattrs::restore_attributes`); an attribute the restore left out is left
   alone. This goes before the file's own times (writing an attribute file
-  leaves them) and flags. A snapshot without the attribute restores as
-  before. An attribute the file has already, with its node's value, is
+  leaves them) and flags. An attribute gets an owner and group only where
+  the restore sets owners: none under `--no-ownership`, and one that was
+  its file's owner's (or group's) at backup gets the owner (group) the
+  restore gave the file, by name (the default) or as its SID's id here,
+  whatever the snapshot's number; another user's keeps its number, as a
+  node has no name for it. A change of owner refused to a restore not
+  running as root is no warning, as for the file itself, and `--exact`
+  compares the attributes' owners only where it compares the file's
+  (0.14.0+backotter.2; before, every attribute was given the snapshot's
+  uid and gid in every mode: under `--no-ownership` too, and by name the
+  backup host's numbers, which may be another user's here, who could then
+  read a 0600 attribute of a file that isn't his). A snapshot without the
+  attribute restores as before. An attribute the file has already, with
+  its node's value, is
   left as it is (read and compared first; only one of the same size is
   read), as on every other system and in BackOtter's restic. A snapshot's
   attribute whose name isn't an attribute file's (empty, `.`, `..`, which

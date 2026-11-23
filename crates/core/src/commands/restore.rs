@@ -1755,7 +1755,7 @@ fn set_metadata(
                 );
                 tally.dest(&err);
             });
-        osattrs::restore_attributes(&target, node, known_bko)
+        osattrs::restore_attributes(&target, node, known_bko, ownership(opts) != Ownership::None)
             .unwrap_or_else(|err| tally.io(path, &err, true));
     };
     // On Haiku before the mode: BFS wants write access to the file for
