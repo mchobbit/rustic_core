@@ -1,0 +1,13 @@
+# BackOtter: the fork's own file (upstream has none). clippy::doc_markdown,
+# which upstream's workspace lints turn on, takes these proper nouns in our
+# doc comments for code that wants backticks; ".." keeps clippy's own list.
+doc-valid-idents = [
+    "BackOtter",
+    "BackShot2",
+    "DragonFly",
+    "ForkAudit1",
+    "NFSv4",
+    "RustAudit1",
+    "SELinux",
+    "..",
+]
