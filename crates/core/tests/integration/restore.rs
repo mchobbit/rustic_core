@@ -1329,6 +1329,80 @@ fn test_restore_failed_contents_get_no_mtime(set_up_repo: Result<RepoOpen>) -> R
     Ok(())
 }
 
+/// BackOtter (ForkAudit1 G6-10): a node whose path would leave the
+/// destination (`..`, an absolute path), as a damaged or crafted snapshot
+/// could hold, stops the plan with an error before the restore's own code
+/// removes, clears, clones or links anything at it (every path there is
+/// taken from `target_of`), with `--delete` and `--exact` too; and the
+/// metadata pass, given such a path, counts an error for it and makes
+/// nothing: not the file, not the hard link. What is beside the destination
+/// stays as it is.
+#[rstest]
+#[cfg(not(windows))]
+fn test_restore_refuses_paths_leaving_the_destination(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    let source = tempdir()?;
+    let s = source.path();
+    fs::write(s.join("a"), "linked")?;
+    fs::hard_link(s.join("a"), s.join("b"))?;
+    fs::write(s.join("f"), "snapshot f")?;
+    let repo = backed_up(set_up_repo?, s)?;
+    let outer = tempdir()?;
+    let dir = outer.path().join("dest");
+    fs::create_dir(&dir)?;
+    fs::write(outer.path().join("x"), "outside")?;
+    let beside = || -> Result<Vec<_>> {
+        let mut names: Vec<_> = fs::read_dir(outer.path())?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<Result<_, _>>()?;
+        names.sort();
+        assert_eq!(fs::read_to_string(outer.path().join("x"))?, "outside");
+        Ok(names)
+    };
+    let before = beside()?;
+
+    let snap = repo.get_snapshot_from_str("latest", |_| true)?;
+    let node = repo.node_from_snapshot_path("latest", |_| true)?;
+    let dest = LocalDestination::new(dir.to_str().expect("utf-8"), true, false)?;
+    // The snapshot's nodes, the one at `from` at `to` instead.
+    let ls_opts = LsOptions::default();
+    let renamed = |from: &'static str, to: &'static str| -> Result<_> {
+        Ok(repo.ls(&node, &ls_opts)?.map(move |item| {
+            item.map(|(p, n)| (if p == Path::new(from) { PathBuf::from(to) } else { p }, n))
+        }))
+    };
+    let absolute = outer.path().join("x").to_str().expect("utf-8").to_string();
+    let absolute: &'static str = absolute.leak();
+    for opts in [
+        RestoreOptions::default(),
+        RestoreOptions::default().delete(true),
+        RestoreOptions::default().exact(true),
+    ] {
+        let opts = opts.origin(SnapshotOrigin::of(&snap));
+        // Something there already, for --delete and --exact to work on.
+        restore_to(&repo, &dir, opts)?;
+        for (from, to) in [
+            ("test/f", "../x"),
+            ("test/f", "test/../../x"),
+            ("test/f", absolute),
+            // The later name of a hard-linked file.
+            ("test/b", "../y"),
+        ] {
+            let planned = repo.prepare_restore(&opts, renamed(from, to)?, &dest, false);
+            let err = planned.expect_err("a path leaving the destination");
+            assert!(err.to_string().contains("Invalid path in snapshot"), "{to}: {err}");
+            assert_eq!(beside()?, before, "{to}");
+
+            // The metadata pass alone, after a plan of the snapshot as it is.
+            let ls = repo.ls(&node, &ls_opts)?;
+            let plan = repo.prepare_restore(&opts, ls, &dest, false)?;
+            let outcome = repo.restore(plan, &opts, renamed(from, to)?, &dest)?;
+            assert!(outcome.errors >= 1, "{to}: no error counted");
+            assert_eq!(beside()?, before, "{to}");
+        }
+    }
+    Ok(())
+}
+
 /// BackOtter (D7): `--exact --delete` over a hard-linked pair whose names
 /// are two immutable files with other names each, unexpected ones: the
 /// pair gets a file of its own, and both unexpected names go, the second
