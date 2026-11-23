@@ -103,12 +103,13 @@ pub(super) fn restore_birthtime(_path: &Path, _node: &Node, _birth: Timestamp) -
 /// Extended attributes have no metadata of their own here.
 pub(super) fn fill_xattr_meta(_path: &Path, _node: &mut Node) {}
 
-/// Extended attributes go through the xattr crate here.
+/// OpenBSD has no extended attributes: nothing reads them here, nor
+/// through the xattr crate, which has no OpenBSD backend.
 pub(super) fn xattrs(_path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr"))
+    Err(io::Error::new(io::ErrorKind::Unsupported, "OpenBSD has no extended attributes"))
 }
 
-/// Extended attributes go through the xattr crate here.
+/// OpenBSD has no extended attributes: there are none to set.
 pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr").into())
+    Err(io::Error::new(io::ErrorKind::Unsupported, "OpenBSD has no extended attributes").into())
 }
