@@ -29,7 +29,7 @@ pub(super) const MASK: u32 = 0x10;
 pub(super) const OTHER: u32 = 0x20;
 pub(super) const EVERYONE: u32 = 0x40;
 
-/// ae_perm, POSIX.1e: the same bits as a mode's rwx
+/// `ae_perm`, POSIX.1e: the same bits as a mode's rwx
 const POSIX_PERMS: u32 = 0x7;
 
 // ae_perm, NFSv4
@@ -373,7 +373,7 @@ mod tests {
     }
 
     /// The ACL a node without `acl_access` stands for (G4-01): three
-    /// entries, the mode's, which keep_acl keeps nothing for.
+    /// entries, the mode's, which `keep_acl` keeps nothing for.
     #[test]
     fn posix_trivial_acl_is_the_mode() {
         assert_eq!(
@@ -458,7 +458,7 @@ mod tests {
     /// BackOtter (ForkAudit1 F2): FreeBSD's and NetBSD's ACLs from another
     /// machine, cut short or with any bit flipped: refused, or read into
     /// entries that the mode and triviality rules take without a panic, and
-    /// that keep_acl keeps as they are.
+    /// that `keep_acl` keeps as they are.
     #[test]
     fn acls_malformed() {
         use crate::backend::osattrs::malformed::every_json_mutation;
