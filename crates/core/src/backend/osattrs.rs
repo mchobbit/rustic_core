@@ -24,8 +24,10 @@
 //! owner, mode, times and ACL of each extended attribute, and ZFS project
 //! IDs.
 
-// System calls and ioctls rustic's dependencies don't wrap.
-#![allow(unsafe_code)]
+// BackOtter: the workspace denies unsafe code; the modules and functions
+// here that make system calls and ioctls rustic's dependencies don't wrap
+// allow it, each for itself, and every unsafe block says why it is sound.
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -56,13 +58,16 @@ mod bsd_flags;
     target_os = "netbsd",
     target_os = "openbsd"
 ))]
+#[allow(unsafe_code)]
 mod bsd_held;
 mod freebsd_acl;
 #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+#[allow(unsafe_code)]
 mod freebsd_netbsd;
 mod haiku_attrs;
 mod illumos_acl;
 #[cfg(target_os = "illumos")]
+#[allow(unsafe_code)]
 mod illumos_idmap;
 mod illumos_project;
 mod illumos_sysattr;
@@ -73,30 +78,37 @@ pub(crate) mod malformed;
 mod sparse;
 
 #[cfg(target_os = "dragonfly")]
+#[allow(unsafe_code)]
 mod dragonfly;
 #[cfg(target_os = "dragonfly")]
 use dragonfly as os;
 #[cfg(target_os = "freebsd")]
+#[allow(unsafe_code)]
 mod freebsd;
 #[cfg(target_os = "freebsd")]
 use freebsd as os;
 #[cfg(target_os = "haiku")]
+#[allow(unsafe_code)]
 mod haiku;
 #[cfg(target_os = "haiku")]
 use haiku as os;
 #[cfg(target_os = "illumos")]
+#[allow(unsafe_code)]
 mod illumos;
 #[cfg(target_os = "illumos")]
 use illumos as os;
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 mod linux;
 #[cfg(target_os = "linux")]
 use linux as os;
 #[cfg(target_os = "netbsd")]
+#[allow(unsafe_code)]
 mod netbsd;
 #[cfg(target_os = "netbsd")]
 use netbsd as os;
 #[cfg(target_os = "openbsd")]
+#[allow(unsafe_code)]
 mod openbsd;
 #[cfg(target_os = "openbsd")]
 use openbsd as os;
@@ -315,6 +327,7 @@ pub(crate) fn unread_size(node: &Node) -> Option<u64> {
 ///   two files are on different file systems (`EXDEV`), `dst` isn't open for
 ///   writing or is no regular file (`EBADF`, `EINVAL`), and the like.
 /// * `ErrorKind::Unsupported` on every system but Linux.
+#[cfg_attr(target_os = "linux", allow(unsafe_code))]
 pub(crate) fn clone_contents(src: &File, dst: &File) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -756,6 +769,7 @@ pub(crate) fn preallocate(f: &File, len: u64) {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(unsafe_code)]
 fn os_preallocate(f: &File, len: u64) -> io::Result<()> {
     use sparse::seek::lfs::{fallocate, off_t};
     use std::os::fd::AsRawFd;
@@ -780,6 +794,7 @@ fn os_preallocate(f: &File, len: u64) -> io::Result<()> {
 }
 
 #[cfg(target_vendor = "apple")]
+#[allow(unsafe_code)]
 fn os_preallocate(f: &File, len: u64) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -1545,6 +1560,7 @@ pub(crate) fn set_atime(path: &Path, atime: Timestamp) -> io::Result<()> {
 /// `None` (`UTIME_OMIT`), with `utimensat(2)` and `AT_SYMLINK_NOFOLLOW`, to
 /// the nanosecond.
 #[cfg(any(target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd"))]
+#[allow(unsafe_code)]
 fn utimensat_nofollow(
     path: &Path,
     atime: Option<Timestamp>,
@@ -1873,6 +1889,7 @@ fn check<T: Copy + Default + PartialOrd>(r: T) -> io::Result<T> {
     target_os = "netbsd",
     target_os = "openbsd"
 ))]
+#[allow(unsafe_code)]
 fn chmod_symlink(path: &Path, node: &Node) -> io::Result<()> {
     use crate::backend::ignore::mapper::nix_mapper::map_mode_from_go;
 

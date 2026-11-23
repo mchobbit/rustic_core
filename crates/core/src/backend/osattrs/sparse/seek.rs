@@ -161,6 +161,7 @@ pub(in crate::backend::osattrs) mod lfs {
 }
 
 /// `lseek(2)` of `f` to `off` from `whence`.
+#[allow(unsafe_code)]
 fn lseek(f: &File, off: u64, whence: libc::c_int) -> io::Result<u64> {
     use lfs::{lseek, off_t};
     use std::os::fd::AsRawFd;

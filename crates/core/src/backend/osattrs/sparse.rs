@@ -152,6 +152,7 @@ fn magic(f_type: i128) -> u32 {
 ///
 /// * `fstatfs(2)`'s.
 #[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(unsafe_code)]
 pub(super) fn statfs_type(f: &File) -> io::Result<u32> {
     use std::os::fd::AsRawFd;
 
@@ -172,6 +173,7 @@ pub(super) fn statfs_type(f: &File) -> io::Result<u32> {
 ///
 /// * `statfs(2)`'s, or a path with a NUL byte.
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 pub(super) fn statfs_type_path(path: &Path) -> io::Result<u32> {
     let path = super::c_path(path)?;
     let mut st = std::mem::MaybeUninit::<seek::lfs::statfs>::uninit();
@@ -218,6 +220,7 @@ pub(super) const FS_NOCOW_FL: u32 = 0x0080_0000;
 ///
 /// * The ioctl's.
 #[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(unsafe_code)]
 pub(super) fn get_flags(f: &File) -> io::Result<u32> {
     use std::os::fd::AsRawFd;
 
@@ -312,6 +315,7 @@ fn hole_block(size: Option<u64>) -> u64 {
     target_os = "openbsd",
     target_vendor = "apple"
 ))]
+#[allow(unsafe_code)]
 fn fs_block_size(f: &File) -> Option<u64> {
     use std::os::fd::AsRawFd;
 
@@ -328,6 +332,7 @@ fn fs_block_size(f: &File) -> Option<u64> {
 /// `f_bsize` of `fstatvfs(2)` of `f` (`fstatvfs`'s, not `fstatfs`'s, on
 /// the BSDs and macOS, is the size of the best transfer, not of a block).
 #[cfg(any(target_os = "netbsd", target_os = "illumos", target_os = "solaris"))]
+#[allow(unsafe_code)]
 fn fs_block_size(f: &File) -> Option<u64> {
     use std::os::fd::AsRawFd;
 
@@ -649,6 +654,7 @@ mod tests {
     // SEEK_HOLE may report as holes, and all its blocks: no holes.
     #[cfg(target_os = "linux")]
     #[test]
+    #[allow(unsafe_code)]
     fn preallocated_has_no_holes() {
         use std::os::fd::AsRawFd;
 
