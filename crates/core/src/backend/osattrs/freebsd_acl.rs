@@ -26,8 +26,7 @@ pub(super) const GROUP_OBJ: u32 = 0x04;
 #[cfg(test)]
 const GROUP: u32 = 0x08;
 pub(super) const MASK: u32 = 0x10;
-#[cfg(test)]
-const OTHER: u32 = 0x20;
+pub(super) const OTHER: u32 = 0x20;
 pub(super) const EVERYONE: u32 = 0x40;
 
 /// ae_perm, POSIX.1e: the same bits as a mode's rwx
@@ -263,6 +262,22 @@ pub(super) fn nfs4_is_trivial(acl: &[AclEntry]) -> bool {
     special == nfs4_trivial_acl(nfs4_mode_from_acl(acl))
 }
 
+/// The POSIX.1e access ACL that says no more than `mode`: its three
+/// required entries (`user_obj`, `group_obj`, `other`), which is what a file
+/// without an ACL has, and what [`keep_acl`] keeps no attribute for. UFS and
+/// FFSv2ea store no ACL for a file given it.
+pub(super) fn posix_trivial_acl(mode: u32) -> Vec<AclEntry> {
+    [(USER_OBJ, 6), (GROUP_OBJ, 3), (OTHER, 0)]
+        .into_iter()
+        .map(|(tag, shift)| AclEntry {
+            tag,
+            id: UNDEFINED_ID,
+            perm: mode >> shift & POSIX_PERMS,
+            ..AclEntry::default()
+        })
+        .collect()
+}
+
 /// The permissions a POSIX.1e access ACL gives the file's owning group: its
 /// `group_obj` entry, limited by the mask. With an ACL, a file's mode holds
 /// the mask in its group bits, which is wider than this whenever a named
@@ -353,6 +368,25 @@ mod tests {
         acl[2].perm = 7;
         acl[4].perm = 5;
         assert_eq!(posix_owning_group_perms(&acl), Some(5));
+    }
+
+    /// The ACL a node without `acl_access` stands for (G4-01): three
+    /// entries, the mode's, which keep_acl keeps nothing for.
+    #[test]
+    fn posix_trivial_acl_is_the_mode() {
+        assert_eq!(
+            posix_trivial_acl(0o4751),
+            [
+                entry(USER_OBJ, UNDEFINED_ID, 7, 0),
+                entry(GROUP_OBJ, UNDEFINED_ID, 5, 0),
+                entry(OTHER, UNDEFINED_ID, 1, 0),
+            ]
+        );
+        for mode in [0, 0o640, 0o777] {
+            let mut attrs = GenericAttributes::default();
+            keep_acl(&FREEBSD, &mut attrs, AclType::Access, &posix_trivial_acl(mode)).unwrap();
+            assert_eq!(attrs.names().count(), 0, "{mode:o}");
+        }
     }
 
     #[test]

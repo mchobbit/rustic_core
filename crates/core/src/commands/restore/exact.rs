@@ -526,15 +526,21 @@ fn same_mode(now: &Node, node: &Node, origin: SnapshotOrigin) -> bool {
 /// every file, which a node from elsewhere hasn't got), nor, unless the
 /// snapshot is BackOtter's (`known_bko`), one that `node` hasn't got: that
 /// is unknown, and the restore leaves what the file has. As in BackOtter's
-/// restic (`sameGenericAttributes`). Without `ownership`, nor the owners of
-/// illumos' extended attributes ([`osattrs::same_generic_attribute`]).
+/// restic (`sameGenericAttributes`), but for FreeBSD's and NetBSD's system
+/// extended attributes, which a node may lack in a snapshot of BackOtter's
+/// too without saying the file had none ([`osattrs::absent_is_unknown`]).
+/// Without `ownership`, nor the owners of illumos' extended attributes
+/// ([`osattrs::same_generic_attribute`]).
 fn same_generic_attributes(now: &Node, node: &Node, ownership: bool, known_bko: bool) -> bool {
     let (a, b) = (&now.meta.generic_attributes, &node.meta.generic_attributes);
     let skipped = |name: &str| name == UNIX_SPARSE || name == UNIX_BIRTHTIME;
     b.names()
         .all(|name| skipped(name) || a.value(name).is_some())
         && a.names().filter(|name| !skipped(name)).all(|name| {
-            b.value(name).map_or(!known_bko, |want| {
+            // BackOtter: nor one a missing attribute says nothing of even
+            // then (FreeBSD's system extended attributes).
+            let unknown = !known_bko || osattrs::absent_is_unknown(name);
+            b.value(name).map_or(unknown, |want| {
                 a.value(name)
                     .is_some_and(|now| osattrs::same_generic_attribute(name, now, want, ownership))
             })

@@ -920,6 +920,38 @@ that either program restores what the other backed up.
   A snapshot without a program version is restic's before 0.16, which wrote
   none (stock rustic always writes `rustic VERSION`): a stock restic
   snapshot, whose regular files without a mode had mode 0.
+- On FreeBSD and NetBSD the restore acts on what such a missing attribute
+  says (0.14.0+backotter.2; before, a restore set only what a node holds,
+  so these stayed, exit 0, and `--exact`, which counts them as differences,
+  set such a file's metadata again on every run), in a snapshot of
+  BackOtter's only:
+  - a node without an ACL attribute had no ACL of that type that says more
+    than its mode, and the file loses one it has (`strip_acls` in
+    `osattrs/freebsd_netbsd.rs`), after the mode is set and with the mode
+    left as it is: an NFSv4 ACL that isn't trivial becomes the mode's
+    trivial one (`chmod(2)` leaves the other entries on ZFS with
+    `aclmode=passthrough`); a POSIX.1e access ACL of more than three
+    entries becomes those three (`chmod(2)` only narrows the mask, so a
+    named user kept what the mode's group bits allow: access the snapshot
+    never gave); a directory's default ACL is removed
+    (`__acl_delete_link`). So an entry given since the backup goes, and so
+    does what a file or symlink the restore made inherited from a default
+    ACL the destination's directory already had. A symlink too, which a
+    snapshot from before 0.14.0+backotter.2, or one of BackOtter's restic,
+    has no ACL for: restoring such a snapshot over a symlink that has an
+    ACL of its own takes it off. An ACL that says no more than the mode is
+    not written to;
+  - a node with `freebsd.system_extattrs` (`netbsd.`) gives the file
+    exactly those: one with the node's value already is left, any other
+    the file has is removed (but for those UFS and FFSv2ea store ACLs in).
+    A node without the attribute leaves the file's as they are, whatever
+    wrote the snapshot: only root can list that namespace, so a backup by
+    another user records none for a file that has some, and the node
+    doesn't say which it was. `--exact` doesn't count them as a difference
+    then (`osattrs::absent_is_unknown`), so it converges.
+  BackOtter's restic does none of this yet (`nodeRestoreACLs` returns for
+  a node without the attribute, `restorer.go` queues flags only for a node
+  that has them): it needs the same for the two to restore alike.
 - `merge` makes a snapshot of other snapshots' nodes: it is BackOtter's
   only if every snapshot merged is. Otherwise the program version it is
   given loses its `+backotter`, each word cut there (`rustic

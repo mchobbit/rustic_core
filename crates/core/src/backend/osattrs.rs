@@ -1313,20 +1313,43 @@ pub(crate) fn same_generic_attribute(
 /// other it has, which `chmod(2)` doesn't always take off. In any other
 /// snapshot the file keeps the ACL it has.
 ///
+/// On FreeBSD and NetBSD a node without an ACL had none that says more than
+/// its mode in such a snapshot: an ACL the file has then goes (an NFSv4 one
+/// becomes the mode's trivial one, a POSIX.1e access ACL its three entries,
+/// a default ACL nothing), which `chmod(2)` doesn't see to either.
+///
 /// # Errors
 ///
 /// * If an ACL couldn't be set.
 pub(crate) fn restore_acls(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
     // BackOtter: past PATH_MAX, through a short path to it.
     let path = &*walkdir::short_path(path);
-    #[cfg(target_os = "illumos")]
+    #[cfg(any(target_os = "illumos", target_os = "freebsd", target_os = "netbsd"))]
     {
         os::restore_acls(path, node, known_bko)
     }
-    #[cfg(not(target_os = "illumos"))]
+    #[cfg(not(any(target_os = "illumos", target_os = "freebsd", target_os = "netbsd")))]
     {
         let _ = known_bko;
         os::restore_acls(path, node)
+    }
+}
+
+/// BackOtter: whether a node without the generic attribute `name` leaves
+/// what the file has as it is in a snapshot of BackOtter's too, where a
+/// missing attribute otherwise says the file had none ([`node_flags`]):
+/// FreeBSD's and NetBSD's system extended attributes, which only root can
+/// list, so that a backup by another user records none for a file that has
+/// some. `restore --exact` then doesn't count them as a difference.
+pub(crate) fn absent_is_unknown(name: &str) -> bool {
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+    {
+        freebsd_netbsd::absent_is_unknown(name)
+    }
+    #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
+    {
+        let _ = name;
+        false
     }
 }
 

@@ -280,9 +280,10 @@ pub(super) fn clear_restricting_flags(path: &Path) -> io::Result<()> {
         .map_err(|err| path_error("lchflags", path, &err))
 }
 
-/// Restores the ACLs, a symlink's too.
-pub(super) fn restore_acls(path: &Path, node: &Node) -> io::Result<()> {
-    freebsd_netbsd::restore_acls(path, node)
+/// Restores the ACLs, a symlink's too; in a snapshot of BackOtter's
+/// (`known_bko`), one the node hasn't got goes.
+pub(super) fn restore_acls(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
+    freebsd_netbsd::restore_acls(path, node, known_bko)
 }
 
 /// Gives a symlink its own permissions back: FreeBSD keeps them

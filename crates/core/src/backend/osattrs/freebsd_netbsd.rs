@@ -80,6 +80,8 @@ mod freebsd_sys {
             acl: *mut RawAcl,
         ) -> libc::c_int;
         pub(super) fn lpathconf(path: *const libc::c_char, name: libc::c_int) -> libc::c_long;
+        #[link_name = "__acl_delete_link"]
+        pub(super) fn acl_delete_link(path: *const libc::c_char, typ: libc::c_int) -> libc::c_int;
     }
 }
 
@@ -92,6 +94,7 @@ mod netbsd_sys {
 
     const SYS_ACL_GET_LINK: libc::c_int = 487;
     const SYS_ACL_SET_LINK: libc::c_int = 488;
+    const SYS_ACL_DELETE_LINK: libc::c_int = 489;
     const SYS_LPATHCONF: libc::c_int = 499;
 
     pub(super) unsafe fn acl_get_link(
@@ -115,6 +118,11 @@ mod netbsd_sys {
     pub(super) unsafe fn lpathconf(path: *const libc::c_char, name: libc::c_int) -> libc::c_long {
         // SAFETY: as lpathconf(2), for which the caller vouches.
         libc::c_long::from(unsafe { libc::syscall(SYS_LPATHCONF, path, name) })
+    }
+
+    pub(super) unsafe fn acl_delete_link(path: *const libc::c_char, typ: libc::c_int) -> libc::c_int {
+        // SAFETY: as __acl_delete_link(2), for which the caller vouches.
+        unsafe { libc::syscall(SYS_ACL_DELETE_LINK, path, typ) }
     }
 }
 
@@ -173,6 +181,17 @@ fn set_acl(path: &Path, typ: AclType, acl: &[AclEntry]) -> io::Result<()> {
     // SAFETY: raw is a struct acl holding cnt entries.
     _ = check(unsafe { sys::acl_set_link(p.as_ptr(), typ as libc::c_int, &raw mut *raw) })
         .map_err(|err| acl_set_error(path_error("__acl_set_link", path, &err), &err))?;
+    Ok(())
+}
+
+/// Removes the default ACL of the directory at `path`
+/// (`__acl_delete_link(2)`, as `setfacl -k`): setting one without entries is
+/// refused.
+fn delete_default_acl(path: &Path) -> io::Result<()> {
+    let p = c_path(path)?;
+    // SAFETY: p is a C string.
+    _ = check(unsafe { sys::acl_delete_link(p.as_ptr(), AclType::Default as libc::c_int) })
+        .map_err(|err| path_error("__acl_delete_link", path, &err))?;
     Ok(())
 }
 
@@ -276,6 +295,23 @@ fn set_system_extattr(path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+fn delete_system_extattr(path: &Path, name: &[u8]) -> io::Result<()> {
+    let p = c_path(path)?;
+    let n = CString::new(name)?;
+    // SAFETY: p and n are C strings.
+    let r = unsafe {
+        libc::extattr_delete_link(p.as_ptr(), libc::EXTATTR_NAMESPACE_SYSTEM, n.as_ptr())
+    };
+    match check(r) {
+        Ok(_) => Ok(()),
+        Err(err) if err.raw_os_error() == Some(libc::ENOATTR) => Ok(()), // gone already
+        Err(err) => {
+            let op = format!("extattr_delete_link system.{}", bsd_extattr::node_name(name));
+            Err(path_error(&op, path, &err))
+        }
+    }
+}
+
 /// The system extended attributes, by name, as BackOtter's restic keeps them
 /// (a Go `map[string][]byte`: base64 values).
 #[serde_as]
@@ -358,11 +394,18 @@ fn fill_acls(path: &Path, node: &mut Node) -> io::Result<()> {
     keep(AclType::Default)
 }
 
-/// Restores the system extended attributes.
+/// Restores the system extended attributes: the file gets exactly the
+/// node's, each set unless it has that value already, and any other it has
+/// removed, but for those the file system stores ACLs in
+/// ([`UFS_ACL_EXTATTRS`]), which the ACLs' restore sees to. A node without
+/// the attribute leaves the file's as they are: its file had none, or the
+/// backup, not running as root, couldn't list them, and the node doesn't say
+/// which ([`absent_is_unknown`]).
 ///
 /// # Errors
 ///
-/// * If one couldn't be set: the first error.
+/// * If one couldn't be set or removed, or they couldn't be listed: the
+///   first error.
 pub(super) fn restore_system_extattrs(path: &Path, node: &Node) -> io::Result<()> {
     let Some(attrs) = node
         .meta
@@ -374,11 +417,44 @@ pub(super) fn restore_system_extattrs(path: &Path, node: &Node) -> io::Result<()
     let attrs = attrs.map_err(io::Error::other)?;
     let mut first_err = None;
     for (name, value) in &attrs.0 {
+        // One with that value already is left: no change time moves.
+        if get_system_extattr(path, name.as_bytes()).is_ok_and(|has| &has == value) {
+            continue;
+        }
         if let Err(err) = set_system_extattr(path, name, value) {
             _ = first_err.get_or_insert(err);
         }
     }
+    match list_extattrs(path, libc::EXTATTR_NAMESPACE_SYSTEM) {
+        Ok(names) => {
+            for name in names {
+                if UFS_ACL_EXTATTRS.iter().any(|acl| acl.as_bytes() == name)
+                    || attrs.0.contains_key(&bsd_extattr::node_name(&name))
+                {
+                    continue;
+                }
+                if let Err(err) = delete_system_extattr(path, &name) {
+                    _ = first_err.get_or_insert(err);
+                }
+            }
+        }
+        // Not root, or no extended attributes here: the sets said so.
+        Err(err) if unsupported(&err) => {}
+        Err(err) => {
+            _ = first_err.get_or_insert(path_error("extattr_list_link system", path, &err));
+        }
+    }
     first_err.map_or(Ok(()), Err)
+}
+
+/// Whether a node without the generic attribute `name` leaves what the
+/// file has as it is in a snapshot of BackOtter's too, where a missing
+/// attribute otherwise says the file had none: the system extended
+/// attributes, which only root can list, so that a backup by another user
+/// records none for a file that has some. `restore --exact` then doesn't
+/// count them as a difference.
+pub(super) fn absent_is_unknown(name: &str) -> bool {
+    name == sys::OS.system_extattrs
 }
 
 /// Restores the ACLs, a symlink's own too. If a POSIX.1e access ACL can't
@@ -386,11 +462,16 @@ pub(super) fn restore_system_extattrs(path: &Path, node: &Node) -> io::Result<()
 /// which would give the owning group all that named users and groups had;
 /// they are narrowed to the group's own access.
 ///
+/// A node without an ACL attribute had no ACL of that type in a snapshot of
+/// BackOtter's (`known_bko`), which records each that says more than the
+/// mode: what the file has of that type then goes ([`strip_acls`]). In any
+/// other snapshot it is unknown, and stays.
+///
 /// # Errors
 ///
-/// * If an ACL couldn't be set: the first error.
-pub(super) fn restore_acls(path: &Path, node: &Node) -> io::Result<()> {
-    let mut first_err = None;
+/// * If an ACL couldn't be set or removed: the first error.
+pub(super) fn restore_acls(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
+    let mut first_err = known_bko.then(|| strip_acls(path, node).err()).flatten();
     let mut restore = |typ: AclType, failed: &dyn Fn(&[AclEntry]) -> io::Result<()>| {
         let name = sys::OS.attribute(typ);
         let Some(acl) = node.meta.generic_attributes.get::<Vec<AclEntry>>(name) else {
@@ -422,6 +503,69 @@ pub(super) fn restore_acls(path: &Path, node: &Node) -> io::Result<()> {
     });
     restore(AclType::Default, &|_| Ok(()));
     first_err.map_or(Ok(()), Err)
+}
+
+/// Takes from the file at `path` the ACLs its file system has a type of and
+/// `node` holds no attribute for, where they say more than its mode, which
+/// the restore set before and which stays as it is: an NFSv4 ACL that isn't
+/// trivial becomes the trivial one of the mode (`chmod(2)` leaves the other
+/// entries on ZFS with `aclmode=passthrough`); a POSIX.1e access ACL of more
+/// than three entries becomes those three, the mode's (`chmod(2)` only
+/// narrows the mask, so a named user keeps what the mode's group bits
+/// allow); a directory's default ACL is removed. So an ACL the file was given
+/// since the backup, or inherited from the directory the restore made it in,
+/// goes, as an extended attribute the node hasn't got does. One that says no
+/// more than the mode is left untouched: no change time moves.
+///
+/// # Errors
+///
+/// * If an ACL couldn't be read (but not where the file system has none),
+///   set or removed: the first error.
+fn strip_acls(path: &Path, node: &Node) -> io::Result<()> {
+    let has = |typ| node.meta.generic_attributes.value(sys::OS.attribute(typ)).is_some();
+    let current = |typ| match get_acl(path, typ) {
+        Ok(acl) => Ok(acl),
+        Err(err) if no_acls(&err) => Ok(Vec::new()),
+        Err(err) => Err(path_error("__acl_get_link", path, &err)),
+    };
+    let mode = || {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(path).map_err(|err| path_error("lstat", path, &err))?;
+        Ok::<_, io::Error>(m.mode() & 0o777)
+    };
+    if path_conf(path, sys::OS.pc_acl_nfs4).ok() == Some(1) {
+        if has(AclType::Nfs4) {
+            return Ok(());
+        }
+        let acl = current(AclType::Nfs4)?;
+        if acl.is_empty() || freebsd_acl::nfs4_is_trivial(&acl) {
+            return Ok(());
+        }
+        return set_acl(path, AclType::Nfs4, &freebsd_acl::nfs4_trivial_acl(mode()?));
+    }
+    if path_conf(path, sys::OS.pc_acl_extended).ok() != Some(1) {
+        return Ok(()); // no ACLs on this file system
+    }
+    let access = if has(AclType::Access) {
+        Ok(())
+    } else {
+        current(AclType::Access).and_then(|acl| {
+            if acl.len() <= 3 {
+                return Ok(());
+            }
+            set_acl(path, AclType::Access, &freebsd_acl::posix_trivial_acl(mode()?))
+        })
+    };
+    if !node.is_dir() || has(AclType::Default) {
+        return access;
+    }
+    let default = current(AclType::Default).and_then(|acl| {
+        if acl.is_empty() {
+            return Ok(());
+        }
+        delete_default_acl(path)
+    });
+    access.and(default)
 }
 
 #[cfg(test)]
@@ -512,7 +656,7 @@ mod tests {
         let kept = node.meta.generic_attributes.get::<Vec<AclEntry>>(sys::OS.attribute(typ));
         assert_eq!(kept.map(Result::unwrap), Some(acl.clone()), "the symlink's ACL not kept");
 
-        restore_acls(&restored, &node).unwrap();
+        restore_acls(&restored, &node, true).unwrap();
         assert_eq!(get_acl(&restored, typ).unwrap(), acl);
         assert_eq!(get_acl(&target, typ).unwrap(), of_target);
 
@@ -523,6 +667,151 @@ mod tests {
         fill_acls(&bare, &mut plain).unwrap();
         let kept = plain.meta.generic_attributes.get::<Vec<AclEntry>>(sys::OS.attribute(typ));
         assert!(kept.is_none(), "a symlink without an ACL got one: {kept:?}");
+    }
+
+    /// The change time of the file at `path`, to tell whether a call after
+    /// this one wrote to its inode: taken a moment later, so that a write
+    /// then moves it (the kernel's timestamps go by its clock ticks).
+    fn ctime(path: &Path) -> (i64, i64) {
+        use std::os::unix::fs::MetadataExt;
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let m = std::fs::symlink_metadata(path).unwrap();
+        (m.ctime(), m.ctime_nsec())
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Whether the file at `path` has no more ACL of type `typ` than its
+    /// mode, 0640, says: what a backup keeps no attribute for.
+    fn only_the_mode(path: &Path, typ: AclType) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let acl = get_acl(path, typ).unwrap();
+        let mut now = node_of("now", NodeType::File, 0o640);
+        fill_acls(path, &mut now).unwrap();
+        let trivial = if typ == AclType::Nfs4 {
+            freebsd_acl::nfs4_is_trivial(&acl)
+        } else {
+            acl == freebsd_acl::posix_trivial_acl(0o640)
+        };
+        let mode = std::fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+        trivial && mode == 0o640 && now.meta.generic_attributes.names().count() == 0
+    }
+
+    /// G4-01: a file's ACL that its node hasn't got goes in a snapshot of
+    /// BackOtter's, where the node says the file had none, and stays in any
+    /// other; a second restore writes nothing. `chmod(2)` alone, which the
+    /// restore did before, left a named user's entry.
+    #[test]
+    fn restore_takes_off_an_acl_the_node_lacks() {
+        let Some((dir, typ)) = acl_dir("restore_takes_off_an_acl_the_node_lacks") else {
+            return;
+        };
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        chmod(&file, 0o640);
+        assert!(only_the_mode(&file, typ));
+        let node = node_of("f", NodeType::File, 0o640);
+        let with_user = acl_with_a_user(typ, 0o640);
+        set_acl(&file, typ, &with_user).unwrap();
+        // As the restore does: the mode first, which leaves the user's entry
+        // (ZFS with aclmode=passthrough; UFS, under the mask).
+        chmod(&file, 0o640);
+        let after_chmod = get_acl(&file, typ).unwrap();
+
+        restore_acls(&file, &node, false).unwrap();
+        assert_eq!(get_acl(&file, typ).unwrap(), after_chmod, "not BackOtter's: kept");
+
+        restore_acls(&file, &node, true).unwrap();
+        assert!(only_the_mode(&file, typ), "{:?}", get_acl(&file, typ));
+        let before = ctime(&file);
+        restore_acls(&file, &node, true).unwrap();
+        assert_eq!(ctime(&file), before, "a second restore wrote to the file");
+
+        // A node with the ACL sets it, as before.
+        let mut keeps = node.clone();
+        keeps.meta.generic_attributes.set(sys::OS.attribute(typ), &with_user).unwrap();
+        restore_acls(&file, &keeps, true).unwrap();
+        assert_eq!(get_acl(&file, typ).unwrap(), with_user);
+    }
+
+    /// G4-01: a directory's default ACL that its node hasn't got is
+    /// removed, and what a file made under it inherited goes too (POSIX.1e).
+    #[test]
+    fn restore_removes_a_default_acl_the_node_lacks() {
+        let Some((dir, typ)) = acl_dir("restore_removes_a_default_acl_the_node_lacks") else {
+            return;
+        };
+        if typ != AclType::Access {
+            eprintln!("restore_removes_a_default_acl_the_node_lacks: NFSv4 ACLs: nothing tested");
+            return;
+        }
+        let (d, kid) = (dir.path().join("d"), dir.path().join("d/kid"));
+        std::fs::create_dir(&d).unwrap();
+        chmod(&d, 0o750);
+        set_acl(&d, AclType::Default, &acl_with_a_user(typ, 0o750)).unwrap();
+        std::fs::write(&kid, "x").unwrap();
+        assert!(get_acl(&kid, typ).unwrap().len() > 3, "nothing inherited");
+
+        let node = node_of("d", NodeType::Dir, 0o750);
+        restore_acls(&d, &node, false).unwrap();
+        assert!(!get_acl(&d, AclType::Default).unwrap().is_empty(), "not BackOtter's: kept");
+        restore_acls(&d, &node, true).unwrap();
+        assert!(get_acl(&d, AclType::Default).unwrap().is_empty());
+        let before = ctime(&d);
+        restore_acls(&d, &node, true).unwrap();
+        assert_eq!(ctime(&d), before, "a second restore wrote to the directory");
+
+        chmod(&kid, 0o640);
+        restore_acls(&kid, &node_of("kid", NodeType::File, 0o640), true).unwrap();
+        assert!(only_the_mode(&kid, typ), "{:?}", get_acl(&kid, typ));
+    }
+
+    /// The names of the system extended attributes of the file at `path`
+    /// that aren't ACLs, sorted.
+    fn system_names(path: &Path) -> Vec<String> {
+        let mut names: Vec<_> = list_extattrs(path, libc::EXTATTR_NAMESPACE_SYSTEM)
+            .unwrap()
+            .iter()
+            .map(|n| bsd_extattr::node_name(n))
+            .filter(|n| !UFS_ACL_EXTATTRS.contains(&n.as_str()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// G4-01: a node with system extended attributes gives the file exactly
+    /// those, writing nothing when it has them; a node without the
+    /// attribute leaves the file's, which `restore --exact` doesn't count.
+    #[test]
+    fn system_extattrs_are_restored_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        if let Err(err) = set_system_extattr(&file, "bko.kept", b"old") {
+            eprintln!("system_extattrs_are_restored_exactly: {err}: nothing tested");
+            return;
+        }
+        set_system_extattr(&file, "bko.extra", b"x").unwrap();
+        let bare = node_of("f", NodeType::File, 0o644);
+        restore_system_extattrs(&file, &bare).unwrap();
+        assert_eq!(system_names(&file), ["bko.extra", "bko.kept"], "no attribute: left");
+        assert!(absent_is_unknown(sys::OS.system_extattrs));
+        assert!(!absent_is_unknown(sys::OS.acl_access));
+
+        let mut attrs = SystemExtattrs::default();
+        _ = attrs.0.insert("bko.kept".to_string(), b"new".to_vec());
+        _ = attrs.0.insert("bko.made".to_string(), b"m".to_vec());
+        let mut node = bare.clone();
+        node.meta.generic_attributes.set(sys::OS.system_extattrs, &attrs).unwrap();
+        restore_system_extattrs(&file, &node).unwrap();
+        assert_eq!(system_names(&file), ["bko.kept", "bko.made"]);
+        assert_eq!(get_system_extattr(&file, b"bko.kept").unwrap(), b"new");
+        let before = ctime(&file);
+        restore_system_extattrs(&file, &node).unwrap();
+        assert_eq!(ctime(&file), before, "a second restore wrote to the file");
     }
 
     #[test]
