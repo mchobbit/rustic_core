@@ -245,10 +245,11 @@ pub struct RestoreStats {
 
 #[derive(Default, Debug, Clone, Copy)]
 #[non_exhaustive]
-/// BackOtter: what restoring a plan couldn't do and only warned about:
-/// metadata not set for a reason other than the target not supporting it,
-/// special files not made. BackOtter's restic counts each as an error (exit
-/// 1).
+/// BackOtter: what restoring a plan couldn't do and only warned about.
+///
+/// Metadata not set for a reason other than the target not supporting it,
+/// and special files not made. BackOtter's restic counts each as an error
+/// (exit 1).
 pub struct RestoreOutcome {
     /// Number of such failures
     pub errors: u64,
@@ -903,11 +904,11 @@ struct MetadataPass {
 /// BackOtter: links the name `path` of the hard-linked file `node` (`key`)
 /// to its first name, `canonical`, as the metadata pass does
 /// (`LocalDestination::hard_link`): an entry made in its directory
-/// (DirChanges). Where its node says which flags it had, the file loses
+/// ([`DirChanges`]). Where its node says which flags it had, the file loses
 /// those that would refuse a link to it (immutable, append-only), which the
 /// late flags pass puts back on it, and what is in the way loses those that
 /// would refuse its removal, held: its other names get them back once this
-/// name is gone (remove_held).
+/// name is gone ([`remove_held`]).
 ///
 /// # Errors
 ///

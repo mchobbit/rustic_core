@@ -429,7 +429,8 @@ pub(super) fn already_matches(target: &Path, node: &Node, how: Compared) -> bool
 
 /// Whether what is at `target` has `node`'s metadata ([`already_matches`])
 /// but for its atime ([`atime_alone_differs`]), which is then put back
-/// alone ([`osattrs::set_atime`]), leaving the change time as it is: on
+/// alone (`osattrs::set_atime`, which only NetBSD has), leaving the change
+/// time as it is: on
 /// NetBSD, whose FFS moves no change time for an atime set with the mtime
 /// omitted, and which has no `O_NOATIME`, so that on a mount that keeps
 /// atimes (as installed) the restore's own reads move them (verifying a
