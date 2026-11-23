@@ -65,7 +65,7 @@ mod tests {
         );
         // A name cut short ends the list.
         assert_eq!(list_names(b"\x01a\x05ab"), [b"a".to_vec()]);
-        assert!(list_names(b"").is_empty());
+        assert_eq!(list_names(b""), Vec::<Vec<u8>>::new());
     }
 
     #[test]
