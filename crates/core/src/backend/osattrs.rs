@@ -946,7 +946,7 @@ impl SidUnmapped {
 /// BackOtter: more than one error from one step of restoring a file's
 /// metadata, which [`warn_restore`] warns about each as if alone: the owner
 /// and the group both SIDs that idmap couldn't map, a warning for each
-/// attribute.
+/// attribute; a Linux file's flags and its btrfs compression property.
 #[derive(Debug)]
 pub(crate) struct RestoreErrors(Vec<io::Error>);
 
@@ -954,7 +954,12 @@ impl RestoreErrors {
     /// `Ok` for no errors, the error itself for one, and one that holds them
     /// all for more.
     #[cfg_attr(
-        not(any(target_os = "illumos", target_os = "freebsd", target_os = "netbsd")),
+        not(any(
+            target_os = "freebsd",
+            target_os = "illumos",
+            target_os = "linux",
+            target_os = "netbsd"
+        )),
         allow(dead_code)
     )]
     fn result(mut errors: Vec<io::Error>) -> io::Result<()> {

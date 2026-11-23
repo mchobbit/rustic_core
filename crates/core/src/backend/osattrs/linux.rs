@@ -16,7 +16,10 @@ use std::{
 use jiff::Timestamp;
 use log::{debug, warn};
 
-use super::{HeldFlags, Unsupported, XattrErrors, path_error, set_flags_best_effort, unsupported};
+use super::{
+    HeldFlags, RestoreErrors, Unsupported, XattrErrors, path_error, set_flags_best_effort,
+    unsupported, xattr_unsupported,
+};
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType,
     generic_attributes::{
@@ -910,14 +913,18 @@ const fn casefold_differs(typ: &NodeType, current: u32, flags: u32) -> bool {
 /// `FS_IOC_SETFLAGS` rewrites the `btrfs.compression` property, restored
 /// before as an extended attribute (or deletes it, without `FS_COMPR_FL`).
 /// So for a file with the property (`compression`), `set` gets the flags
-/// but immutable and append-only, `set_compression` puts the property back,
-/// and `add_xflags` adds those two through `FS_IOC_FSSETXATTR`, which leaves
-/// it alone. `get` (`FS_IOC_GETFLAGS`) then checks them: where the file
-/// system has no `FS_IOC_FSSETXATTR`, or that didn't give the file exactly
-/// those two (ZFS 2.2, which takes `fsx_xflags` for `FS_IOC_GETFLAGS`'s
-/// flags, so that `FS_XFLAG_APPEND` set immutable), `set` gives it all its
-/// flags, as [`put_back_restricting_with`] does. Only a file system without
-/// the property gets there: btrfs has `FS_IOC_FSSETXATTR`, and maps the two.
+/// but immutable and append-only, `set_compression` puts the property back
+/// after it (neither where those are right already; a file system without
+/// the property is no error), and `add_xflags` adds those two through
+/// `FS_IOC_FSSETXATTR`, which leaves it alone. Each step's error is kept,
+/// in a [`RestoreErrors`] for more than one, as BackOtter's restic joins
+/// them (`setLateFlags`). `get` (`FS_IOC_GETFLAGS`) then checks the two:
+/// where the file system has no `FS_IOC_FSSETXATTR`, or that didn't give
+/// the file exactly those two (ZFS 2.2, which takes `fsx_xflags` for
+/// `FS_IOC_GETFLAGS`'s flags, so that `FS_XFLAG_APPEND` set immutable),
+/// `set` gives it all its flags, as [`put_back_restricting_with`] does. Only
+/// a file system without the property gets there: btrfs has
+/// `FS_IOC_FSSETXATTR`, and maps the two.
 #[allow(clippy::too_many_arguments)]
 fn restore_flags_with(
     path: &Path,
@@ -946,20 +953,31 @@ fn restore_flags_with(
     };
     let late = flags & (FS_IMMUTABLE_FL | FS_APPEND_FL);
     let first = flags & KEPT_LATE & !late;
-    let set_first = if own | first == current {
-        Ok(())
-    } else {
-        set_flags_best_effort(
-            LINUX_INODE_FLAGS,
-            path,
-            "FS_IOC_SETFLAGS",
-            Some(current & KEPT_LATE),
-            first,
-            |f| set(own | f),
-        )
-    };
-    let set_property = set_compression(compression)
-        .map_err(|err| path_error(&format!("set {BTRFS_COMPRESSION} of"), path, &err));
+    // BackOtter: each step's error is kept and warned about alone
+    // (RestoreErrors), as BackOtter's restic joins them (setLateFlags).
+    let mut errors = Vec::new();
+    // Only an FS_IOC_SETFLAGS rewrites the property: without one it stays
+    // as restored. Where the file system has no such property (ext4, XFS,
+    // ZFS), that goes unsaid, as in BackOtter's restic (setCompression).
+    if own | first != current {
+        errors.extend(
+            set_flags_best_effort(
+                LINUX_INODE_FLAGS,
+                path,
+                "FS_IOC_SETFLAGS",
+                Some(current & KEPT_LATE),
+                first,
+                |f| set(own | f),
+            )
+            .err(),
+        );
+        match set_compression(compression) {
+            Err(err) if !xattr_unsupported(&err) => {
+                errors.push(path_error(&format!("set {BTRFS_COMPRESSION} of"), path, &err));
+            }
+            _ => {}
+        }
+    }
     let mut xflags = 0;
     if late & FS_IMMUTABLE_FL != 0 {
         xflags |= FS_XFLAG_IMMUTABLE;
@@ -980,7 +998,8 @@ fn restore_flags_with(
             Err(err) => Err(path_error("FS_IOC_FSSETXATTR", path, &err)),
         },
     };
-    set_first.and(set_property).and(set_late)
+    errors.extend(set_late.err());
+    RestoreErrors::result(errors)
 }
 
 /// Gives a file the [`KEPT_LATE`] flags `want` with `set`
@@ -1817,10 +1836,11 @@ mod tests {
             restore_flags_calls(COMPR, COMPR | NODUMP, zstd),
             ["set 0x44", "compression zstd"]
         );
-        // Immutable last, through FS_IOC_FSSETXATTR.
+        // Immutable last, through FS_IOC_FSSETXATTR. No FS_IOC_SETFLAGS ran,
+        // so nothing rewrote the property: it isn't set again.
         assert_eq!(
             restore_flags_calls(COMPR, COMPR | FS_IMMUTABLE_FL, zstd),
-            ["compression zstd", "xflags 0x8"]
+            ["xflags 0x8"]
         );
         assert_eq!(
             restore_flags_calls(COMPR, COMPR | NODUMP | FS_APPEND_FL, zstd),
@@ -1895,8 +1915,78 @@ mod tests {
             );
             assert_eq!(now.get(), EXTENTS | flags, "{name}");
             assert_eq!(sets.get(), want_sets, "{name}");
-            // The property alone wasn't restored, where there is none.
-            assert_eq!(result.is_err(), zfs, "{name}: {result:?}");
+            // A file system without the property is no error, as in
+            // BackOtter's restic (setCompression).
+            assert!(result.is_ok(), "{name}: {result:?}");
+        }
+    }
+
+    /// Runs [`restore_flags_with`] for a file with the flags `current`, a
+    /// node with `flags` and `btrfs.compression`, where `FS_IOC_SETFLAGS`
+    /// fails with `set`'s errno, setting the property with `property`'s and
+    /// `FS_IOC_FSSETXATTR` with `xflags`' (0: it works).
+    fn restore_flags_failing(
+        current: u32,
+        flags: u32,
+        set: i32,
+        property: i32,
+        xflags: i32,
+    ) -> io::Result<()> {
+        let fails = |errno: i32| match errno {
+            0 => Ok(()),
+            errno => Err(io::Error::from_raw_os_error(errno)),
+        };
+        restore_flags_with(
+            Path::new("f"),
+            current,
+            flags,
+            Some(&b"zstd"[..]),
+            || Ok(current),
+            |_| fails(set),
+            |_| fails(property),
+            |_| fails(xflags),
+        )
+    }
+
+    // BackOtter (ForkAudit1 G3-01): each step's error is kept, as BackOtter's
+    // restic joins them (setLateFlags), where only the first was.
+    #[test]
+    fn restore_flags_keep_every_error() {
+        use crate::backend::osattrs::restore_error_counts;
+
+        // A c+i file restored onto XFS, not as root: FS_IOC_SETFLAGS has no
+        // FS_COMPR_FL there (unsupported: warned once, never counted), there
+        // is no btrfs.compression (nothing said), and FS_IOC_FSSETXATTR
+        // refuses immutable (EPERM), which is the file's error and counts.
+        let err = restore_flags_failing(
+            EXTENTS,
+            COMPR | FS_IMMUTABLE_FL,
+            libc::EOPNOTSUPP,
+            libc::EOPNOTSUPP,
+            libc::EPERM,
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("linux.inode_flags 0x4 not supported"), "{text}");
+        assert!(text.contains("FS_IOC_FSSETXATTR f: "), "{text}");
+        assert!(!text.contains(BTRFS_COMPRESSION), "{text}");
+        assert!(restore_error_counts(&err, false, false), "{text}");
+        // The unsupported flag alone doesn't count.
+        let err = restore_flags_failing(EXTENTS, COMPR | FS_IMMUTABLE_FL, libc::EOPNOTSUPP, 0, 0)
+            .unwrap_err();
+        assert!(!restore_error_counts(&err, false, false), "{err}");
+
+        // The property refused for another reason is an error of its own,
+        // beside the flags'.
+        let err = restore_flags_failing(EXTENTS, COMPR | NODUMP | FS_APPEND_FL, 0, libc::EIO, libc::EPERM)
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("set btrfs.compression of f: "), "{text}");
+        assert!(text.contains("FS_IOC_FSSETXATTR f: "), "{text}");
+        assert!(restore_error_counts(&err, false, false), "{text}");
+        // No such property (ENOTSUP, or ENODATA from an SMB mount): nothing.
+        for errno in [libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENODATA] {
+            restore_flags_failing(EXTENTS, COMPR | NODUMP, 0, errno, 0).unwrap();
         }
     }
 
