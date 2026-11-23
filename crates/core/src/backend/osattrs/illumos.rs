@@ -279,6 +279,13 @@ pub(super) fn open_for_attrs(
         .ok()
 }
 
+/// The system attributes of the file whose view is `f`, as a mask, if they
+/// are worth keeping ([`View::kept_mask`]); none without a view.
+///
+/// # Errors
+///
+/// * If the view couldn't be read, or isn't an nvlist: the backup warns and
+///   keeps the node without them.
 pub(super) fn file_flags(
     path: &Path,
     _typ: &NodeType,
@@ -293,8 +300,14 @@ pub(super) fn file_flags(
 }
 
 /// Records the SIDs of an owner and group that are SIDs, the creation time
-/// and a mask of 0, from the system attribute view, and of a regular file or
-/// directory its ACL and ZFS project.
+/// from the system attribute view, and of a regular file or directory its
+/// ACL and ZFS project.
+///
+/// # Errors
+///
+/// * If the ACL or the view couldn't be read (not: a file system without
+///   them). What could be read is recorded all the same; the backup warns
+///   with the error and counts the file as incomplete.
 pub(super) fn fill_attributes(path: &Path, node: &mut Node, f: Option<&File>) -> io::Result<()> {
     let mut sids = SidNamer::default();
     sids.owner(node);
@@ -557,11 +570,19 @@ pub(super) fn prepare_dir_for_flags(_path: &Path, _flags: u32) -> io::Result<()>
 
 /// Sets the system attributes the view has to those in `flags`, writing
 /// their booleans alone: the whole view would set the creation time too,
-/// which an immutable file refuses. Each write names every boolean, so as
-/// not the owner, where one of them only root may set, the others are set
-/// and cleared one at a time from what the file has
-/// ([`set_flags_best_effort`]): `av_modified`, which the owner may set but
-/// not clear, stays as it is meanwhile (naming it unchanged is allowed).
+/// which an immutable file refuses. One write names every boolean. Where
+/// that is refused, because one of them only root may set or clear, the
+/// others are set and cleared one at a time from what the file has
+/// ([`set_flags_best_effort`]), each write naming the refused one as the
+/// file has it, which is allowed: `av_modified`, which the owner may set
+/// but not clear, stays as it is.
+///
+/// # Errors
+///
+/// * If the view couldn't be opened, read or written.
+/// * An [`Unsupported`] error (a warning once per restore, not counted) if
+///   every boolean refused is one the file system doesn't have; else an
+///   error that names the bits not set or cleared.
 pub(super) fn restore_file_flags(
     path: &Path,
     typ: &NodeType,
@@ -631,6 +652,13 @@ pub(super) fn clear_restricting_flags(_path: &Path) -> io::Result<()> {
 /// [`SidUnmapped`] error: not the number, which may belong to another SID.
 /// The owner and the group unmapped both give both errors
 /// ([`RestoreErrors`]), a warning for each attribute.
+///
+/// # Errors
+///
+/// * If a SID in the node isn't a string, or the `lchown(2)` failed.
+/// * A [`SidUnmapped`] error for a SID idmap couldn't map, after the file
+///   got nobody for it; two of them in a [`RestoreErrors`]. The restore
+///   warns once per attribute and doesn't count them.
 pub(super) fn restore_owner(path: &Path, node: &Node) -> io::Result<()> {
     let id = |attr: &'static str, group, unmapped: &mut Option<io::Error>| {
         node.meta
@@ -662,6 +690,16 @@ pub(super) fn restore_owner(path: &Path, node: &Node) -> io::Result<()> {
 /// the project and the system attributes it has otherwise
 /// ([`reset_zfs_project`], [`reset_file_flags`]). A node with system
 /// attributes gets them in the late flags pass ([`restore_file_flags`]).
+///
+/// # Errors
+///
+/// The first of, each tried whatever the others gave:
+///
+/// * the ZFS project: an [`Unsupported`] error on a file system without
+///   one (a warning once per restore, not counted), or the ioctl's;
+/// * the attributes' metadata: the first that couldn't be set, else a
+///   [`SidUnmapped`] error about an owner or ACL entry that got nobody;
+/// * the system attributes' reset: as [`restore_file_flags`].
 pub(super) fn restore_attributes(
     path: &Path,
     node: &Node,
@@ -712,6 +750,15 @@ fn strip_acl(of: AclOf<'_>, mode: u32, dir: bool) -> io::Result<()> {
 /// (`known_bko`), which records every other: the file then gets the trivial
 /// ACL of its mode, where it has another ([`strip_acl`]). In any other
 /// snapshot the ACL is unknown, and the file keeps the one it has.
+///
+/// # Errors
+///
+/// * If the node's ACL isn't one, or it couldn't be read or set: an
+///   `ErrorKind::Unsupported` error where the file system has no NFSv4
+///   ACLs (`acl_set_error`), which the restore warns about and doesn't
+///   count.
+/// * A [`SidUnmapped`] error for an entry whose SID idmap couldn't map,
+///   after the ACL was set with nobody for it.
 pub(super) fn restore_acls(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
     if node.is_symlink() {
         return Ok(());
@@ -747,6 +794,12 @@ pub(super) fn restore_symlink_mode(_path: &Path, _node: &Node) -> io::Result<()>
 /// the system attributes, since an immutable file refuses it. Symlinks have
 /// no view of their own (it is their target's), the other types none, and
 /// UFS has none; tmpfs has one, but refuses a `crtime`.
+///
+/// # Errors
+///
+/// * An `ErrorKind::Unsupported` error where the file has no view, or its
+///   file system takes no `crtime`: the caller says nothing then.
+/// * If the view couldn't be opened or written otherwise.
 pub(super) fn restore_birthtime(path: &Path, node: &Node, birth: Timestamp) -> io::Result<()> {
     let f = match sysattr_view(path, &node.node_type, true) {
         Ok(f) => f,
@@ -899,7 +952,7 @@ fn open_attr(dir: &File, name: &CStr, how: libc::c_int) -> io::Result<File> {
 }
 
 /// The extended attributes of the file at `path`: on illumos, named
-/// attribute files (`runat(1)`, `fsattr(5)`), which the xattr crate doesn't
+/// attribute files (`runat(1)`, `fsattr(7)`), which the xattr crate doesn't
 /// support. One whose value can't be read is left out and named in
 /// `unreadable`, and the others are kept, as BackOtter's restic does. One
 /// whose name isn't UTF-8 is read by its bytes and kept under its name with
@@ -965,6 +1018,14 @@ fn attr_has_value(dir: &File, name: &CStr, want: &[u8]) -> bool {
 /// refused ([`attr_name_refused`]). One the file has that `attrs` hasn't is
 /// removed by its name's bytes, so one whose name isn't UTF-8 goes too (a
 /// node holds no such name).
+///
+/// # Errors
+///
+/// * [`XattrErrors`], with each attribute that couldn't be set under its
+///   name, each that couldn't be removed as `removing NAME`, and `listing`.
+///   Those of a file without an attribute directory (its type, or its file
+///   system) are `ErrorKind::Unsupported`, which the restore doesn't count.
+/// * If the attribute directory couldn't be opened.
 pub(super) fn set_xattrs(path: &Path, attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
     let Some(dir) = attr_dir(path)? else {
         // Which of the two reasons attr_dir has for none: a symlink, FIFO

@@ -369,7 +369,10 @@ fn written(file: &impl AttrFile, name: &CStr, attr: &Attr) -> io::Result<bool> {
 }
 
 /// Gives the file the attribute `name` as `attr`, type and data, in place
-/// of any it has of that name: a failed write leaves the old one.
+/// of any it has of that name. A failed write leaves the old one only
+/// where BFS keeps it in the inode: one in an attribute inode of its own
+/// is truncated before the write, and the fallback below removes the old
+/// attribute before it writes again, so a failure there leaves none.
 ///
 /// A write of no data creates no attribute on BFS (the kernel doesn't call
 /// the file system's write for 0 bytes, and BFS creates an attribute only
@@ -905,6 +908,18 @@ mod tests {
         let err = apply(&bfs, &want(&[("a", attr(RAWT, b"new"))]), false).unwrap_err();
         assert!(err.to_string().starts_with("write attribute a: "), "{err}");
         assert_eq!(bfs.get(b"a").unwrap().attr, attr(MIMS, b"old"));
+    }
+
+    /// `ForkAudit1` G5-15 (`RustAudit1` R4-07): what a failed write leaves of
+    /// an attribute in an inode of its own: it was truncated first, so it
+    /// is left empty, not as it was.
+    #[test]
+    fn a_failed_write_truncates_an_attribute_in_its_own_inode() {
+        let bfs = FakeBfs::with(&[(b"a", attr(MIMS, &[1; 2 * SMALL_DATA]))]);
+        bfs.full.set(true);
+        let err = apply(&bfs, &want(&[("a", attr(MIMS, &[2; 2 * SMALL_DATA]))]), false).unwrap_err();
+        assert!(err.to_string().starts_with("write attribute a: "), "{err}");
+        assert_eq!(bfs.get(b"a").map(|a| a.attr.value), Some(Vec::new()));
     }
 
     #[test]

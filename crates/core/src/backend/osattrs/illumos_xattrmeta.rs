@@ -1,5 +1,5 @@
 //! What illumos keeps of each extended attribute besides its value: an
-//! attribute is a file of its own (`runat(1)`, `fsattr(5)`), with an owner,
+//! attribute is a file of its own (`runat(1)`, `fsattr(7)`), with an owner,
 //! a group, a mode, times and an ACL, which `illumos.xattr_meta` holds by
 //! the attribute's name. Without it a restored attribute belongs to whoever
 //! ran the restore, with mode 0600 and the time of the restore. Portable, so

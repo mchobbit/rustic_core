@@ -241,6 +241,12 @@ fn left_out(unreadable: &Unreadable) -> io::Result<()> {
 
 /// Gives the file at `path` exactly the extended attributes `attrs`, as
 /// attributes of type `B_XATTR_TYPE`, and leaves its other attributes alone.
+///
+/// # Errors
+///
+/// * The first attribute that couldn't be removed or written, the others
+///   done all the same; `ErrorKind::Unsupported` for a type of file or a
+///   file system without attributes, which the restore doesn't count.
 pub(super) fn set_xattrs(path: &Path, attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
     Ok(apply(path, &haiku_attrs::from_xattrs(attrs), true)?)
 }
@@ -320,6 +326,13 @@ pub(super) fn restore_file_flags(
 /// `haiku.attributes` (from another system, or a file system without
 /// attributes) leaves the file's as they are, as FreeBSD's system extended
 /// attributes are.
+///
+/// # Errors
+///
+/// * If `haiku.attributes` isn't what it should be, or an attribute
+///   couldn't be removed or written (the first; the others are done).
+/// * An `ErrorKind::InvalidData` error naming the entries of type
+///   `B_XATTR_TYPE`, skipped, once the others are restored.
 pub(super) fn restore_attributes(path: &Path, node: &Node) -> io::Result<()> {
     let Some(attrs) = node.meta.generic_attributes.get::<Attrs>(HAIKU_ATTRIBUTES) else {
         return Ok(());
