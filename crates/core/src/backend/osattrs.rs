@@ -745,7 +745,7 @@ pub(crate) fn preallocate(f: &File, len: u64) {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn os_preallocate(f: &File, len: u64) -> io::Result<()> {
-    use sparse::lfs::{fallocate, off_t};
+    use sparse::seek::lfs::{fallocate, off_t};
     use std::os::fd::AsRawFd;
 
     // Not on btrfs but for a NOCOW file, nor on bcachefs: they never
