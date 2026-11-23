@@ -572,10 +572,10 @@ impl HeldFlags {
 /// BackOtter: [`clear_restricting_flags`] for a file whose name the restore
 /// is about to remove, or rename another file over (a hard link broken, a
 /// file replaced, linked over, or removed by `--delete`): the file is held
-/// open (`O_RDONLY|O_NOFOLLOW|O_NONBLOCK`) from before its flags come off,
-/// and [`HeldFlags::put_back`], which must follow, once the name is gone or
-/// wasn't, sets them again through that descriptor (`fchflags`, Linux's
-/// ioctls). As in BackOtter's restic (`ClearRestrictingFlagsHeld`).
+/// open (`O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_NOCTTY`) from before its flags
+/// come off, and [`HeldFlags::put_back`], which must follow, once the name
+/// is gone or wasn't, sets them again through that descriptor (`fchflags`,
+/// Linux's ioctls). As in BackOtter's restic (`ClearRestrictingFlagsHeld`).
 pub(crate) fn clear_restricting_flags_held(path: &Path) -> HeldFlags {
     // BackOtter: past PATH_MAX, through a short path to it (`sys`); the
     // messages name `path`, as does `put_back`'s, which on Linux takes no

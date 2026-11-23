@@ -1,7 +1,7 @@
 //! BackOtter: restricting flags held for putting back, on FreeBSD, NetBSD,
 //! OpenBSD and DragonFly ([`super::clear_restricting_flags_held`]): the
-//! file stays open (`O_RDONLY|O_NOFOLLOW|O_NONBLOCK`) from before its
-//! flags come off, and they go back on it through `fchflags(2)`. What
+//! file stays open (`O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_NOCTTY`) from before
+//! its flags come off, and they go back on it through `fchflags(2)`. What
 //! can't be opened (a symlink, which `O_NOFOLLOW` refuses; a device, which
 //! isn't opened; a file the restore may not open) has them cleared and put
 //! back by path. As in BackOtter's restic (`restrictflags_bsd.go`). The
@@ -50,8 +50,8 @@ fn set_fd_flags(f: &File, path: &Path, flags: u32) -> io::Result<()> {
 }
 
 /// Gives the file at `path`, not following a symlink, the flags `flags`;
-/// an error names the call `op`.
-fn set_path_flags(path: &Path, flags: u32, op: &str) -> io::Result<()> {
+/// an error names the call made ([`PATH_OP`]).
+fn set_path_flags(path: &Path, flags: u32) -> io::Result<()> {
     let p = c_path(path)?;
     #[cfg(target_os = "openbsd")]
     // SAFETY: p is a C string.
@@ -59,16 +59,15 @@ fn set_path_flags(path: &Path, flags: u32, op: &str) -> io::Result<()> {
     #[cfg(not(target_os = "openbsd"))]
     // SAFETY: p is a C string.
     let r = unsafe { libc::lchflags(p.as_ptr(), flags.into()) };
-    check(r).map(drop).map_err(|err| path_error(op, path, &err))
+    check(r).map(drop).map_err(|err| path_error(PATH_OP, path, &err))
 }
 
-/// The call [`clear_restricting_flags`]'s errors name. The held clear's
-/// and the put-backs' errors name `lchflags`, on OpenBSD too, where
-/// `chflagsat` runs (R3-16).
+/// The call [`set_path_flags`] makes, for its errors: OpenBSD has no
+/// `lchflags(2)`.
 #[cfg(target_os = "openbsd")]
-const CLEAR_OP: &str = "chflagsat";
+const PATH_OP: &str = "chflagsat";
 #[cfg(not(target_os = "openbsd"))]
-const CLEAR_OP: &str = "lchflags";
+const PATH_OP: &str = "lchflags";
 
 /// Clears the flags of the file at `path` that keep a restore from
 /// rewriting, replacing or changing it ([`RESTRICTING`]), leaving the others
@@ -83,7 +82,7 @@ pub(super) fn clear_restricting_flags(path: &Path) -> io::Result<()> {
     if flags & RESTRICTING == 0 {
         return Ok(());
     }
-    set_path_flags(path, flags & !RESTRICTING, CLEAR_OP)
+    set_path_flags(path, flags & !RESTRICTING)
 }
 
 /// Clears the restricting flags of the file at `path`, held for putting
@@ -93,7 +92,7 @@ pub(super) fn clear_restricting_flags(path: &Path) -> io::Result<()> {
 ///
 /// * If the file can't be `lstat`ed (the error as it is).
 /// * If the file opened for holding isn't the one `lstat`ed (its device and
-///   inode differ): "replaced while it was read".
+///   inode differ): "replaced before its flags were cleared".
 /// * If its flags can't be set: `fchflags(2)`'s error on the file held,
 ///   `lchflags(2)`'s (`chflagsat(2)`'s on OpenBSD) on one cleared by path.
 pub(super) fn clear_restricting_flags_held(path: &Path) -> io::Result<HeldFlags> {
@@ -119,7 +118,7 @@ pub(super) fn clear_restricting_flags_held(path: &Path) -> io::Result<HeldFlags>
             }
             Ok(_) => {
                 return Err(io::Error::other(format!(
-                    "{} was replaced while it was read",
+                    "{} was replaced before its flags were cleared",
                     path.display()
                 )));
             }
@@ -127,7 +126,7 @@ pub(super) fn clear_restricting_flags_held(path: &Path) -> io::Result<HeldFlags>
         }
     }
     let flags = st_flags(&m);
-    set_path_flags(path, flags & !RESTRICTING, "lchflags")?;
+    set_path_flags(path, flags & !RESTRICTING)?;
     Ok(HeldFlags::ByPath {
         path: path.to_path_buf(),
         dev: m.dev(),
@@ -163,5 +162,5 @@ pub(super) fn put_back_restricting_flags_path(path: &Path, cleared: u32) -> io::
     if flags | cleared == flags {
         return Ok(());
     }
-    set_path_flags(path, flags | cleared, "lchflags")
+    set_path_flags(path, flags | cleared)
 }

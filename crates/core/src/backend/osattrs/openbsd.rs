@@ -64,7 +64,7 @@ pub(super) fn restore_file_flags(
     _xattrs: &[ExtendedAttribute],
 ) -> io::Result<()> {
     let p = c_path(path)?;
-    set_flags_best_effort(OPENBSD_FILE_FLAGS, path, "chflags", None, flags & KEPT_FLAGS, |bits| {
+    set_flags_best_effort(OPENBSD_FILE_FLAGS, path, "chflagsat", None, flags & KEPT_FLAGS, |bits| {
         // SAFETY: p is a C string.
         let r = unsafe {
             libc::chflagsat(libc::AT_FDCWD, p.as_ptr(), bits, libc::AT_SYMLINK_NOFOLLOW)
