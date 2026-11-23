@@ -1069,8 +1069,9 @@ pub(crate) fn xattr_unsupported(err: &io::Error) -> bool {
     let no_attr: Option<i32> = None;
     #[cfg(unix)]
     {
-        matches!(err.raw_os_error(), Some(e) if e == libc::ENOTSUP || e == libc::EOPNOTSUPP)
-            || (no_attr.is_some() && err.raw_os_error() == no_attr)
+        let errno = errno(err);
+        matches!(errno, Some(e) if e == libc::ENOTSUP || e == libc::EOPNOTSUPP)
+            || (no_attr.is_some() && errno == no_attr)
     }
     #[cfg(not(unix))]
     {
@@ -1168,13 +1169,39 @@ impl From<Vec<ExtendedAttribute>> for XattrsRead {
 
 /// BackOtter: a copy of `err`, for each of several things it kept from being
 /// done, such as each extended attribute of a file on a file system without
-/// them.
-#[cfg_attr(any(windows, target_os = "openbsd", target_os = "illumos"), allow(dead_code))]
+/// them, and for [`path_error`]: the same errno where it has one, a
+/// [`PathError`] copied likewise, else the same kind and text.
+#[cfg_attr(
+    not(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "haiku",
+        target_os = "illumos",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )),
+    allow(dead_code)
+)]
 pub(crate) fn same_error(err: &io::Error) -> io::Error {
-    err.raw_os_error().map_or_else(
-        || io::Error::new(err.kind(), err.to_string()),
-        io::Error::from_raw_os_error,
-    )
+    if let Some(errno) = err.raw_os_error() {
+        return io::Error::from_raw_os_error(errno);
+    }
+    err.get_ref()
+        .and_then(|e| e.downcast_ref::<PathError>())
+        .map_or_else(
+            || io::Error::new(err.kind(), err.to_string()),
+            |wrapped| {
+                io::Error::new(
+                    err.kind(),
+                    PathError {
+                        op: wrapped.op.clone(),
+                        path: wrapped.path.clone(),
+                        source: same_error(&wrapped.source),
+                    },
+                )
+            },
+        )
 }
 
 /// An error that isn't about one attribute: the file's extended attributes
@@ -1842,7 +1869,33 @@ fn chmod_symlink(path: &Path, node: &Node) -> io::Result<()> {
     }
 }
 
-/// An error that names the operation and the file.
+/// BackOtter: a system call's error with the operation and the file it
+/// failed on, as [`path_error`] wraps it: it reads `OP PATH: ERROR`, and
+/// keeps the error itself as its source, with its errno ([`errno`]).
+#[derive(Debug)]
+pub(crate) struct PathError {
+    /// What was done: the system call, mostly.
+    op: String,
+    /// The file.
+    path: PathBuf,
+    /// The system's error.
+    source: io::Error,
+}
+
+impl fmt::Display for PathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}: {}", self.op, self.path.display(), self.source)
+    }
+}
+
+impl std::error::Error for PathError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// An error that names the operation and the file: `err`'s kind, a
+/// [`PathError`] of it inside.
 #[cfg_attr(
     not(any(
         target_os = "dragonfly",
@@ -1856,19 +1909,37 @@ fn chmod_symlink(path: &Path, node: &Node) -> io::Result<()> {
     allow(dead_code)
 )]
 fn path_error(op: &str, path: &Path, err: &io::Error) -> io::Error {
-    io::Error::new(err.kind(), format!("{op} {}: {err}", path.display()))
+    io::Error::new(
+        err.kind(),
+        PathError {
+            op: op.to_string(),
+            path: path.to_path_buf(),
+            source: same_error(err),
+        },
+    )
 }
 
-/// BackOtter: `err`, an ACL that couldn't be set (the system's error
-/// `source`), as an `ErrorKind::Unsupported` one, with the same text, where
-/// it says the file system can't hold ACLs (`ENOTSUP`, `EOPNOTSUPP`):
-/// unsupported metadata, which BackOtter's restic doesn't count as an
-/// error (`restore_error_counts`).
+/// BackOtter: the errno of `err`, a system call's error as it came or as
+/// [`path_error`] wrapped it since (a [`PathError`], looked through), for
+/// the rules that go by it ([`unsupported`], [`xattr_unsupported`]): an
+/// error doesn't change its class by being given a path.
+fn errno(err: &io::Error) -> Option<i32> {
+    err.raw_os_error().or_else(|| {
+        let wrapped = err.get_ref()?.downcast_ref::<PathError>()?;
+        errno(&wrapped.source)
+    })
+}
+
+/// BackOtter: `err`, an ACL that couldn't be set, as an
+/// `ErrorKind::Unsupported` one, with the same text and `err` inside, where
+/// it says the file system can't hold ACLs (`ENOTSUP`, `EOPNOTSUPP`, by
+/// [`errno`]): unsupported metadata, which BackOtter's restic doesn't count
+/// as an error (`restore_error_counts`).
 #[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "illumos"))]
-fn acl_set_error(err: io::Error, source: &io::Error) -> io::Error {
-    match source.raw_os_error() {
+fn acl_set_error(err: io::Error) -> io::Error {
+    match errno(&err) {
         Some(e) if e == libc::ENOTSUP || e == libc::EOPNOTSUPP => {
-            io::Error::new(io::ErrorKind::Unsupported, err.to_string())
+            io::Error::new(io::ErrorKind::Unsupported, err)
         }
         _ => err,
     }
@@ -1979,7 +2050,7 @@ fn set_flags_best_effort<F: Copy + Into<u64> + TryFrom<u64>>(
 fn unsupported(err: &io::Error) -> bool {
     #[cfg(unix)]
     {
-        err.raw_os_error().is_some_and(|code| {
+        errno(err).is_some_and(|code| {
             [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOTTY].contains(&code)
         })
     }
@@ -1992,6 +2063,65 @@ fn unsupported(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // BackOtter (ForkAudit1 G3-10): an error given its operation and path
+    // reads as before, and keeps its errno, so that the rules that go by
+    // the errno class it as they did before it was wrapped.
+    #[test]
+    #[cfg(unix)]
+    fn path_error_keeps_the_errno() {
+        let raw = io::Error::from_raw_os_error(libc::ENOTSUP);
+        let err = path_error("setxattr", Path::new("/a/b"), &raw);
+        assert_eq!(err.to_string(), format!("setxattr /a/b: {raw}"));
+        assert_eq!(err.kind(), raw.kind());
+        assert_eq!(err.raw_os_error(), None);
+        assert_eq!(errno(&err), Some(libc::ENOTSUP));
+        let source = std::error::Error::source(&err).and_then(|e| e.downcast_ref::<io::Error>());
+        assert_eq!(source.and_then(io::Error::raw_os_error), Some(libc::ENOTSUP));
+        assert!(unsupported(&err) && xattr_unsupported(&err));
+        // Wrapped again, and copied.
+        let twice = path_error("restore", Path::new("c"), &err);
+        assert_eq!(twice.to_string(), format!("restore c: setxattr /a/b: {raw}"));
+        assert_eq!(errno(&twice), Some(libc::ENOTSUP));
+        assert!(unsupported(&twice) && xattr_unsupported(&twice));
+        assert_eq!(same_error(&err).to_string(), err.to_string());
+
+        // An error that isn't the system's has none, wrapped or not.
+        let other = io::Error::other("no such thing");
+        assert_eq!(errno(&other), None);
+        let wrapped = path_error("open", Path::new("d"), &other);
+        assert_eq!(wrapped.to_string(), "open d: no such thing");
+        assert_eq!(errno(&wrapped), None);
+        assert!(!unsupported(&wrapped));
+        // Nor does every errno say "unsupported".
+        let eperm = path_error("chflags", Path::new("e"), &io::Error::from_raw_os_error(libc::EPERM));
+        assert!(!unsupported(&eperm) && !xattr_unsupported(&eperm));
+        assert!(permission_refused(&eperm));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert!(xattr_unsupported(&path_error(
+            "getxattr",
+            Path::new("f"),
+            &io::Error::from_raw_os_error(libc::ENODATA)
+        )));
+    }
+
+    // An ACL the file system can't hold is unsupported metadata, with the
+    // text and the errno it had.
+    #[test]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "illumos"))]
+    fn acl_set_error_by_the_wrapped_errno() {
+        let wrapped = |errno| path_error("acl", Path::new("f"), &io::Error::from_raw_os_error(errno));
+        for errno in [libc::ENOTSUP, libc::EOPNOTSUPP] {
+            let text = wrapped(errno).to_string();
+            let err = acl_set_error(wrapped(errno));
+            assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+            assert_eq!(err.to_string(), text);
+            assert!(!restore_error_counts(&err, true, true));
+        }
+        let err = acl_set_error(wrapped(libc::EPERM));
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(restore_error_counts(&err, true, true));
+    }
 
     // BackOtter (ForkAudit1 G3-07): FICLONE as <linux/fs.h> gives it where
     // an ioctl's direction is asm-generic's. Its low 32 bits: musl's ioctl

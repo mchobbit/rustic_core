@@ -176,10 +176,11 @@ fn set_ace(of: AclOf<'_>, entries: &[AceEntry]) -> io::Result<()> {
     _ = of
         .call(ACE_SETACL, n, raw.as_mut_ptr().cast())
         .map_err(|err| {
-            acl_set_error(
-                path_error(&format!("{} ACE_SETACL", of.op()), of.path(), &err),
+            acl_set_error(path_error(
+                &format!("{} ACE_SETACL", of.op()),
+                of.path(),
                 &err,
-            )
+            ))
         })?;
     Ok(())
 }

@@ -174,7 +174,7 @@ fn set_acl(path: &Path, typ: AclType, acl: &[AclEntry]) -> io::Result<()> {
     // SAFETY: p is a C string, raw a struct acl with maxcnt set, holding
     // cnt entries.
     _ = check(unsafe { sys::acl_set_link(p.as_ptr(), typ as libc::c_int, &raw mut *raw) })
-        .map_err(|err| acl_set_error(path_error("__acl_set_link", path, &err), &err))?;
+        .map_err(|err| acl_set_error(path_error("__acl_set_link", path, &err)))?;
     Ok(())
 }
 
