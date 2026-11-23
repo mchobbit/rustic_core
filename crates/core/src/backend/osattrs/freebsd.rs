@@ -22,7 +22,7 @@ use log::debug;
 use super::{
     Unsupported, XattrErrors,
     bsd_flags::{
-        FREEBSD_KEPT_FLAGS as KEPT_FLAGS, FREEBSD_RESTRICTING_FLAGS, freebsd_file_flags,
+        FREEBSD_KEPT_FLAGS as KEPT_FLAGS, freebsd_file_flags,
     },
     c_path, check, chmod_symlink, freebsd_netbsd,
     illumos_project::ZfsProject,
@@ -287,20 +287,7 @@ pub(super) fn restore_attributes(path: &Path, node: &Node) -> io::Result<()> {
     restore_zfs_project(path, node).and(extattrs)
 }
 
-/// Clears the flags of the file at `path` that keep a restore from
-/// rewriting, replacing or changing it ([`FREEBSD_RESTRICTING_FLAGS`]),
-/// leaving the others as they are; the late flags pass sets the node's.
-pub(super) fn clear_restricting_flags(path: &Path) -> io::Result<()> {
-    let flags = std::fs::symlink_metadata(path)?.st_flags();
-    if flags & FREEBSD_RESTRICTING_FLAGS == 0 {
-        return Ok(());
-    }
-    let p = c_path(path)?;
-    // SAFETY: p is a C string.
-    check(unsafe { libc::lchflags(p.as_ptr(), (flags & !FREEBSD_RESTRICTING_FLAGS).into()) })
-        .map(drop)
-        .map_err(|err| path_error("lchflags", path, &err))
-}
+pub(super) use super::bsd_held::clear_restricting_flags;
 
 /// Restores the ACLs, a symlink's too; in a snapshot of BackOtter's
 /// (`known_bko`), one the node hasn't got goes.

@@ -4,7 +4,8 @@
 //! flags come off, and they go back on it through `fchflags(2)`. What
 //! can't be opened (a symlink, which `O_NOFOLLOW` refuses; a device, which
 //! isn't opened; a file the restore may not open) has them cleared and put
-//! back by path. As in BackOtter's restic (`restrictflags_bsd.go`).
+//! back by path. As in BackOtter's restic (`restrictflags_bsd.go`). The
+//! plain clear, [`clear_restricting_flags`], is here too, the same on each.
 
 use std::{
     fs::{File, Metadata, OpenOptions},
@@ -48,8 +49,9 @@ fn set_fd_flags(f: &File, path: &Path, flags: u32) -> io::Result<()> {
         .map_err(|err| path_error("fchflags", path, &err))
 }
 
-/// Gives the file at `path`, not following a symlink, the flags `flags`.
-fn set_path_flags(path: &Path, flags: u32) -> io::Result<()> {
+/// Gives the file at `path`, not following a symlink, the flags `flags`;
+/// an error names the call `op`.
+fn set_path_flags(path: &Path, flags: u32, op: &str) -> io::Result<()> {
     let p = c_path(path)?;
     #[cfg(target_os = "openbsd")]
     // SAFETY: p is a C string.
@@ -57,7 +59,31 @@ fn set_path_flags(path: &Path, flags: u32) -> io::Result<()> {
     #[cfg(not(target_os = "openbsd"))]
     // SAFETY: p is a C string.
     let r = unsafe { libc::lchflags(p.as_ptr(), flags.into()) };
-    check(r).map(drop).map_err(|err| path_error("lchflags", path, &err))
+    check(r).map(drop).map_err(|err| path_error(op, path, &err))
+}
+
+/// The call [`clear_restricting_flags`]'s errors name. The held clear's
+/// and the put-backs' errors name `lchflags`, on OpenBSD too, where
+/// `chflagsat` runs (R3-16).
+#[cfg(target_os = "openbsd")]
+const CLEAR_OP: &str = "chflagsat";
+#[cfg(not(target_os = "openbsd"))]
+const CLEAR_OP: &str = "lchflags";
+
+/// Clears the flags of the file at `path` that keep a restore from
+/// rewriting, replacing or changing it ([`RESTRICTING`]), leaving the others
+/// as they are; the late flags pass sets the node's.
+///
+/// # Errors
+///
+/// * If the file can't be `lstat`ed (the error as it is), or its flags
+///   can't be set (`lchflags(2)`, `chflagsat(2)` on OpenBSD).
+pub(super) fn clear_restricting_flags(path: &Path) -> io::Result<()> {
+    let flags = st_flags(&std::fs::symlink_metadata(path)?);
+    if flags & RESTRICTING == 0 {
+        return Ok(());
+    }
+    set_path_flags(path, flags & !RESTRICTING, CLEAR_OP)
 }
 
 /// Clears the restricting flags of the file at `path`, held for putting
@@ -93,7 +119,7 @@ pub(super) fn clear_restricting_flags_held(path: &Path) -> io::Result<HeldFlags>
         }
     }
     let flags = st_flags(&m);
-    set_path_flags(path, flags & !RESTRICTING)?;
+    set_path_flags(path, flags & !RESTRICTING, "lchflags")?;
     Ok(HeldFlags::ByPath {
         path: path.to_path_buf(),
         dev: m.dev(),
@@ -119,5 +145,5 @@ pub(super) fn put_back_restricting_flags_path(path: &Path, cleared: u32) -> io::
     if flags | cleared == flags {
         return Ok(());
     }
-    set_path_flags(path, flags | cleared)
+    set_path_flags(path, flags | cleared, "lchflags")
 }

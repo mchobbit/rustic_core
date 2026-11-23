@@ -4,10 +4,7 @@ use std::{io, os::openbsd::fs::MetadataExt, path::Path};
 
 use jiff::Timestamp;
 
-use super::{
-    XattrErrors, bsd_flags::NETBSD_OPENBSD_RESTRICTING_FLAGS, c_path, check, chmod_symlink,
-    path_error, set_flags_best_effort,
-};
+use super::{XattrErrors, c_path, check, chmod_symlink, set_flags_best_effort};
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType, generic_attributes::OPENBSD_FILE_FLAGS,
 };
@@ -22,15 +19,6 @@ pub(super) const ZFS_DOS_FLAGS: Option<&str> = None;
 /// append, opaque) and those only root may (archived, immutable, append; the
 /// last two can't be cleared again above securelevel 0).
 const KEPT_FLAGS: u32 = 0x0000_ffff | 0xffff_0000;
-
-unsafe extern "C" {
-    fn chflagsat(
-        fd: libc::c_int,
-        path: *const libc::c_char,
-        flags: libc::c_uint,
-        atflags: libc::c_int,
-    ) -> libc::c_int;
-}
 
 /// No file is opened for its attributes ahead of them here.
 pub(super) fn open_for_attrs(
@@ -78,7 +66,7 @@ pub(super) fn restore_file_flags(
         // SAFETY: p is a C string.
         let r = unsafe {
             if symlink {
-                chflagsat(libc::AT_FDCWD, p.as_ptr(), bits, libc::AT_SYMLINK_NOFOLLOW)
+                libc::chflagsat(libc::AT_FDCWD, p.as_ptr(), bits, libc::AT_SYMLINK_NOFOLLOW)
             } else {
                 libc::chflags(p.as_ptr(), bits)
             }
@@ -91,27 +79,7 @@ pub(super) fn restore_zfs_dos_flags(_path: &Path, _typ: &NodeType, _flags: u64) 
     Ok(())
 }
 
-/// Clears the flags of the file at `path` that keep a restore from
-/// rewriting, replacing or changing it
-/// ([`NETBSD_OPENBSD_RESTRICTING_FLAGS`]), leaving the others as they are;
-/// the late flags pass sets the node's.
-pub(super) fn clear_restricting_flags(path: &Path) -> io::Result<()> {
-    let flags = std::fs::symlink_metadata(path)?.st_flags();
-    if flags & NETBSD_OPENBSD_RESTRICTING_FLAGS == 0 {
-        return Ok(());
-    }
-    let p = c_path(path)?;
-    // SAFETY: p is a C string.
-    let r = unsafe {
-        chflagsat(
-            libc::AT_FDCWD,
-            p.as_ptr(),
-            flags & !NETBSD_OPENBSD_RESTRICTING_FLAGS,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    check(r).map(drop).map_err(|err| path_error("chflagsat", path, &err))
-}
+pub(super) use super::bsd_held::clear_restricting_flags;
 
 pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
