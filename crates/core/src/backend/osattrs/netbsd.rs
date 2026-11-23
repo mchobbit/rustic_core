@@ -7,7 +7,7 @@ use std::{io, os::netbsd::fs::MetadataExt, path::Path};
 use jiff::Timestamp;
 
 use super::{
-    XattrErrors,
+    RestoreErrors, XattrErrors, bsd_held::restore_no_flags,
     bsd_flags::NETBSD_KEPT_FLAGS,
     c_path, check, chmod_symlink, freebsd_netbsd,
     lower_birthtime, path_error, set_flags_best_effort,
@@ -92,9 +92,22 @@ pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
 
-/// Restores the system extended attributes.
-pub(super) fn restore_attributes(path: &Path, node: &Node) -> io::Result<()> {
-    freebsd_netbsd::restore_system_extattrs(path, node)
+/// Restores the system extended attributes. In a snapshot of BackOtter's
+/// (`known_bko`), a file whose node holds no `netbsd.file_flags` had none,
+/// and loses those it has now ([`restore_no_flags`]).
+///
+/// # Errors
+///
+/// * If either couldn't be set: the attributes' error, the flags', or one
+///   that holds both ([`RestoreErrors`]).
+pub(super) fn restore_attributes(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
+    let extattrs = freebsd_netbsd::restore_system_extattrs(path, node);
+    let flags = if known_bko && node.meta.generic_attributes.value(NETBSD_FILE_FLAGS).is_none() {
+        restore_no_flags(path, NETBSD_FILE_FLAGS, NETBSD_KEPT_FLAGS, 0)
+    } else {
+        Ok(())
+    };
+    RestoreErrors::result([extattrs, flags].into_iter().filter_map(Result::err).collect())
 }
 
 /// Restores the ACLs, a symlink's too; in a snapshot of BackOtter's

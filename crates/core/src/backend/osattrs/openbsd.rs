@@ -4,7 +4,9 @@ use std::{io, os::openbsd::fs::MetadataExt, path::Path};
 
 use jiff::Timestamp;
 
-use super::{XattrErrors, c_path, check, chmod_symlink, set_flags_best_effort};
+use super::{
+    XattrErrors, bsd_held::restore_no_flags, c_path, check, chmod_symlink, set_flags_best_effort,
+};
 use crate::backend::node::{
     ExtendedAttribute, Node, NodeType, generic_attributes::OPENBSD_FILE_FLAGS,
 };
@@ -83,7 +85,13 @@ pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn restore_attributes(_path: &Path, _node: &Node) -> io::Result<()> {
+/// In a snapshot of BackOtter's (`known_bko`), a file whose node holds no
+/// `openbsd.file_flags` had none, and loses those it has now
+/// ([`restore_no_flags`]). Nothing else to restore here.
+pub(super) fn restore_attributes(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
+    if known_bko && node.meta.generic_attributes.value(OPENBSD_FILE_FLAGS).is_none() {
+        return restore_no_flags(path, OPENBSD_FILE_FLAGS, KEPT_FLAGS, 0);
+    }
     Ok(())
 }
 

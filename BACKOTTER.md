@@ -947,6 +947,14 @@ that either program restores what the other backed up.
     has no ACL for: restoring such a snapshot over a symlink that has an
     ACL of its own takes it off. An ACL that says no more than the mode is
     not written to;
+  - a node without file flags had a new file's (none; `uarch` alone on
+    FreeBSD's ZFS), on OpenBSD and DragonFly too: the kept flags the file
+    has beyond them go (`nodump`, `hidden`, `opaque`, `uarch` off ZFS...;
+    `bsd_held::restore_no_flags`, with the attributes, one flag at a time
+    where they can't all change). The restricting ones came off before the
+    restore changed the file. A file with a new file's flags is not
+    written to. On Linux a flag the node lacks still stays (the late flags
+    pass sets only a node's own);
   - a node with `freebsd.system_extattrs` (`netbsd.`) gives the file
     exactly those: one with the node's value already is left, any other
     the file has is removed (but for those UFS and FFSv2ea store ACLs in).

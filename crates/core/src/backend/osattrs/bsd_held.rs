@@ -19,7 +19,7 @@ use std::{
 
 use log::debug;
 
-use super::{HeldFlags, c_path, check, path_error};
+use super::{HeldFlags, c_path, check, path_error, set_flags_best_effort};
 
 #[cfg(target_os = "dragonfly")]
 use super::bsd_flags::DRAGONFLY_RESTRICTING_FLAGS as RESTRICTING;
@@ -52,6 +52,11 @@ fn set_fd_flags(f: &File, path: &Path, flags: u32) -> io::Result<()> {
 /// Gives the file at `path`, not following a symlink, the flags `flags`;
 /// an error names the call made ([`PATH_OP`]).
 fn set_path_flags(path: &Path, flags: u32) -> io::Result<()> {
+    set_path_flags_raw(path, flags).map_err(|err| path_error(PATH_OP, path, &err))
+}
+
+/// [`set_path_flags`], with the system's error as it is.
+fn set_path_flags_raw(path: &Path, flags: u32) -> io::Result<()> {
     let p = c_path(path)?;
     #[cfg(target_os = "openbsd")]
     // SAFETY: p is a C string.
@@ -59,7 +64,7 @@ fn set_path_flags(path: &Path, flags: u32) -> io::Result<()> {
     #[cfg(not(target_os = "openbsd"))]
     // SAFETY: p is a C string.
     let r = unsafe { libc::lchflags(p.as_ptr(), flags.into()) };
-    check(r).map(drop).map_err(|err| path_error(PATH_OP, path, &err))
+    check(r).map(drop)
 }
 
 /// The call [`set_path_flags`] makes, for its errors: OpenBSD has no
@@ -83,6 +88,38 @@ pub(super) fn clear_restricting_flags(path: &Path) -> io::Result<()> {
         return Ok(());
     }
     set_path_flags(path, flags & !RESTRICTING)
+}
+
+/// Gives the file at `path`, not following a symlink, the flags a node
+/// without the flags attribute `attr` stands for in a snapshot of
+/// BackOtter's, which records a file's flags wherever it has any: `none` of
+/// those kept (`kept`; 0, or `uarch` on FreeBSD's ZFS), where it has others
+/// now (`nodump` or `hidden` set since the backup, say; the restricting
+/// ones came off before the restore changed the file). The late flags pass
+/// sets only the flags a node holds, so these stayed, and `restore --exact`
+/// set such a file's metadata again on every run. Flags outside `kept` stay
+/// as they are, and a file with just `none` is not written to. One flag
+/// that can't be changed (root's, as another user) doesn't keep the others.
+///
+/// # Errors
+///
+/// * If the file can't be `lstat`ed, or a flag couldn't be changed: as
+///   [`set_flags_best_effort`] reports it, naming the flags.
+pub(super) fn restore_no_flags(
+    path: &Path,
+    attr: &'static str,
+    kept: u32,
+    none: u32,
+) -> io::Result<()> {
+    let m = std::fs::symlink_metadata(path).map_err(|err| path_error("lstat", path, &err))?;
+    let current = st_flags(&m);
+    if current & kept == none & kept {
+        return Ok(());
+    }
+    let own = current & !kept;
+    set_flags_best_effort(attr, path, PATH_OP, Some(current & kept), none & kept, |bits| {
+        set_path_flags_raw(path, own | bits)
+    })
 }
 
 /// Clears the restricting flags of the file at `path`, held for putting
@@ -163,4 +200,51 @@ pub(super) fn put_back_restricting_flags_path(path: &Path, cleared: u32) -> io::
         return Ok(());
     }
     set_path_flags(path, flags | cleared)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::node::{Metadata as NodeMetadata, Node, NodeType};
+
+    const UF_NODUMP: u32 = 0x1; // "nodump", an owner's to set on every BSD
+
+    fn flags_and_ctime(path: &Path) -> (u32, i64, i64) {
+        // A moment later, so that a write after this moves the change time.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let m = std::fs::symlink_metadata(path).unwrap();
+        (st_flags(&m), m.ctime(), m.ctime_nsec())
+    }
+
+    /// G4-03: a flag a file has and its node doesn't goes in a snapshot of
+    /// BackOtter's, where a node without flags says its file had none, and
+    /// stays in any other; a file with a new file's flags isn't written to.
+    /// The late flags pass alone, which sets a node's own flags, left it.
+    #[test]
+    fn restore_takes_off_flags_the_node_lacks() {
+        let dir = tempfile::tempdir().unwrap();
+        for typ in [NodeType::File, NodeType::Dir, NodeType::from_link(Path::new("f"))] {
+            let path = dir.path().join(format!("{typ:?}").split(' ').next().unwrap());
+            match typ {
+                NodeType::File => std::fs::write(&path, "x").unwrap(),
+                NodeType::Dir => std::fs::create_dir(&path).unwrap(),
+                _ => std::os::unix::fs::symlink("f", &path).unwrap(),
+            }
+            let (new_file, ..) = flags_and_ctime(&path);
+            if let Err(err) = set_path_flags(&path, new_file | UF_NODUMP) {
+                eprintln!("restore_takes_off_flags_the_node_lacks: {err}: nothing tested");
+                return;
+            }
+            let node = Node::new_node(std::ffi::OsStr::new("n"), typ, NodeMetadata::default());
+            let restore = |known_bko| super::super::os::restore_attributes(&path, &node, known_bko);
+
+            restore(false).unwrap();
+            assert_eq!(flags_and_ctime(&path).0, new_file | UF_NODUMP, "not BackOtter's: kept");
+            restore(true).unwrap();
+            let after = flags_and_ctime(&path);
+            assert_eq!(after.0, new_file, "{}", path.display());
+            restore(true).unwrap();
+            assert_eq!(flags_and_ctime(&path), after, "a second restore wrote to the file");
+        }
+    }
 }

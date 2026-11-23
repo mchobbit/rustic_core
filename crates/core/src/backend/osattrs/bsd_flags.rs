@@ -25,8 +25,16 @@ pub(super) const FREEBSD_KEPT_FLAGS: u32 =
 #[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
 pub(super) fn freebsd_file_flags(st_flags: u32, zfs: bool) -> Option<u32> {
     let flags = st_flags & FREEBSD_KEPT_FLAGS;
-    let new_file = if zfs { FREEBSD_UF_ARCHIVE } else { 0 };
-    (flags != new_file).then_some(flags)
+    (flags != freebsd_no_flags(zfs)).then_some(flags)
+}
+
+/// The kept flags of a file that gets no `freebsd.file_flags`
+/// ([`freebsd_file_flags`]), on ZFS (`zfs`) or another file system: what a
+/// new file there has, and what a restore gives a file whose node holds no
+/// attribute in a snapshot of BackOtter's.
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+pub(super) const fn freebsd_no_flags(zfs: bool) -> u32 {
+    if zfs { FREEBSD_UF_ARCHIVE } else { 0 }
 }
 
 // The flags that keep a file from being written, appended to only, or
@@ -104,6 +112,16 @@ mod tests {
         assert_eq!(freebsd_file_flags(0x8800, true), Some(0x8800));
         assert_eq!(freebsd_file_flags(0x8000, true), Some(0x8000));
         assert_eq!(freebsd_file_flags(0x0001, true), Some(0x0001));
+    }
+
+    /// G4-03: what a node without the attribute stands for is what gets
+    /// none, on each kind of file system.
+    #[test]
+    fn freebsd_no_flags_get_no_attribute() {
+        for zfs in [true, false] {
+            assert_eq!(freebsd_file_flags(freebsd_no_flags(zfs), zfs), None);
+            assert!(freebsd_file_flags(freebsd_no_flags(zfs), !zfs).is_some());
+        }
     }
 
     #[test]

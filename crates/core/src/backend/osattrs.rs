@@ -1261,7 +1261,10 @@ pub(crate) fn restore_owner(path: &Path, node: &Node) -> io::Result<()> {
 /// (`known_bko`), which bcachefs then gets where the file inherited another;
 /// in any other snapshot the file keeps the one it has or inherited. On
 /// illumos such a node's file loses its ZFS project, and one without system
-/// attributes gets a new file's, where it has others.
+/// attributes gets a new file's, where it has others. On the BSDs a node
+/// without file flags had none then (a new file's), and its file loses the
+/// kept flags it has now, but for the restricting ones, which came off
+/// before.
 ///
 /// `owners` says whether the restore sets owners (not `--no-ownership`): on
 /// illumos each extended attribute has an owner and group of its own, set
@@ -1275,7 +1278,13 @@ pub(crate) fn restore_attributes(
     // BackOtter: past PATH_MAX, through a short path to it.
     let path = &*walkdir::short_path(path);
     warn_unknown(node);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
     {
         let _ = owners;
         os::restore_attributes(path, node, known_bko)
@@ -1284,7 +1293,14 @@ pub(crate) fn restore_attributes(
     {
         os::restore_attributes(path, node, known_bko, owners)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "illumos")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "illumos",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
     {
         let _ = (known_bko, owners);
         os::restore_attributes(path, node)

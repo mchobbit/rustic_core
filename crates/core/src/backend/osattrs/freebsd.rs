@@ -21,9 +21,8 @@ use log::debug;
 
 use super::{
     RestoreErrors, Unsupported, XattrErrors,
-    bsd_flags::{
-        FREEBSD_KEPT_FLAGS as KEPT_FLAGS, freebsd_file_flags,
-    },
+    bsd_flags::{FREEBSD_KEPT_FLAGS as KEPT_FLAGS, freebsd_file_flags, freebsd_no_flags},
+    bsd_held::restore_no_flags,
     c_path, check, chmod_symlink, freebsd_netbsd,
     illumos_project::ZfsProject,
     lower_birthtime, path_error, set_flags_best_effort,
@@ -157,7 +156,7 @@ pub(super) fn file_flags(
     path: &Path,
     typ: &NodeType,
     m: &std::fs::Metadata,
-    _f: Option<&std::fs::File>,
+    _f: Option<&File>,
 ) -> io::Result<Option<u32>> {
     Ok(freebsd_file_flags(m.st_flags(), on_zfs(path, typ, m)))
 }
@@ -281,16 +280,29 @@ pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
 
-/// Restores the system extended attributes and the ZFS project.
+/// Restores the system extended attributes and the ZFS project. In a
+/// snapshot of BackOtter's (`known_bko`), a file whose node holds no
+/// `freebsd.file_flags` had a new file's flags, and gets them where it has
+/// others now ([`restore_no_flags`]): none, or `uarch` alone on ZFS.
 ///
 /// # Errors
 ///
-/// * If either couldn't be set: the project's error, the attributes', or
-///   one that holds both ([`RestoreErrors`]).
-pub(super) fn restore_attributes(path: &Path, node: &Node) -> io::Result<()> {
+/// * If any of them couldn't be set: the project's error, the attributes',
+///   the flags', or one that holds them all ([`RestoreErrors`]).
+pub(super) fn restore_attributes(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
     let extattrs = freebsd_netbsd::restore_system_extattrs(path, node);
     let project = restore_zfs_project(path, node);
-    RestoreErrors::result([project, extattrs].into_iter().filter_map(Result::err).collect())
+    let flags = if known_bko && node.meta.generic_attributes.value(FREEBSD_FILE_FLAGS).is_none() {
+        std::fs::symlink_metadata(path)
+            .map_err(|err| path_error("lstat", path, &err))
+            .and_then(|m| {
+                let new_file = freebsd_no_flags(on_zfs(path, &node.node_type, &m));
+                restore_no_flags(path, FREEBSD_FILE_FLAGS, KEPT_FLAGS, new_file)
+            })
+    } else {
+        Ok(())
+    };
+    RestoreErrors::result([project, extattrs, flags].into_iter().filter_map(Result::err).collect())
 }
 
 pub(super) use super::bsd_held::clear_restricting_flags;
