@@ -746,7 +746,7 @@ mod tests {
         assert_eq!(std::fs::read(&foo).unwrap(), b"new contents");
         assert_eq!(std::fs::read(&victim).unwrap(), b"outside");
         assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
-        assert!(temps(dir.path()).is_empty());
+        assert_eq!(temps(dir.path()), Vec::<String>::new());
 
         // The system's own clone: one that fails (no reflinks here) leaves
         // the file as it was.
@@ -756,7 +756,7 @@ mod tests {
             Err(_) => assert_eq!(std::fs::read(&foo).unwrap(), b"old contents"),
         }
         assert_eq!(std::fs::read(&victim).unwrap(), b"outside");
-        assert!(temps(dir.path()).is_empty());
+        assert_eq!(temps(dir.path()), Vec::<String>::new());
     }
 
     /// D1, E2: breaking a hard link never touches an entry named
