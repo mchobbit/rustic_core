@@ -400,7 +400,12 @@ fn test_backup_keeps_access_times(set_up_repo: Result<RepoOpen>) -> Result<()> {
     if cfg!(any(target_os = "linux", target_os = "android")) {
         for path in [dir.join("file"), dir] {
             let m = std::fs::metadata(&path)?;
-            assert_eq!(FileTime::from_last_access_time(&m), old, "{}", path.display());
+            assert_eq!(
+                FileTime::from_last_access_time(&m),
+                old,
+                "{}",
+                path.display()
+            );
         }
         // So a second backup saves the same trees, even where the file
         // system updates atimes on every access (strictatime).

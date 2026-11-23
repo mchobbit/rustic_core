@@ -11,16 +11,21 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use super::{IgnoreErrorKind, IgnoreResult, Incomplete, OpenFile};
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+#[cfg(not(any(
+    windows,
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "haiku"
+)))]
 use crate::backend::node::ExtendedAttribute;
 use crate::backend::{
     ReadSourceEntry,
-    osattrs,
     node::{
         Metadata, Node, NodeType,
         generic_attributes::GenericAttributes,
         modification::{DevIdOption, TimeOption, XattrOption},
     },
+    osattrs,
 };
 
 #[cfg(not(windows))]
@@ -241,7 +246,8 @@ impl LocalSourceSaveOptions {
             Node::new_node(name, NodeType::Dir, meta)
         } else if m.is_symlink() {
             // BackOtter: past PATH_MAX, through a short path to it.
-            let target = std::fs::read_link(walkdir::short_path(path)).map_err(|err| IgnoreErrorKind::ErrorLink {
+            let short = walkdir::short_path(path);
+            let target = std::fs::read_link(short).map_err(|err| IgnoreErrorKind::ErrorLink {
                 path: path.to_path_buf(),
                 source: err,
             })?;
@@ -475,7 +481,10 @@ mod tests {
         let node = real
             .map_path(&path, name, &m, &Incomplete::default(), false)
             .unwrap();
-        assert_eq!(node.meta.atime.map(Timestamp::as_second), Some(old.unix_seconds()));
+        assert_eq!(
+            node.meta.atime.map(Timestamp::as_second),
+            Some(old.unix_seconds())
+        );
     }
 
     /// BackOtter: extended attributes are stored in the byte order of their
@@ -544,7 +553,10 @@ mod tests {
         }
         assert_eq!(read.unreadable.len(), 1);
         let (name, err) = &read.unreadable[0];
-        assert_eq!(Some(name.clone()), osattrs::xattr_node_name("user.b".as_ref()));
+        assert_eq!(
+            Some(name.clone()),
+            osattrs::xattr_node_name("user.b".as_ref())
+        );
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
 
         let refused = || Err(io::Error::from_raw_os_error(libc::EACCES));

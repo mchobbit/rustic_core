@@ -11,9 +11,9 @@ use crate::{
         packer::{PackSizer, Packer},
         tree::{self, Tree, TreeId},
     },
+    commands::restore::SnapshotOrigin,
     error::{ErrorKind, RusticError, RusticResult},
     index::{ReadIndex, indexer::Indexer},
-    commands::restore::SnapshotOrigin,
     repofile::{PathList, SnapshotFile, SnapshotSummary},
     repository::{IndexedTree, Repository},
 };
@@ -26,7 +26,10 @@ use crate::{
 fn without_backotter(program_version: &str) -> String {
     program_version
         .split(' ')
-        .map(|word| word.split_once("+backotter").map_or(word, |(stock, _)| stock))
+        .map(|word| {
+            word.split_once("+backotter")
+                .map_or(word, |(stock, _)| stock)
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -55,7 +58,10 @@ pub(crate) fn merge_snapshots<S: IndexedTree>(
 
     // BackOtter: the merged snapshot is BackOtter's (missing attributes
     // were zero at backup) only if every snapshot merged is.
-    if !snapshots.iter().all(|sn| SnapshotOrigin::of(sn).known_bko()) {
+    if !snapshots
+        .iter()
+        .all(|sn| SnapshotOrigin::of(sn).known_bko())
+    {
         snap.program_version = without_backotter(&snap.program_version);
     }
 
@@ -182,7 +188,10 @@ mod tests {
         ] {
             let cut = without_backotter(version);
             assert_eq!(cut, want, "{version}");
-            assert!(!SnapshotOrigin::from_program_version(&cut).known_bko(), "{version}");
+            assert!(
+                !SnapshotOrigin::from_program_version(&cut).known_bko(),
+                "{version}"
+            );
         }
     }
 }

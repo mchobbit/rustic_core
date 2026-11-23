@@ -173,7 +173,8 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                     _ = dropped.fetch_add(1, Ordering::Relaxed);
                     None
                 }
-                Ok(ReadSourceEntry { path, mut node, open }) => {
+                Ok(ReadSourceEntry { path, node, open }) => {
+                    let mut node = node; // BackOtter: renamed below
                     let is_backup_path = path == backup_path;
                     let snapshot_path = if let Some(as_path) = as_path {
                         as_path

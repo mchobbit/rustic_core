@@ -482,7 +482,15 @@ mod tests {
             [MIN_SIZE, MIN_SIZE + 3, MIN_SIZE - 3]
         );
 
-        for (offset, want) in [(-65, 0), (-64, 1), (-63, 2), (-2, 0), (-1, 1), (0, 0), (64, 0)] {
+        for (offset, want) in [
+            (-65, 0),
+            (-64, 1),
+            (-63, 2),
+            (-2, 0),
+            (-1, 1),
+            (0, 0),
+            (64, 0),
+        ] {
             let mut zeros = vec![0; 64 * KB];
             zeros[(8 * KB).checked_add_signed(offset).unwrap()] = 0x5a;
             let mut lengths = lengths(zeros, 127, 8 * KB, 64 * KB);

@@ -25,8 +25,17 @@ fn test_merge_known_bko_only_if_all_are(
 
     // This fork's own snapshots are BackOtter's.
     let bko = SnapshotFile::default();
-    assert!(SnapshotOrigin::of(&bko).known_bko(), "{}", bko.program_version);
-    let stock_version = bko.program_version.split("+backotter").next().unwrap().to_string();
+    assert!(
+        SnapshotOrigin::of(&bko).known_bko(),
+        "{}",
+        bko.program_version
+    );
+    let stock_version = bko
+        .program_version
+        .split("+backotter")
+        .next()
+        .unwrap()
+        .to_string();
     let bko1 = repo.backup(&opts, paths, SnapshotFile::default())?;
     let bko2 = repo.backup(&opts, paths, SnapshotFile::default())?;
     let stock = repo.backup(

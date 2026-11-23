@@ -1863,7 +1863,12 @@ impl<S: IndexedFull> Repository<S> {
     ///
     /// * If `dir` is inside `dest`.
     /// * If the trees below `node` can't be read.
-    pub fn clone_sources(&self, node: &Node, dir: &Path, dest: Option<&Path>) -> RusticResult<CloneSources> {
+    pub fn clone_sources(
+        &self,
+        node: &Node,
+        dir: &Path,
+        dest: Option<&Path>,
+    ) -> RusticResult<CloneSources> {
         if let Some(dest) = dest {
             clone_dir_outside(dir, dest)?;
         }
@@ -1878,7 +1883,8 @@ impl<S: IndexedFull> Repository<S> {
             }
             if n.is_file()
                 && n.meta.size > 0
-                && std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file() && m.len() == n.meta.size)
+                && std::fs::symlink_metadata(&path)
+                    .is_ok_and(|m| m.is_file() && m.len() == n.meta.size)
             {
                 if let Some(content) = n.content.as_ref().filter(|c| !c.is_empty()) {
                     sources.insert(content.clone(), path);
@@ -2061,7 +2067,10 @@ mod tests {
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&dir, tmp.path().join("link")).unwrap();
-            assert_eq!(path_below(&tmp.path().join("link"), &dest).as_deref(), Some(rel));
+            assert_eq!(
+                path_below(&tmp.path().join("link"), &dest).as_deref(),
+                Some(rel)
+            );
         }
         // Elsewhere: beside it, a name it begins, and above it.
         let other = tmp.path().join("atx");
@@ -2069,6 +2078,9 @@ mod tests {
         assert_eq!(path_below(&dir, &other), None);
         assert_eq!(path_below(&dir, tmp.path()), None);
         // Not there yet: as written.
-        assert_eq!(path_below(&dir, &dir.join("new")).as_deref(), Some(Path::new("new")));
+        assert_eq!(
+            path_below(&dir, &dir.join("new")).as_deref(),
+            Some(Path::new("new"))
+        );
     }
 }

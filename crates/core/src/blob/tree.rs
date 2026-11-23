@@ -652,7 +652,8 @@ where
                 }
                 // BackOtter: the held directories above it first, outermost
                 // first, each once.
-                self.queue.extend(self.held.iter_mut().filter_map(Option::take));
+                self.queue
+                    .extend(self.held.iter_mut().filter_map(Option::take));
                 self.queue.push_back((path, node));
                 return self.queue.pop_front().map(Ok);
             }

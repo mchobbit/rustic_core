@@ -194,11 +194,17 @@ mod tests {
         // BackOtter: Go writes "Z" for a zero offset, and trims trailing
         // zeros of the nanoseconds.
         let ts = Timestamp::new(1_000_000_000, 123_456_789).unwrap();
-        assert_eq!(timestamp_to_string(ts, Offset::UTC), "2001-09-09T01:46:40.123456789Z");
+        assert_eq!(
+            timestamp_to_string(ts, Offset::UTC),
+            "2001-09-09T01:46:40.123456789Z"
+        );
         let ts = Timestamp::new(1_000_000_000, 0).unwrap();
         assert_eq!(timestamp_to_string(ts, Offset::UTC), "2001-09-09T01:46:40Z");
         let ts = Timestamp::new(1_000_000_000, 500_000_000).unwrap();
-        assert_eq!(timestamp_to_string(ts, offset(2)), "2001-09-09T03:46:40.5+02:00");
+        assert_eq!(
+            timestamp_to_string(ts, offset(2)),
+            "2001-09-09T03:46:40.5+02:00"
+        );
         for s in ["2001-09-09T01:46:40.5Z", "2001-09-09T01:46:40.5+00:00"] {
             assert_eq!(s.parse::<Timestamp>().unwrap(), ts);
         }
