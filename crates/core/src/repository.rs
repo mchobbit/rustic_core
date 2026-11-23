@@ -1895,6 +1895,17 @@ impl<S: IndexedFull> Repository<S> {
             let ls_opts = LsOptions::default().recursive(true);
             for item in self.ls(node, &ls_opts)? {
                 let (path, n) = item?;
+                // BackOtter: a node's path that would leave `dir` names no
+                // file restored there (a damaged or crafted snapshot): the
+                // rule the restore itself goes by (LocalDestination::path).
+                if !stays_below(&path) {
+                    log::debug!(
+                        "{} would leave {}: no clone source",
+                        path.display(),
+                        dir.display()
+                    );
+                    continue;
+                }
                 add(&path, dir.join(&path), &n);
             }
         } else {
@@ -2016,9 +2027,29 @@ fn clone_dir_outside(dir: &Path, dest: &Path) -> RusticResult<()> {
     }
 }
 
+/// BackOtter: whether `rel`, a node's path as the repository gives it, stays
+/// below the directory it is joined to: it has no `..`, root or prefix
+/// component, as `LocalDestination::path` wants of a path it restores to.
+fn stays_below(rel: &Path) -> bool {
+    rel.components()
+        .all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ForkAudit1 G6-09: `--clone-from` offers no file outside its
+    /// directory for a node path that leaves it.
+    #[test]
+    fn node_paths_stay_below() {
+        for inside in ["f", "a/b/c", "./a", "a/./b", "..a/b..", ""] {
+            assert!(stays_below(Path::new(inside)), "{inside}");
+        }
+        for outside in ["..", "../x", "a/../../etc/shadow", "a/..", "/etc/shadow"] {
+            assert!(!stays_below(Path::new(outside)), "{outside}");
+        }
+    }
 
     #[test]
     fn clone_sources_dir_inside_dest() {
