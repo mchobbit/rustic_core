@@ -2509,4 +2509,74 @@ mod tests {
         let unsupported = err.get_ref().unwrap().downcast_ref::<Unsupported>().unwrap();
         assert_eq!(unsupported.kind(), "x.flags");
     }
+
+    /// BackOtter (ForkAudit1 F2): what the restore asks of a node with every
+    /// generic attribute, cut short or with any bit flipped, answered
+    /// without a panic.
+    #[test]
+    fn node_readers_malformed() {
+        use malformed::{EVERY_ATTRIBUTE_NODE, every_json_mutation};
+
+        _ = every_json_mutation::<Node>("node readers", EVERY_ATTRIBUTE_NODE, |node| {
+            _ = (
+                is_sparse(node),
+                file_flags(node),
+                zfs_dos_flags(node),
+                fat_attrs(node),
+            );
+            _ = (xfs_options(node), is_quarantined(node), unread_size(node));
+            _ = (
+                takes_nothing_before_data(node),
+                node_flags(node, true),
+                node_flags(node, false),
+            );
+            _ = (node_sets_flags(node, true), flags_xattrs(node));
+            if let Some(t) = node.meta.generic_attributes.timestamp(UNIX_BIRTHTIME) {
+                _ = (birthtime_first(node, t), unix_time(t));
+            }
+            warn_unknown(node);
+            Ok(())
+        });
+    }
+
+    /// BackOtter (ForkAudit1 F2): the same nodes restored onto a file of
+    /// their own type: each step succeeds or fails, and none panics.
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore = "system calls")]
+    #[test]
+    fn node_restore_malformed() {
+        use malformed::{EVERY_ATTRIBUTE_NODE, every_json_mutation};
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        let sub = dir.path().join("d");
+        _ = every_json_mutation::<Node>("node restore", EVERY_ATTRIBUTE_NODE, |node| {
+            let path = if node.is_dir() {
+                _ = std::fs::create_dir(&sub);
+                &sub
+            } else {
+                _ = std::fs::write(&file, b"x");
+                &file
+            };
+            let typ = &node.node_type;
+            _ = prepare_file(path, node);
+            if let Some(f) = file_flags(node) {
+                _ = restore_file_flags(path, typ, f, &flags_xattrs(node));
+            }
+            if let Some(f) = zfs_dos_flags(node) {
+                _ = restore_zfs_dos_flags(path, typ, f);
+            }
+            if let Some(a) = fat_attrs(node) {
+                _ = restore_fat_attrs(path, typ, a);
+            }
+            if let Some(o) = xfs_options(node) {
+                _ = restore_xfs_options(path, typ, &o);
+            }
+            _ = restore_attributes(path, node, true, true);
+            _ = restore_acls(path, node, true);
+            _ = restore_birthtime(path, node);
+            clear_restricting_flags(path);
+            Ok(())
+        });
+    }
 }

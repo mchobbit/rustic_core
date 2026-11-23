@@ -568,4 +568,128 @@ pub(super) mod tests {
             proptest::prop_assert_eq!(chunks(HoleReader::new(f.clone())), chunks(&f.data[..]));
         }
     }
+
+    /// BackOtter (ForkAudit1 F2): a file whose `SEEK_DATA`, `SEEK_HOLE` and
+    /// size answer anything at all (a buggy or changing file system: before
+    /// or past the offset asked, past the end, errors), and whose reads give
+    /// its bytes: the reader ends, gives each byte as the file has it or as
+    /// a zero, no more bytes than the largest size it was told, and never
+    /// panics.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn hole_reader_any_answers() {
+        use std::io::Read;
+
+        struct Lying {
+            data: Vec<u8>,
+            x: u64,
+            biggest: u64,
+        }
+
+        impl Lying {
+            fn next(&mut self) -> u64 {
+                self.x ^= self.x << 13;
+                self.x ^= self.x >> 7;
+                self.x ^= self.x << 17;
+                self.x
+            }
+
+            /// An offset near `off`, the end or 0, or far off; or an error.
+            fn answer(&mut self, off: u64) -> io::Result<u64> {
+                let len = self.data.len() as u64;
+                let r = self.next();
+                let near = |d: u64| {
+                    [
+                        off.saturating_sub(d),
+                        off.saturating_add(d),
+                        len.saturating_sub(d),
+                        len + d,
+                        d,
+                    ]
+                };
+                Ok(match r % 16 {
+                    0 => return Err(io::Error::from_raw_os_error(libc::ENXIO)),
+                    1 => return Err(io::Error::from_raw_os_error(libc::EIO)),
+                    2 => u64::MAX - (r >> 60),
+                    3 => off,
+                    _ => near((r >> 8) % 600)[usize::try_from((r >> 32) % 5).unwrap()],
+                })
+            }
+        }
+
+        impl Extents for Lying {
+            fn seek_data(&mut self, off: u64) -> io::Result<u64> {
+                self.answer(off)
+            }
+
+            fn seek_hole(&mut self, off: u64) -> io::Result<u64> {
+                self.answer(off)
+            }
+
+            fn size(&mut self) -> io::Result<u64> {
+                let len = self.data.len() as u64;
+                let size = match self.next() % 8 {
+                    0 => return Err(io::Error::from_raw_os_error(libc::EIO)),
+                    1 => 0,
+                    2 => len / 2,
+                    3 => len * 2,
+                    _ => len,
+                };
+                self.biggest = self.biggest.max(size);
+                Ok(size)
+            }
+
+            fn read_at(&mut self, buf: &mut [u8], off: u64) -> io::Result<usize> {
+                let Some(rest) = usize::try_from(off)
+                    .ok()
+                    .and_then(|off| self.data.get(off..))
+                else {
+                    return Ok(0);
+                };
+                let n = rest.len().min(buf.len());
+                buf[..n].copy_from_slice(&rest[..n]);
+                Ok(n)
+            }
+        }
+
+        let seeds: u64 = if cfg!(miri) { 40 } else { 20_000 };
+        for seed in 1..=seeds {
+            let data: Vec<u8> = (0..1000_u32)
+                .map(|i| u8::try_from(i % 251 + 1).unwrap())
+                .collect();
+            let len = data.len() as u64;
+            let mut r = HoleReader::new(Lying {
+                data: data.clone(),
+                x: seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1,
+                biggest: 0,
+            });
+            let mut out = Vec::new();
+            let mut buf = [0_u8; 97];
+            let mut reads = 0;
+            loop {
+                reads += 1;
+                assert!(
+                    reads < 10_000,
+                    "seed {seed}: no end after {} bytes",
+                    out.len()
+                );
+                match r.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                }
+            }
+            let most = r.f.biggest.max(len);
+            assert!(
+                out.len() as u64 <= most,
+                "seed {seed}: {} bytes of a file of at most {most}",
+                out.len()
+            );
+            for (i, &b) in out.iter().enumerate() {
+                assert!(
+                    b == 0 || data.get(i) == Some(&b),
+                    "seed {seed}: byte {i} is {b}"
+                );
+            }
+        }
+    }
 }

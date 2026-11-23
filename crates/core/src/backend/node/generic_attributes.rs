@@ -520,4 +520,126 @@ mod tests {
                 .unwrap();
         assert!(!node.meta.generic_attributes.is_true(UNIX_SPARSE));
     }
+
+    /// BackOtter (ForkAudit1 F2): a node with every generic attribute,
+    /// cut short or with any bit flipped: refused, or read into attributes
+    /// that each reader takes without a panic, and that write back as read.
+    #[test]
+    fn node_with_every_attribute_malformed() {
+        use crate::backend::osattrs::malformed::{EVERY_ATTRIBUTE_NODE, every_json_mutation};
+
+        let node: Node = serde_json::from_str(EVERY_ATTRIBUTE_NODE).unwrap();
+        for name in KNOWN {
+            assert!(
+                node.meta.generic_attributes.value(name).is_some()
+                    || name.starts_with("windows.")
+                    || name.starts_with("netbsd.")
+                    || *name == FREEBSD_ACL_DEFAULT,
+                "{name} not in the sample"
+            );
+        }
+        _ = every_json_mutation::<Node>("node", EVERY_ATTRIBUTE_NODE, |node| {
+            let a = &node.meta.generic_attributes;
+            for name in a.names().chain(KNOWN.iter().copied()) {
+                _ = (
+                    a.number(name),
+                    a.number_u64(name),
+                    a.is_true(name),
+                    a.timestamp(name),
+                );
+                _ = a.decoded::<XfsOptions>(name);
+                _ = a.get::<serde_json::Value>(name);
+            }
+            let json = serde_json::to_string(node).map_err(|e| e.to_string())?;
+            // A time before the system's zone had standard time is written
+            // at the zone's local mean time, whose offset has seconds that
+            // RFC 3339 drops (Europe/Paris before 1891: +00:09:21 written
+            // as +00:09), and reads back up to 59 s off: upstream's
+            // RusticTime, not compared here (ForkAudit1 F2's report).
+            let before_1900 =
+                |t: Option<Timestamp>| t.is_some_and(|t| t.as_second() < -2_208_988_800);
+            match serde_json::from_str::<Node>(&json) {
+                Ok(mut again) => {
+                    let m = &node.meta;
+                    for (a, b) in [
+                        (&mut again.meta.mtime, m.mtime),
+                        (&mut again.meta.atime, m.atime),
+                        (&mut again.meta.ctime, m.ctime),
+                    ] {
+                        if before_1900(b) && a.is_some() {
+                            *a = b;
+                        }
+                    }
+                    if again == *node {
+                        Ok(())
+                    } else {
+                        Err(format!("written as {json}, read back as {again:?}"))
+                    }
+                }
+                Err(err) => Err(format!("written as {json}, not read back: {err}")),
+            }
+        });
+    }
+
+    /// BackOtter (ForkAudit1 F2): every attribute BackOtter knows, with a
+    /// value of each JSON type and the edges of each number and time: each
+    /// reader gives a value only for one in its range, and none panics.
+    #[test]
+    fn every_attribute_with_odd_values() {
+        let odd = [
+            "null",
+            "true",
+            "false",
+            "0",
+            "-1",
+            "4294967295",
+            "4294967296",
+            "18446744073709551615",
+            "18446744073709551616",
+            "1e3",
+            "1.5",
+            "-0",
+            "\"\"",
+            "\"16\"",
+            "[]",
+            "[16]",
+            "{}",
+            r#"{"xflags":-1}"#,
+            r#"{"xflags":1,"extsize":4294967296}"#,
+            "\"9999-12-31T23:59:59.999999999Z\"",
+            "\"-009999-01-01T00:00:00Z\"",
+            "\"0000-01-01T00:00:00Z\"",
+            "\"1969-12-31T23:59:59.999999999Z\"",
+            "\"2001-09-09T01:46:40.5+25:00\"",
+            "\"2001-02-29T00:00:00Z\"",
+            "\"1970-01-01T00:00:60Z\"",
+        ];
+        for name in KNOWN {
+            for v in odd {
+                let attrs: GenericAttributes =
+                    serde_json::from_str(&format!(r#"{{"{name}":{v}}}"#)).unwrap();
+                let n = attrs.number(name);
+                let n64 = attrs.number_u64(name);
+                let b = attrs.is_true(name);
+                let t = attrs.timestamp(name);
+                _ = attrs.decoded::<XfsOptions>(name);
+                let num: Option<u64> = v.parse().ok();
+                assert_eq!(
+                    n,
+                    num.and_then(|n| u32::try_from(n).ok()),
+                    "{name}={v} as u32"
+                );
+                assert_eq!(n64, num, "{name}={v} as u64");
+                assert_eq!(b, v == "true", "{name}={v} as bool");
+                if let Some(t) = t {
+                    // A time read is written back as one that reads the same.
+                    let mut again = GenericAttributes::default();
+                    again.set_timestamp(name, t);
+                    if let Some(back) = again.timestamp(name) {
+                        assert_eq!(back, t, "{name}={v}");
+                    }
+                }
+            }
+        }
+    }
 }
