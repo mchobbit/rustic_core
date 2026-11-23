@@ -281,7 +281,8 @@ fn file_projid(f: &File, attr: &FsXattr) -> u32 {
 /// ([`read_whole`]).
 fn get_xattr(f: &File, name: &str) -> io::Result<Vec<u8>> {
     let name = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::from)?;
-    // SAFETY: name is a C string, and value has room for size bytes.
+    // SAFETY: name is a C string, and value has room for size bytes, or is
+    // null with size 0 (read_whole's contract).
     read_whole(|value, size| unsafe { libc::fgetxattr(f.as_raw_fd(), name.as_ptr(), value, size) })
 }
 
@@ -1187,6 +1188,10 @@ pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> Result<(
 /// 1.7 asks for the size as this does (rustix's `*_query` calls), and is
 /// what `Cargo.lock` has now; this stays while `Cargo.toml` takes any
 /// xattr 1.x.
+///
+/// `call` is only ever given a null pointer and 0, or a pointer to a
+/// writable buffer of exactly that many bytes, which lives until it
+/// returns: what the callers' SAFETY comments rely on.
 fn read_whole(mut call: impl FnMut(*mut libc::c_void, usize) -> isize) -> io::Result<Vec<u8>> {
     loop {
         let size = call(std::ptr::null_mut(), 0);
@@ -1216,7 +1221,8 @@ pub(super) fn xattr_get(path: &Path, name: &std::ffi::OsStr) -> io::Result<Optio
     use std::os::unix::ffi::OsStrExt;
     let p = super::c_path(path)?;
     let n = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::from)?;
-    // SAFETY: p and n are C strings, and value has room for size bytes.
+    // SAFETY: p and n are C strings, and value has room for size bytes, or
+    // is null with size 0 (read_whole's contract).
     let value = read_whole(|value, size| unsafe {
         libc::lgetxattr(p.as_ptr(), n.as_ptr(), value, size)
     });
@@ -1231,7 +1237,8 @@ pub(super) fn xattr_get(path: &Path, name: &std::ffi::OsStr) -> io::Result<Optio
 pub(super) fn xattr_list(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
     use std::os::unix::ffi::OsStrExt;
     let p = super::c_path(path)?;
-    // SAFETY: p is a C string, and list has room for size bytes.
+    // SAFETY: p is a C string, and list has room for size bytes, or is null
+    // with size 0 (read_whole's contract).
     let names =
         read_whole(|list, size| unsafe { libc::llistxattr(p.as_ptr(), list.cast(), size) })?;
     Ok(names
