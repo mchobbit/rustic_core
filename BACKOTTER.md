@@ -1358,7 +1358,10 @@ that either program restores what the other backed up.
   (sparse only if it is new); one whose temporary file can't be removed
   is a warning naming it. The source is opened
   `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` and checked with `fstat` (a regular
-  file of its size, not the file cloned onto by any name: S11). Only
+  file of its size, not the file cloned onto by any name: S11). A
+  directory to clone from that is inside the restore's destination is
+  refused before anything is written (`clone_sources`): the restore
+  changes what is there, so a later clone could take what it wrote. Only
   Linux clones; elsewhere nothing is tried, the file is written, and a
   hard link is broken by removing the name.
 

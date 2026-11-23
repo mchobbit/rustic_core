@@ -1855,12 +1855,18 @@ impl<S: IndexedFull> Repository<S> {
     /// restored, unchanged since; what is in the destination isn't (a
     /// snapper snapshot inside the subvolume cloned from, which holds a
     /// seed until restored): a file there would be cloned onto itself, or
-    /// give another file its seeded contents.
+    /// give another file its seeded contents.  A `dir` inside `dest` is
+    /// refused: the restore changes what is there, so a file cloned from it
+    /// later could get what the restore wrote, not its own contents.
     ///
     /// # Errors
     ///
+    /// * If `dir` is inside `dest`.
     /// * If the trees below `node` can't be read.
     pub fn clone_sources(&self, node: &Node, dir: &Path, dest: Option<&Path>) -> RusticResult<CloneSources> {
+        if let Some(dest) = dest {
+            clone_dir_outside(dir, dest)?;
+        }
         let mut sources = CloneSources::new();
         // The destination's path below `dir`, if it is there.
         let skip = dest.and_then(|dest| path_below(dir, dest));
@@ -1988,9 +1994,57 @@ fn path_below(dir: &Path, path: &Path) -> Option<PathBuf> {
     path.strip_prefix(dir).ok().map(Path::to_path_buf)
 }
 
+/// BackOtter: refuses `dir`, a directory to clone from
+/// ([`Repository::clone_sources`]), when it is inside `dest`, the restore's
+/// destination, as [`path_below`] sees it.  `dest` itself is not refused:
+/// nothing is taken from it.
+fn clone_dir_outside(dir: &Path, dest: &Path) -> RusticResult<()> {
+    match path_below(dest, dir) {
+        Some(rel) if !rel.as_os_str().is_empty() => Err(RusticError::new(
+            ErrorKind::InvalidInput,
+            "The directory to clone from, `{dir}`, is inside the restore's destination `{dest}`, which the restore changes. Please clone from a directory outside the destination.",
+        )
+        .attach_context("dir", dir.display().to_string())
+        .attach_context("dest", dest.display().to_string())),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clone_sources_dir_inside_dest() {
+        // BackOtter: a directory to clone from inside the destination is
+        // refused (RustAudit1 R7-04); the destination itself, one that
+        // holds the destination, and one beside it are not.
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("t");
+        let old = dest.join("old");
+        let beside = tmp.path().join("told");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir(&beside).unwrap();
+        let err = clone_dir_outside(&old, &dest).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("is inside the restore's destination"),
+            "{text}"
+        );
+        assert!(text.contains(&old.display().to_string()), "{text}");
+        assert!(clone_dir_outside(&dest.join("old/../old"), &dest).is_err());
+        // Not there: by its name.
+        assert!(clone_dir_outside(&dest.join("missing/deep"), &dest).is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&old, tmp.path().join("link")).unwrap();
+            assert!(clone_dir_outside(&tmp.path().join("link"), &dest).is_err());
+        }
+        clone_dir_outside(&dest, &dest).unwrap();
+        clone_dir_outside(tmp.path(), &dest).unwrap();
+        clone_dir_outside(&dest, &old).unwrap();
+        clone_dir_outside(&beside, &dest).unwrap();
+    }
 
     #[test]
     fn path_below_dir() {
