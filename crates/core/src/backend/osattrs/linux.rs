@@ -1260,13 +1260,23 @@ mod tests {
     const NODUMP: u32 = 0x0000_0040;
     const NOCOW: u32 = FS_NOCOW_FL;
 
+    /// An ioctl's number as the headers write it, 32 bits: `libc::Ioctl` is
+    /// an `unsigned long` on glibc and an `int` on musl, where a number with
+    /// bit 31 set (a read) is negative. The numbers are checked where the
+    /// direction and size are encoded as asm-generic does (not on powerpc,
+    /// mips or sparc).
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn ioctl_number(ioctl: libc::Ioctl) -> i128 {
+        i128::from(ioctl) & 0xffff_ffff
+    }
+
     #[test]
     fn fsxattr_ioctls() {
         assert_eq!(size_of::<FsXattr>(), 28);
-        #[cfg(all(target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
-            assert_eq!(FS_IOC_FSGETXATTR, 0x801c_581f);
-            assert_eq!(FS_IOC_FSSETXATTR, 0x401c_5820);
+            assert_eq!(ioctl_number(FS_IOC_FSGETXATTR), 0x801c_581f);
+            assert_eq!(ioctl_number(FS_IOC_FSSETXATTR), 0x401c_5820);
         }
     }
 
@@ -1283,10 +1293,10 @@ mod tests {
     #[test]
     fn zfs_dos_ioctls() {
         assert_eq!(ZFS_DOS_KEPT, 0x0000_302f_0000_0000);
-        #[cfg(all(target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
-            assert_eq!(ZFS_IOC_GETDOSFLAGS, 0x8008_8301);
-            assert_eq!(ZFS_IOC_SETDOSFLAGS, 0x4008_8302);
+            assert_eq!(ioctl_number(ZFS_IOC_GETDOSFLAGS), 0x8008_8301);
+            assert_eq!(ioctl_number(ZFS_IOC_SETDOSFLAGS), 0x4008_8302);
         }
     }
 
@@ -1415,10 +1425,10 @@ mod tests {
 
     #[test]
     fn fat_ioctls() {
-        #[cfg(all(target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
-            assert_eq!(FAT_IOCTL_GET_ATTRIBUTES, 0x8004_7210);
-            assert_eq!(FAT_IOCTL_SET_ATTRIBUTES, 0x4004_7211);
+            assert_eq!(ioctl_number(FAT_IOCTL_GET_ATTRIBUTES), 0x8004_7210);
+            assert_eq!(ioctl_number(FAT_IOCTL_SET_ATTRIBUTES), 0x4004_7211);
         }
     }
 
