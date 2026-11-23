@@ -1,76 +1,77 @@
-// BackOtter: paths of PATH_MAX bytes or more.
-//
-// A file system holds files deeper than a path a system call takes
-// (PATH_MAX, 4096 bytes on Linux, its NUL included: ENAMETOOLONG past it),
-// and a backup must read them and a restore make them, as tar and rsync do.
-// `short_path` gives, for such a path, a shorter one to the same file: the
-// directory at a prefix of the path (ending at a component) is reached
-// through a symbolic link to it, in a directory of this process's own (mode
-// 0700, in the temporary directory, removed at exit), and the rest of the
-// path follows the link; a rest still too long is shortened the same way,
-// from that link. A link is followed by name, as the long path's own
-// components are, so the short path names whatever the long one names, now
-// and after the tree changes; and each prefix has one link, so a path gets
-// the same short path every time.
-//
-// A prefix is at most 2048 bytes (PATH_MAX / 2) where the links' directory
-// takes a link's target of that many bytes, and at most 1000 where it
-// doesn't: XFS refuses a target past 1024 bytes, ext2/3/4 and minix past
-// a block less its NUL, 1023 bytes on 1 KiB blocks and 2047 on 2 KiB ones
-// (symlink(2) ENAMETOOLONG). Which one is decided
-// once per process, by a link made in the new directory before any other
-// (`probe`), so a prefix is always cut at the same place. `probe` first
-// makes a link to the directory itself and follows it: where none can be
-// made (vfat and exFAT have no symbolic links, a read-only file system) or
-// one isn't followed (a mount with `nosymfollow`), no path is shortened,
-// and the error says that, naming the directory.
-//
-// Depth: a system call follows at most 40 symbolic links in a path (Linux's
-// MAXSYMLINKS; ELOOP past it), and a short path made in k rounds follows k
-// links (each link's target starts with the link before), so a path that
-// takes more than 40 rounds fails (ELOOP), as one too long did before. A
-// round cuts its prefix less the link's own path (its directory and some
-// 30 bytes), so the deepest path reached is about, with 2048-byte prefixes,
-// 82 KB (names of 40 bytes, an 18-byte $TMPDIR), 77 KB (names of 200
-// bytes), 55 KB (names of 255 bytes, a 495-byte $TMPDIR) and 35 KB at worst
-// (names of 255 bytes, a 1024-byte $TMPDIR); with 1000-byte prefixes 42 KB,
-// 36 KB and 14 KB (a $TMPDIR of at most 500 bytes). The links' directory is in
-// $TMPDIR's canonical path, with no symbolic link in it: a link's path is
-// in its target's, and so in every later round's, and a symbolic link
-// there would be followed again in each round (0.13.0+backotter.16 to .20:
-// one halved the depth reached). Symbolic links in the long path's first
-// prefix count toward the 40 too, once.
-//
-// Trust: $TMPDIR and each directory above it are trusted, as every user of
-// mktemp(3) trusts them. The links' directory (mode 0700, new) and its
-// links are this process's alone, but not its name, which each link and
-// each short path goes through again: whoever could rename an entry of
-// $TMPDIR (its owner, the owner of a directory above it, or anyone where
-// one of them is writable by others and not sticky) could put a directory
-// of their own there, whose links a restore run as root would follow. Root's
-// $TMPDIR is root's own (glibc drops an inherited one in setuid sudo and su),
-// and BackOtter runs rustic-bko with /tmp.
-//
-// A link is checked each time it is used (readlink): one that is gone, or
-// leads elsewhere, is made again, and its directory too (new, mode 0700;
-// one there must still be this user's alone), so a short path never goes
-// through a link that isn't there. Without that, a `restore --delete` with
-// $TMPDIR in its destination removed the links as extra entries, and
-// create_dir_all of the next short path then built the rest of the path as
-// real directories inside $TMPDIR, where the files were written and removed
-// at exit (0.13.0+backotter.16 to 0.14.0+backotter.1: ForkAudit1 G7-01).
-// A walk of a tree that holds $TMPDIR finds the links' directory in it:
-// `is_short_path_dir` says which entry it is, for a backup to leave out and
-// a restore to leave alone.
-//
-// Where a short path can't be made, `short_path` gives the path as it is,
-// whose system call then fails as before, and the reason goes once to the
-// function given to `report_short_path_errors` (walkdir has no logger of
-// its own); `try_short_path` returns it.
-//
-// Only on Linux and Android, where the rest of BackOtter's rustic_core is
-// tested past PATH_MAX; elsewhere a path is given back as it is, and a
-// system call on one too long fails as before.
+//! BackOtter: paths of `PATH_MAX` bytes or more.
+//!
+//! A file system holds files deeper than a path a system call takes
+//! (`PATH_MAX`, 4096 bytes on Linux, its NUL included: `ENAMETOOLONG` past it),
+//! and a backup must read them and a restore make them, as tar and rsync do.
+//! `short_path` gives, for such a path, a shorter one to the same file: the
+//! directory at a prefix of the path (ending at a component) is reached
+//! through a symbolic link to it, in a directory of this process's own (mode
+//! 0700, in the temporary directory, removed at a normal exit; a process
+//! that is killed leaves it), and the rest of the
+//! path follows the link; a rest still too long is shortened the same way,
+//! from that link. A link is followed by name, as the long path's own
+//! components are, so the short path names whatever the long one names, now
+//! and after the tree changes; and each prefix has one link, so a path gets
+//! the same short path every time.
+//!
+//! A prefix is at most 2048 bytes (`PATH_MAX` / 2) where the links' directory
+//! takes a link's target of that many bytes, and at most 1000 where it
+//! doesn't: XFS refuses a target past 1024 bytes, ext2/3/4 and minix past
+//! a block less its NUL, 1023 bytes on 1 KiB blocks and 2047 on 2 KiB ones
+//! (`symlink(2)` `ENAMETOOLONG`). Which one is decided
+//! once per process, by a link made in the new directory before any other
+//! (`probe`), so a prefix is always cut at the same place. `probe` first
+//! makes a link to the directory itself and follows it: where none can be
+//! made (vfat and exFAT have no symbolic links, a read-only file system) or
+//! one isn't followed (a mount with `nosymfollow`), no path is shortened,
+//! and the error says that, naming the directory.
+//!
+//! Depth: a system call follows at most 40 symbolic links in a path (Linux's
+//! `MAXSYMLINKS`; `ELOOP` past it), and a short path made in k rounds follows k
+//! links (each link's target starts with the link before), so a path that
+//! takes more than 40 rounds fails (`ELOOP`), as one too long did before. A
+//! round cuts its prefix less the link's own path (its directory and some
+//! 30 bytes), so the deepest path reached is about, with 2048-byte prefixes,
+//! 82 KB (names of 40 bytes, an 18-byte `$TMPDIR`), 77 KB (names of 200
+//! bytes), 55 KB (names of 255 bytes, a 495-byte `$TMPDIR`) and 35 KB at worst
+//! (names of 255 bytes, a 1024-byte `$TMPDIR`); with 1000-byte prefixes 42 KB,
+//! 36 KB and 14 KB (a `$TMPDIR` of at most 500 bytes). The links' directory is in
+//! `$TMPDIR`'s canonical path, with no symbolic link in it: a link's path is
+//! in its target's, and so in every later round's, and a symbolic link
+//! there would be followed again in each round (0.13.0+backotter.16 to .20:
+//! one halved the depth reached). Symbolic links in the long path's first
+//! prefix count toward the 40 too, once.
+//!
+//! Trust: `$TMPDIR` and each directory above it are trusted, as every user of
+//! `mktemp(3)` trusts them. The links' directory (mode 0700, new) and its
+//! links are this process's alone, but not its name, which each link and
+//! each short path goes through again: whoever could rename an entry of
+//! `$TMPDIR` (its owner, the owner of a directory above it, or anyone where
+//! one of them is writable by others and not sticky) could put a directory
+//! of their own there, whose links a restore run as root would follow. Root's
+//! `$TMPDIR` is root's own (glibc drops an inherited one in setuid sudo and su),
+//! and BackOtter runs rustic-bko with /tmp.
+//!
+//! A link is checked each time it is used (readlink): one that is gone, or
+//! leads elsewhere, is made again, and its directory too (new, mode 0700;
+//! one there must still be this user's alone), so a short path never goes
+//! through a link that isn't there. Without that, a `restore --delete` with
+//! `$TMPDIR` in its destination removed the links as extra entries, and
+//! `create_dir_all` of the next short path then built the rest of the path as
+//! real directories inside `$TMPDIR`, where the files were written and removed
+//! at exit (0.13.0+backotter.16 to 0.14.0+backotter.1: ForkAudit1 G7-01).
+//! A walk of a tree that holds `$TMPDIR` finds the links' directory in it:
+//! `is_short_path_dir` says which entry it is, for a backup to leave out and
+//! a restore to leave alone.
+//!
+//! Where a short path can't be made, `short_path` gives the path as it is,
+//! whose system call then fails as before, and the reason goes once to the
+//! function given to `report_short_path_errors` (walkdir has no logger of
+//! its own); `try_short_path` returns it.
+//!
+//! Only on Linux and Android, where the rest of BackOtter's `rustic_core` is
+//! tested past `PATH_MAX`; elsewhere a path is given back as it is, and a
+//! system call on one too long fails as before.
 
 use std::borrow::Cow;
 use std::io;
@@ -80,16 +81,17 @@ use std::sync::OnceLock;
 
 /// BackOtter: a path to the file at `path` that a system call takes: `path`
 /// itself, unless it has `PATH_MAX` bytes or more, when it is a shorter one
-/// through symbolic links to directories along it (see this module).
+/// through symbolic links to directories along it (see the module).
 ///
 /// Where a link can't be made (no usable temporary directory for the
 /// links, a link refused, a path with no '/' to cut it at: the errors of
 /// [`try_short_path`]), it is `path` as it is, which then fails as before
 /// (`ENAMETOOLONG`), and why goes, the first time, to the function given to
 /// [`report_short_path_errors`]. A path that takes more than 40 links
-/// (about 82 KB with 40-byte names; see this module) gets a short path all
+/// (about 82 KB with 40-byte names; see the module) gets a short path all
 /// the same, which fails with `ELOOP` ("Too many levels of symbolic
 /// links").
+#[must_use]
 pub fn short_path(path: &Path) -> Cow<'_, Path> {
     try_short_path(path).unwrap_or_else(|err| {
         report(&err);
@@ -121,7 +123,7 @@ pub fn try_short_path(path: &Path) -> io::Result<Cow<'_, Path>> {
     imp::shorten(path).map(Cow::Owned)
 }
 
-/// BackOtter: `path` as it is (see this module).
+/// BackOtter: `path` as it is (see the module).
 ///
 /// # Errors
 ///
@@ -132,7 +134,7 @@ pub fn try_short_path(path: &Path) -> io::Result<Cow<'_, Path>> {
 }
 
 /// BackOtter: whether `path` is the directory this process keeps its links
-/// in (see this module): `.bko-longpath-PID-N` in the temporary directory,
+/// in (see the module): `.bko-longpath-PID-N` in the temporary directory,
 /// there once a path of `PATH_MAX` bytes or more was shortened. By device
 /// and inode, so however `path` spells it (relative, or through a symbolic
 /// link). For a walk of a tree that holds the temporary directory: it is no
@@ -188,10 +190,10 @@ mod imp {
     pub(super) const MAX: usize = libc::PATH_MAX as usize;
     /// The longest prefix a link leads to where the links' directory takes
     /// a link's target of this many bytes (tmpfs, btrfs, f2fs, ZFS, ext4 on
-    /// 4 KiB blocks: a page, a block or PATH_MAX).
+    /// 4 KiB blocks: a page, a block or `PATH_MAX`).
     pub(super) const LONG: usize = MAX / 2;
     /// The longest prefix a link leads to where it doesn't: XFS keeps a
-    /// target to 1024 bytes (XFS_SYMLINK_MAXLEN), ext2/3/4 and minix to a
+    /// target to 1024 bytes (`XFS_SYMLINK_MAXLEN`), ext2/3/4 and minix to a
     /// block with its NUL (1023 on 1 KiB blocks, 2047 on 2 KiB blocks: under
     /// LONG, but over SHORT). A component is at most
     /// 255 bytes, so each link still cuts hundreds of bytes off.
@@ -200,7 +202,7 @@ mod imp {
     /// of at most `chunk` bytes: a link's path (it, `/.bko-longpath-PID-N/`,
     /// a number: under 50 bytes more) must be shorter than the shortest
     /// prefix a round cuts, which ends at the last '/' in its first chunk +
-    /// 1 bytes, past chunk - NAME_MAX (255), so that each round shortens the
+    /// 1 bytes, past chunk - `NAME_MAX` (255), so that each round shortens the
     /// path: 1024 bytes for LONG, 500 for SHORT. `make_dir` takes one of up
     /// to LONG's, and `Links::for_process` refuses one past SHORT's where
     /// `probe` chooses SHORT (0.13.0+backotter.19 and .20 refused one past
@@ -239,8 +241,8 @@ mod imp {
     }
 
     /// `err`, saying what failed first.
-    fn failed(what: String, err: io::Error) -> io::Error {
-        io::Error::new(err.kind(), format!("{}: {}", what, err))
+    fn failed(what: &str, err: &io::Error) -> io::Error {
+        io::Error::new(err.kind(), format!("{what}: {err}"))
     }
 
     /// Absolute, for a link to lead to; without doubled slashes or "."
@@ -249,8 +251,9 @@ mod imp {
         Ok(if path.is_absolute() {
             path.components().collect()
         } else {
-            let cwd = std::env::current_dir()
-                .map_err(|err| failed("no current directory for a relative path".into(), err))?;
+            let cwd = std::env::current_dir().map_err(|err| {
+                failed("no current directory for a relative path", &err)
+            })?;
             cwd.join(path).components().collect()
         })
     }
@@ -258,16 +261,15 @@ mod imp {
     pub(super) fn shorten(path: &Path) -> io::Result<PathBuf> {
         let p = absolute(path)?;
         let mut guard = LINKS.lock().unwrap_or_else(PoisonError::into_inner);
-        let links = match guard.take() {
-            Some(links) => links,
-            None => {
-                if let Some((kind, why)) = FAILED.get() {
-                    return Err(io::Error::new(*kind, why.clone()));
-                }
-                Links::for_process().inspect_err(|err| {
-                    let _ = FAILED.set((err.kind(), err.to_string()));
-                })?
+        let links = if let Some(links) = guard.take() {
+            links
+        } else {
+            if let Some((kind, why)) = FAILED.get() {
+                return Err(io::Error::new(*kind, why.clone()));
             }
+            Links::for_process().inspect_err(|err| {
+                let _ = FAILED.set((err.kind(), err.to_string()));
+            })?
         };
         guard.insert(links).shorten(p)
     }
@@ -306,7 +308,10 @@ mod imp {
         }
 
         /// `p` (absolute, as `absolute` spells it) shortened below MAX.
-        pub(super) fn shorten(&mut self, mut p: PathBuf) -> io::Result<PathBuf> {
+        pub(super) fn shorten(
+            &mut self,
+            mut p: PathBuf,
+        ) -> io::Result<PathBuf> {
             while p.as_os_str().as_bytes().len() >= MAX {
                 let b = p.as_os_str().as_bytes();
                 // In bounds: chunk + 1 <= MAX <= the path's length.
@@ -314,8 +319,14 @@ mod imp {
                     .iter()
                     .rposition(|&c| c == b'/')
                     .filter(|&i| i > 0)
-                    .ok_or_else(|| too_long(format!("no '/' to cut a path at in its first {} bytes", self.chunk + 1)))?;
-                let link = self.link_to(Path::new(OsStr::from_bytes(&b[..cut])))?;
+                    .ok_or_else(|| {
+                        too_long(format!(
+                            "no '/' to cut a path at in its first {} bytes",
+                            self.chunk + 1
+                        ))
+                    })?;
+                let link =
+                    self.link_to(Path::new(OsStr::from_bytes(&b[..cut])))?;
                 // Each round must shorten it (a component of thousands of
                 // bytes can't be cut).
                 if link.as_os_str().as_bytes().len() >= cut {
@@ -329,7 +340,7 @@ mod imp {
         /// The link to the directory at `prefix`, made the first time, and
         /// again if it has gone since or leads elsewhere (`remake`): a
         /// path through a link that isn't there would be made, by
-        /// create_dir_all, as real directories in the links' directory.
+        /// `create_dir_all`, as real directories in the links' directory.
         fn link_to(&mut self, prefix: &Path) -> io::Result<PathBuf> {
             if let Some(link) = self.map.get(prefix) {
                 if !std::fs::read_link(link).is_ok_and(|to| to == prefix) {
@@ -338,8 +349,9 @@ mod imp {
                 return Ok(link.clone());
             }
             let link = self.dir.join(self.map.len().to_string());
-            std::os::unix::fs::symlink(prefix, &link)
-                .map_err(|err| failed(format!("no link {} made", link.display()), err))?;
+            std::os::unix::fs::symlink(prefix, &link).map_err(|err| {
+                failed(&format!("no link {} made", link.display()), &err)
+            })?;
             let _ = self.map.insert(prefix.to_path_buf(), link.clone());
             Ok(link)
         }
@@ -357,31 +369,59 @@ mod imp {
             match std::fs::DirBuilder::new().mode(0o700).create(&self.dir) {
                 Ok(()) => {}
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                    let m = std::fs::symlink_metadata(&self.dir)
-                        .map_err(|err| failed(format!("no link {} made again", link.display()), err))?;
+                    let m = std::fs::symlink_metadata(&self.dir).map_err(
+                        |err| {
+                            failed(
+                                &format!(
+                                    "no link {} made again",
+                                    link.display()
+                                ),
+                                &err,
+                            )
+                        },
+                    )?;
                     // SAFETY: geteuid takes nothing and always succeeds.
                     let euid = unsafe { libc::geteuid() };
-                    if !m.is_dir() || m.uid() != euid || m.mode() & 0o077 != 0 {
+                    if !m.is_dir() || m.uid() != euid || m.mode() & 0o077 != 0
+                    {
                         let why = format!(
                             "no link {} made again: {} is no longer a directory of this process's alone",
                             link.display(),
                             self.dir.display()
                         );
-                        return Err(io::Error::new(io::ErrorKind::PermissionDenied, why));
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            why,
+                        ));
                     }
                     // What is in the link's place, if anything.
                     match std::fs::remove_file(link) {
                         Ok(()) => {}
                         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                        Err(err) => return Err(failed(format!("no link {} made again", link.display()), err)),
+                        Err(err) => {
+                            return Err(failed(
+                                &format!(
+                                    "no link {} made again",
+                                    link.display()
+                                ),
+                                &err,
+                            ))
+                        }
                     }
                 }
                 Err(err) => {
-                    return Err(failed(format!("no directory {} made for links again", self.dir.display()), err))
+                    return Err(failed(
+                        &format!(
+                            "no directory {} made for links again",
+                            self.dir.display()
+                        ),
+                        &err,
+                    ))
                 }
             }
-            std::os::unix::fs::symlink(prefix, link)
-                .map_err(|err| failed(format!("no link {} made again", link.display()), err))
+            std::os::unix::fs::symlink(prefix, link).map_err(|err| {
+                failed(&format!("no link {} made again", link.display()), &err)
+            })
         }
     }
 
@@ -406,7 +446,8 @@ mod imp {
         let guard = LINKS.lock().unwrap_or_else(PoisonError::into_inner);
         guard.as_ref().is_some_and(|links| {
             links.dir.file_name() == Some(name)
-                && std::fs::symlink_metadata(&links.dir).is_ok_and(|d| (d.dev(), d.ino()) == (m.dev(), m.ino()))
+                && std::fs::symlink_metadata(&links.dir)
+                    .is_ok_and(|d| (d.dev(), d.ino()) == (m.dev(), m.ino()))
         })
     }
 
@@ -431,11 +472,17 @@ mod imp {
     /// what failed, in which directory.
     pub(super) fn probe(dir: &Path) -> io::Result<usize> {
         let link = dir.join("probe");
-        std::os::unix::fs::symlink(dir, &link)
-            .map_err(|err| failed(format!("no link made in {}", dir.display()), err))?;
+        std::os::unix::fs::symlink(dir, &link).map_err(|err| {
+            failed(&format!("no link made in {}", dir.display()), &err)
+        })?;
         let followed = std::fs::metadata(&link);
         let _ = std::fs::remove_file(&link);
-        let _ = followed.map_err(|err| failed(format!("a link in {} isn't followed", dir.display()), err))?;
+        let _ = followed.map_err(|err| {
+            failed(
+                &format!("a link in {} isn't followed", dir.display()),
+                &err,
+            )
+        })?;
         let target = vec![b'p'; LONG];
         let target = Path::new(OsStr::from_bytes(&target));
         if std::os::unix::fs::symlink(target, &link).is_err() {
@@ -451,18 +498,25 @@ mod imp {
     /// directory, by its canonical path (as it is if it has none): with no
     /// symbolic link in a link's path, which each round would follow again.
     /// Its contents are this process's alone; its name is only as safe as
-    /// the temporary directory, which is trusted (see this module).
+    /// the temporary directory, which is trusted (see the module).
     pub(super) fn make_dir() -> io::Result<PathBuf> {
         use std::os::unix::fs::DirBuilderExt;
 
         let tmp = std::env::temp_dir();
         let tmp = std::fs::canonicalize(&tmp).unwrap_or(tmp);
         if !tmp.is_absolute() {
-            let why = format!("the temporary directory {} isn't absolute", tmp.display());
+            let why = format!(
+                "the temporary directory {} isn't absolute",
+                tmp.display()
+            );
             return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
         }
         if tmp.as_os_str().as_bytes().len() > tmp_max(LONG) {
-            return Err(too_long(format!("the temporary directory {} is over {} bytes", tmp.display(), tmp_max(LONG))));
+            return Err(too_long(format!(
+                "the temporary directory {} is over {} bytes",
+                tmp.display(),
+                tmp_max(LONG)
+            )));
         }
         let pid = std::process::id();
         for n in 0..1000u32 {
@@ -470,7 +524,15 @@ mod imp {
             match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
                 Ok(()) => return Ok(dir),
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(err) => return Err(failed(format!("no directory {} made for links", dir.display()), err)),
+                Err(err) => {
+                    return Err(failed(
+                        &format!(
+                            "no directory {} made for links",
+                            dir.display()
+                        ),
+                        &err,
+                    ))
+                }
             }
         }
         let why = format!("{NAME}{pid}-0 to -999 all in {}", tmp.display());
@@ -478,7 +540,7 @@ mod imp {
     }
 
     /// Removes the links' directory at exit: the links only, never what
-    /// they lead to (remove_dir_all follows no symbolic link).
+    /// they lead to (`remove_dir_all` follows no symbolic link).
     extern "C" fn remove_dir() {
         if let Some(dir) = DIR.get() {
             let _ = std::fs::remove_dir_all(dir);
@@ -512,36 +574,56 @@ mod tests {
     }
 
     /// `deep_tree` with names of `len` bytes.
-    fn deep_tree_of(top: &Path, depth: usize, len: usize) -> (PathBuf, (u64, u64)) {
+    fn deep_tree_of(
+        top: &Path,
+        depth: usize,
+        len: usize,
+    ) -> (PathBuf, (u64, u64)) {
         let c = |s: &[u8]| CString::new(s).unwrap();
         let mut path = top.to_path_buf();
-        // SAFETY: plain system calls on C strings and descriptors this owns.
-        unsafe {
-            let mut fd = libc::open(c(top.as_os_str().as_bytes()).as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
-            assert!(fd >= 0);
-            for i in 0..depth {
-                let name = format!("d{i:03}{}", "x".repeat(len - 4));
-                path.push(&name);
-                let n = c(name.as_bytes());
-                assert_eq!(libc::mkdirat(fd, n.as_ptr(), 0o755), 0);
-                let next = libc::openat(fd, n.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
-                assert!(next >= 0);
-                libc::close(fd);
-                fd = next;
-            }
-            let f = libc::openat(fd, c(b"leaf").as_ptr(), libc::O_WRONLY | libc::O_CREAT, 0o644);
-            assert!(f >= 0);
-            assert_eq!(libc::write(f, b"deep".as_ptr().cast(), 4), 4);
-            libc::close(f);
-            let mut st: libc::stat = std::mem::zeroed();
-            assert_eq!(libc::fstat(fd, &mut st), 0);
-            libc::close(fd);
-            (path, (st.st_dev as u64, st.st_ino as u64))
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY;
+        // SAFETY: a C string.
+        let mut fd = unsafe {
+            libc::open(c(top.as_os_str().as_bytes()).as_ptr(), flags)
+        };
+        assert!(fd >= 0);
+        for i in 0..depth {
+            let name = format!("d{i:03}{}", "x".repeat(len - 4));
+            path.push(&name);
+            let n = c(name.as_bytes());
+            // SAFETY: fd is an open directory, n a C string.
+            assert_eq!(unsafe { libc::mkdirat(fd, n.as_ptr(), 0o755) }, 0);
+            // SAFETY: as above.
+            let next = unsafe { libc::openat(fd, n.as_ptr(), flags) };
+            assert!(next >= 0);
+            // SAFETY: fd is open, and this owns it.
+            unsafe { libc::close(fd) };
+            fd = next;
         }
+        let how = libc::O_WRONLY | libc::O_CREAT;
+        // SAFETY: fd is an open directory, the name a C string.
+        let f = unsafe { libc::openat(fd, c(b"leaf").as_ptr(), how, 0o644) };
+        assert!(f >= 0);
+        // SAFETY: f is open, and the buffer holds 4 bytes.
+        assert_eq!(unsafe { libc::write(f, b"deep".as_ptr().cast(), 4) }, 4);
+        // SAFETY: f is open, and this owns it.
+        unsafe { libc::close(f) };
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: fd is open, st a stat to fill.
+        assert_eq!(unsafe { libc::fstat(fd, st.as_mut_ptr()) }, 0);
+        // SAFETY: fstat filled it.
+        let st = unsafe { st.assume_init() };
+        // SAFETY: fd is open, and this owns it.
+        unsafe { libc::close(fd) };
+        // st_ino is a u32 on 32-bit glibc without _FILE_OFFSET_BITS.
+        #[allow(clippy::unnecessary_cast)]
+        let id = (st.st_dev as u64, st.st_ino as u64);
+        (path, id)
     }
 
     fn top(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("walkdir-longpath-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir()
+            .join(format!("walkdir-longpath-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -588,9 +670,9 @@ mod tests {
         if std::env::var_os(CHILD).is_some() {
             return true;
         }
-        let test = format!("longpath::tests::{}", name);
+        let child_test = format!("longpath::tests::{name}");
         let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+            .args(["--exact", &child_test, "--nocapture", "--test-threads=1"])
             .env(CHILD, "1")
             .env("TMPDIR", tmp)
             .output()
@@ -607,28 +689,38 @@ mod tests {
 
     #[test]
     fn a_link_directory_not_made_is_reported() {
+        static SEEN: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        fn seen(err: &std::io::Error) {
+            assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+            SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
         // No such temporary directory.
-        let missing = std::env::temp_dir().join(format!("walkdir-longpath-missing-{}", std::process::id()));
+        let missing = std::env::temp_dir()
+            .join(format!("walkdir-longpath-missing-{}", std::process::id()));
         if !child("a_link_directory_not_made_is_reported", &missing) {
             return;
         }
         let missing = std::env::temp_dir();
         let long = PathBuf::from(format!("/{}", "d/".repeat(3000)));
         let err = try_short_path(&long).unwrap_err();
-        eprintln!("{}", err);
+        eprintln!("{err}");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-        assert!(err.to_string().contains(&*missing.to_string_lossy()), "{}", err);
+        assert!(
+            err.to_string().contains(&*missing.to_string_lossy()),
+            "{}",
+            err
+        );
         // The same error again, without trying again: not once it is there.
         fs::create_dir(&missing).unwrap();
-        assert_eq!(try_short_path(&long).unwrap_err().to_string(), err.to_string());
+        assert_eq!(
+            try_short_path(&long).unwrap_err().to_string(),
+            err.to_string()
+        );
         assert_eq!(fs::read_dir(&missing).unwrap().count(), 0);
         fs::remove_dir(&missing).unwrap();
         // short_path gives the path as it is, and reports it once.
-        static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        fn seen(err: &std::io::Error) {
-            assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-            SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         report_short_path_errors(seen);
         assert!(matches!(short_path(&long), Cow::Borrowed(p) if p == long));
         assert!(matches!(short_path(&long), Cow::Borrowed(_)));
@@ -644,8 +736,14 @@ mod tests {
             std::os::unix::fs::symlink("real", base.join("tmp")).unwrap();
         }
         let tmp = base.join("tmp");
-        if !child("a_symlink_in_the_temporary_directory_is_followed_once", &tmp) {
-            let _ = std::process::Command::new("rm").arg("-rf").arg(&base).status();
+        if !child(
+            "a_symlink_in_the_temporary_directory_is_followed_once",
+            &tmp,
+        ) {
+            let _ = std::process::Command::new("rm")
+                .arg("-rf")
+                .arg(&base)
+                .status();
             return;
         }
         let tmp = std::env::temp_dir();
@@ -660,7 +758,8 @@ mod tests {
         let short = links.shorten(imp::absolute(&bottom).unwrap()).unwrap();
         let n = check_targets(&dir, imp::SHORT);
         assert!((25..=40).contains(&n), "{} links", n);
-        let m = fs::symlink_metadata(&short).unwrap_or_else(|err| panic!("{} links: {}", n, err));
+        let m = fs::symlink_metadata(&short)
+            .unwrap_or_else(|err| panic!("{} links: {}", n, err));
         assert_eq!((m.dev(), m.ino()), id);
         assert_eq!(fs::read(short.join("leaf")).unwrap(), b"deep");
         assert!(dir.starts_with(&canonical), "{}", dir.display());
@@ -678,8 +777,14 @@ mod tests {
                 tmp.push("t".repeat(100));
             }
             fs::create_dir_all(&tmp).unwrap();
-            assert!(!child("a_long_temporary_directory_serves_the_long_chunk", &tmp));
-            let _ = std::process::Command::new("rm").arg("-rf").arg(&base).status();
+            assert!(!child(
+                "a_long_temporary_directory_serves_the_long_chunk",
+                &tmp
+            ));
+            let _ = std::process::Command::new("rm")
+                .arg("-rf")
+                .arg(&base)
+                .status();
             return;
         }
         let tmp = std::env::temp_dir();
@@ -688,7 +793,11 @@ mod tests {
         let top = top("deep");
         let (bottom, id) = deep_tree(&top, 330);
         let short = try_short_path(&bottom);
-        eprintln!("a {}-byte $TMPDIR; a target of 2048 bytes taken: {}", tmp.as_os_str().len(), long_ok);
+        eprintln!(
+            "a {}-byte $TMPDIR; a target of 2048 bytes taken: {}",
+            tmp.as_os_str().len(),
+            long_ok
+        );
         if long_ok {
             // Links to 2048-byte prefixes, as in .16 to .18.
             let short = short.unwrap();
@@ -702,7 +811,11 @@ mod tests {
             let err = short.unwrap_err();
             assert!(err.to_string().contains("over 500 bytes"), "{}", err);
             let pid = format!(".bko-longpath-{}-", std::process::id());
-            assert!(!fs::read_dir(&tmp).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with(&pid)));
+            assert!(!fs::read_dir(&tmp).unwrap().any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&pid)));
         }
         let _ = std::process::Command::new("rm").arg("-rf").arg(&top).status();
     }
@@ -734,10 +847,14 @@ mod tests {
         assert_eq!(fs::read(short_path(&leaf)).unwrap(), b"deep");
         // A file made through it is where the long path says.
         fs::write(short_path(&bottom.join("new")), b"made").unwrap();
-        assert!(fs::read_dir(&short).unwrap().any(|e| e.unwrap().file_name() == "new"));
+        assert!(fs::read_dir(&short)
+            .unwrap()
+            .any(|e| e.unwrap().file_name() == "new"));
         // The links are in a directory only this user can enter.
         let (links, chunk) = imp::dir().unwrap();
-        assert!(links.starts_with(fs::canonicalize(std::env::temp_dir()).unwrap()));
+        assert!(
+            links.starts_with(fs::canonicalize(std::env::temp_dir()).unwrap())
+        );
         let mode = fs::symlink_metadata(&links).unwrap().mode();
         assert_eq!(mode & 0o777, 0o700);
         // The short chunk where the temporary directory's file system
@@ -765,7 +882,10 @@ mod tests {
         assert!(short.as_os_str().len() < imp::MAX, "{}", short.display());
         let m = fs::symlink_metadata(&short).unwrap();
         assert_eq!((m.dev(), m.ino()), id);
-        assert_eq!(fs::read(short_path(&bottom.join("leaf"))).unwrap(), b"deep");
+        assert_eq!(
+            fs::read(short_path(&bottom.join("leaf"))).unwrap(),
+            b"deep"
+        );
         let (links, chunk) = imp::dir().unwrap();
         let _ = check_targets(&links, chunk);
         let _ = std::process::Command::new("rm").arg("-rf").arg(&top).status();
@@ -789,7 +909,11 @@ mod tests {
         // At least one link per SHORT bytes cut; the same short path again,
         // and no new link for it.
         let n = check_targets(&dir, imp::SHORT);
-        assert!(n * imp::SHORT >= long.as_os_str().len() - imp::MAX, "{} links", n);
+        assert!(
+            n * imp::SHORT >= long.as_os_str().len() - imp::MAX,
+            "{} links",
+            n
+        );
         assert_eq!(links.shorten(long).unwrap(), short);
         assert_eq!(check_targets(&dir, imp::SHORT), n);
         // 255-byte names too: a '/' every 256 bytes.
@@ -809,7 +933,7 @@ mod tests {
     /// tree with the temporary directory in it removed the links'
     /// directory as an extra entry) is made again, its directory too, and
     /// the short path reaches the same file; 0.14.0+backotter.1 gave the
-    /// path through the missing link, which create_dir_all then built as
+    /// path through the missing link, which `create_dir_all` then built as
     /// real directories in the temporary directory.
     #[test]
     fn a_link_that_is_gone_is_made_again() {
@@ -851,10 +975,19 @@ mod tests {
         // A directory in its place that others can enter isn't used.
         fs::remove_dir_all(&dir).unwrap();
         fs::create_dir(&dir).unwrap();
-        fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        fs::set_permissions(
+            &dir,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
         let err = links.shorten(long.clone()).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{}", err);
-        assert!(err.to_string().contains("no longer a directory of this process's alone"), "{}", err);
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        assert!(
+            err.to_string()
+                .contains("no longer a directory of this process's alone"),
+            "{}",
+            err
+        );
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
         // Nor a file there; and no temporary directory at all is an error
         // that names the directory.
@@ -862,13 +995,16 @@ mod tests {
         fs::write(&dir, b"").unwrap();
         assert!(links.shorten(long.clone()).is_err());
         fs::remove_file(&dir).unwrap();
-        let mut gone = imp::Links::with_chunk(top.join("no-such-tmp").join("links"), imp::SHORT);
+        let mut gone = imp::Links::with_chunk(
+            top.join("no-such-tmp").join("links"),
+            imp::SHORT,
+        );
         let _ = fs::create_dir_all(top.join("no-such-tmp").join("links"));
         let short = gone.shorten(long.clone()).unwrap();
         reaches(&short);
         fs::remove_dir_all(top.join("no-such-tmp")).unwrap();
         let err = gone.shorten(long).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{}", err);
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
         assert!(err.to_string().contains("made for links again"), "{}", err);
         let _ = std::process::Command::new("rm").arg("-rf").arg(&top).status();
     }
@@ -881,19 +1017,41 @@ mod tests {
     fn a_directory_without_links_is_an_error() {
         let top = top("nolinks");
         let chunk = imp::probe(&top).unwrap();
-        assert_eq!(chunk, if takes_long_targets() { imp::LONG } else { imp::SHORT });
+        assert_eq!(
+            chunk,
+            if takes_long_targets() { imp::LONG } else { imp::SHORT }
+        );
         assert_eq!(fs::read_dir(&top).unwrap().count(), 0);
         // Not writable: symlink(2) fails with EACCES (not for root, who
         // writes anywhere).
-        fs::set_permissions(&top, std::os::unix::fs::PermissionsExt::from_mode(0o500)).unwrap();
+        fs::set_permissions(
+            &top,
+            std::os::unix::fs::PermissionsExt::from_mode(0o500),
+        )
+        .unwrap();
         // SAFETY: geteuid takes nothing and always succeeds.
         if unsafe { libc::geteuid() } != 0 {
             let err = imp::probe(&top).unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{}", err);
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{err}"
+            );
             let said = err.to_string();
-            assert!(said.starts_with(&format!("no link made in {}: ", top.display())), "{}", said);
+            assert!(
+                said.starts_with(&format!(
+                    "no link made in {}: ",
+                    top.display()
+                )),
+                "{}",
+                said
+            );
         }
-        fs::set_permissions(&top, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        fs::set_permissions(
+            &top,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         fs::remove_dir_all(&top).unwrap();
     }
 
@@ -908,11 +1066,16 @@ mod tests {
         assert!(is_short_path_dir(&links));
         // Through a symbolic link to the temporary directory, and relative.
         let name = links.file_name().unwrap();
-        std::os::unix::fs::symlink(links.parent().unwrap(), top.join("tmp")).unwrap();
+        std::os::unix::fs::symlink(links.parent().unwrap(), top.join("tmp"))
+            .unwrap();
         assert!(is_short_path_dir(&top.join("tmp").join(name)));
         let cwd = std::env::current_dir().unwrap();
         let up = "../".repeat(cwd.components().count());
-        let relative = PathBuf::from(format!("{}{}", up, links.to_str().unwrap().trim_start_matches('/')));
+        let relative = PathBuf::from(format!(
+            "{}{}",
+            up,
+            links.to_str().unwrap().trim_start_matches('/')
+        ));
         assert!(relative.is_relative());
         assert!(is_short_path_dir(&relative));
         // Not its parent, a link in it, one of the same name elsewhere,
@@ -924,6 +1087,27 @@ mod tests {
         let other = links.parent().unwrap().join(".bko-longpath-0-0");
         assert!(!is_short_path_dir(&other));
         assert!(!is_short_path_dir(Path::new("/")));
+        let _ = std::process::Command::new("rm").arg("-rf").arg(&top).status();
+    }
+
+    /// RustAudit1 R8-13: a relative path of `PATH_MAX` bytes or more is
+    /// shortened from the current directory, and reaches the same file.
+    #[test]
+    fn a_relative_long_path_reaches_the_same_file() {
+        let top = top("relative");
+        let (bottom, id) = deep_tree(&top, 120);
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count());
+        let below_root = bottom.to_str().unwrap().trim_start_matches('/');
+        let relative = PathBuf::from(format!("{up}{below_root}"));
+        assert!(relative.is_relative());
+        assert!(relative.as_os_str().len() >= imp::MAX);
+        let short = short_path(&relative);
+        assert!(short.as_os_str().len() < imp::MAX, "{}", short.display());
+        let m = fs::symlink_metadata(&short).unwrap();
+        assert_eq!((m.dev(), m.ino()), id);
+        let leaf = relative.join("leaf");
+        assert_eq!(fs::read(short_path(&leaf)).unwrap(), b"deep");
         let _ = std::process::Command::new("rm").arg("-rf").arg(&top).status();
     }
 

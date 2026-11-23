@@ -1,11 +1,11 @@
-// BackOtter: reading a directory without updating its access time.
-//
-// On Linux a directory opened with O_NOATIME keeps its access time while it
-// is read, which a backup saves and must not change (BackOtter's restic
-// reads directories that way too). std::fs::read_dir has no way to ask for
-// that, so this reads them with open(2), fdopendir(3) and readdir(3). The
-// flag takes owning the directory (or CAP_FOWNER): without it, the
-// directory is opened as std opens it.
+//! BackOtter: reading a directory without updating its access time.
+//!
+//! On Linux a directory opened with `O_NOATIME` keeps its access time while it
+//! is read, which a backup saves and must not change (BackOtter's restic
+//! reads directories that way too). `std::fs::read_dir` has no way to ask for
+//! that, so this reads them with `open(2)`, `fdopendir(3)` and `readdir(3)`. The
+//! flag takes owning the directory (or `CAP_FOWNER`): without it, the
+//! directory is opened as std opens it.
 
 use std::ffi::{CStr, CString, OsStr};
 use std::fmt;
@@ -14,6 +14,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 /// An entry of a directory, as `readdir(3)` gives it.
+#[derive(Debug)]
 pub struct RawEntry {
     /// The directory's path joined with the entry's name.
     pub(crate) path: PathBuf,
@@ -182,6 +183,37 @@ mod tests {
         want.sort();
         assert_eq!(got, want);
         assert!(read_dir(&dir.join("f")).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// RustAudit1 R8-13: listing a directory the user owns leaves its
+    /// access time as it was (`O_NOATIME`), by `read_dir` and by a walk,
+    /// though it is older than the modification time, when `relatime`
+    /// moves it on a read.
+    #[test]
+    fn a_listing_leaves_the_access_time_of_an_owned_directory() {
+        use std::time::{Duration, SystemTime};
+
+        let dir = std::env::temp_dir()
+            .join(format!("walkdir-noatime-atime-{}", std::process::id()));
+        fs::create_dir_all(dir.join("d")).unwrap();
+        fs::write(dir.join("d").join("f"), b"x").unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let atime = |p: &Path| fs::metadata(p).unwrap().accessed().unwrap();
+        for p in [dir.clone(), dir.join("d")] {
+            let times = fs::FileTimes::new().set_accessed(old);
+            fs::File::open(&p).unwrap().set_times(times).unwrap();
+            assert_eq!(atime(&p), old);
+        }
+        assert_eq!(read_dir(&dir).unwrap().count(), 1);
+        assert_eq!(atime(&dir), old);
+        let walked: Vec<_> = crate::WalkDir::new(&dir)
+            .into_iter()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(walked.len(), 3);
+        assert_eq!(atime(&dir), old);
+        assert_eq!(atime(&dir.join("d")), old);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

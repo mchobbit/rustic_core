@@ -3,20 +3,25 @@ walkdir
 
 **BackOtter:** this is walkdir 2.5.0 from crates.io, vendored into
 BackOtter's rustic_core and swapped in for crates.io's through
-`[patch.crates-io]`, with one change: on Linux and Android, directories are
-read with `open(2)` with `O_NOATIME` (`src/noatime.rs`) instead of
-`std::fs::read_dir`, so that a backup leaves their access times as they were,
-as BackOtter's restic does; without permission for `O_NOATIME` (a directory
-the user doesn't own), they are read as before. And on every Unix a
-directory's metadata is taken before it is listed and kept in its entry
-(`DirEntry::keep_metadata`), for `metadata()` to give: where a listing
-moves the access time (no `O_NOATIME`: FreeBSD and the other BSDs,
-illumos, Haiku), a backup keeps the one it had. Each change is marked
-`BackOtter:`. And on Linux and Android a path of `PATH_MAX` bytes or
-more is listed and looked up through a shorter path to it
-(`src/longpath.rs`, `short_path`, which BackOtter's rustic_core uses for its
-own system calls too), so that a walk goes past `PATH_MAX`. Everything else
-is walkdir as released.
+`[patch.crates-io]`, with three changes, each marked `BackOtter:`:
+
+- On Linux and Android, directories are read with `open(2)` with
+  `O_NOATIME` (`src/noatime.rs`) instead of `std::fs::read_dir`, so that a
+  backup leaves their access times as they were, as BackOtter's restic
+  does; without permission for `O_NOATIME` (a directory the user doesn't
+  own), they are read as before.
+- On every Unix a directory's metadata is taken before it is listed and
+  kept in its entry (`DirEntry::keep_metadata`), for `metadata()` to give:
+  where a listing moves the access time (no `O_NOATIME`: FreeBSD and the
+  other BSDs, illumos, Haiku), a backup keeps the one it had.
+- On Linux and Android a path of `PATH_MAX` bytes or more is listed and
+  looked up through a shorter path to it (`src/longpath.rs`: `short_path`,
+  `try_short_path`, `report_short_path_errors` and `is_short_path_dir`,
+  which BackOtter's rustic_core uses for its own system calls too), so that
+  a walk goes past `PATH_MAX`.
+
+Everything else is walkdir as released.
+
 A cross platform Rust library for efficiently walking a directory recursively.
 Comes with support for following symbolic links, controlling the number of
 open file descriptors and efficient mechanisms for pruning the entries in the

@@ -40,7 +40,7 @@ version = "1.0.1"
 version = "0.3"
 
 # BackOtter: for reading directories without updating their access time
-# (src/noatime.rs).
+# (src/noatime.rs), and for PATH_MAX, atexit and geteuid in src/longpath.rs.
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies.libc]
 version = "0.2.155"
 

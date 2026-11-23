@@ -129,11 +129,16 @@ pub use crate::dent::DirEntry;
 pub use crate::dent::DirEntryExt;
 pub use crate::error::Error;
 // BackOtter: paths past PATH_MAX (longpath.rs).
-pub use crate::longpath::{is_short_path_dir, report_short_path_errors, short_path, try_short_path};
+pub use crate::longpath::{
+    is_short_path_dir, report_short_path_errors, short_path, try_short_path,
+};
 
 mod dent;
 mod error;
+// BackOtter: paths past PATH_MAX (ours).
 mod longpath;
+// BackOtter: directories read without moving their access time (ours),
+// in place of std's read_dir and ReadDir above.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod noatime;
 #[cfg(any(target_os = "linux", target_os = "android"))]

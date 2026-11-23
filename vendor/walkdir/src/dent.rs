@@ -52,9 +52,10 @@ pub struct DirEntry {
     /// (`DirEntry::keep_metadata`): listing a directory moves its access
     /// time where it can't be opened with `O_NOATIME` (every Unix but Linux,
     /// and Linux for a directory the user doesn't own), and a backup keeps
-    /// the access time it had.
+    /// the access time it had. Boxed: only directories have one, and an
+    /// entry is moved about (sorted, kept in a stack) more than it is read.
     #[cfg(unix)]
-    listed_metadata: Option<fs::Metadata>,
+    listed_metadata: Option<Box<fs::Metadata>>,
     /// The underlying metadata (Windows only). We store this on Windows
     /// because this comes for free while reading a directory.
     ///
@@ -149,7 +150,7 @@ impl DirEntry {
         // BackOtter: a directory's metadata from before it was listed.
         #[cfg(unix)]
         if let Some(md) = &self.listed_metadata {
-            return Ok(md.clone());
+            return Ok(fs::Metadata::clone(md));
         }
         // BackOtter: through a short path past PATH_MAX.
         let path = crate::short_path(&self.path);
@@ -198,14 +199,17 @@ impl DirEntry {
     /// BackOtter: takes the metadata of this entry, a directory about to be
     /// listed, for [`DirEntry::metadata`] to give from now on: the listing
     /// moves the directory's access time where it isn't read with
-    /// `O_NOATIME` (FreeBSD and every other Unix but Linux), and a backup
-    /// keeps the one it had, as BackOtter's restic, which takes a
+    /// `O_NOATIME` (FreeBSD and every other Unix but Linux, and Linux and
+    /// Android for a directory the user doesn't own: `noatime.rs`), and a
+    /// backup keeps the one it had, as BackOtter's restic, which takes a
     /// directory's lstat before listing it. If it can't be taken, the
     /// metadata is looked up when asked for, as before.
     #[cfg(unix)]
     pub(crate) fn keep_metadata(&mut self) {
+        // None first: metadata_internal would give a kept one back, and
+        // this takes it anew.
         self.listed_metadata = None;
-        self.listed_metadata = self.metadata_internal().ok();
+        self.listed_metadata = self.metadata_internal().ok().map(Box::new);
     }
 
     #[cfg(windows)]
