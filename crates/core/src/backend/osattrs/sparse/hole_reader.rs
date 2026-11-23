@@ -391,7 +391,7 @@ pub(super) mod tests {
                 assert_eq!(read_all(&mut r, sizes), want, "{name}");
                 assert_eq!(r.zeros, holes, "{name}");
             }
-            assert_eq!(chunks(HoleReader::new(f.clone())), chunks(&want[..]), "{name}");
+            assert_eq!(chunks(HoleReader::new(f)), chunks(&want[..]), "{name}");
         }
     }
 

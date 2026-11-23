@@ -2303,7 +2303,7 @@ mod tests {
         keep_unread(Path::new("/q"), &mut node);
         assert_eq!(node.content, Some(Vec::new()));
         assert_eq!(node.meta.size, 0);
-        assert!(node.meta.extended_attributes.is_empty());
+        assert_eq!(node.meta.extended_attributes, []);
         assert_eq!(unread_size(&node), Some(12));
         assert_eq!(node.meta.mode, Some(0o644));
         assert_eq!(node.meta.inode, 7);

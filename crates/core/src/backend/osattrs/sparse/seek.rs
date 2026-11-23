@@ -425,7 +425,11 @@ pub(super) mod tests {
                     let mut max = 64 * M;
                     while !stop.load(Ordering::Relaxed) {
                         match rand() % 10 {
-                            0 => f.set_len(rand() % (96 * M)).unwrap(),
+                            0 => {
+                                let len = rand() % (96 * M);
+                                max = max.max(len);
+                                f.set_len(len).unwrap();
+                            }
                             1 => {
                                 let len = rand() % (32 * M) + 64 * M;
                                 max = max.max(len);
