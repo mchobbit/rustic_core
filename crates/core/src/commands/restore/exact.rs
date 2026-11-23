@@ -142,7 +142,9 @@ impl From<CloneFailed> for io::Error {
 /// Opens the regular file at `path` for reading, following no symlink and
 /// not waiting on a FIFO (`O_NONBLOCK`: BackOtter's rule S11), and checks
 /// with `fstat` that it is one. It is only cloned from, never read.
-fn open_regular(path: &Path) -> io::Result<(std::fs::File, std::fs::Metadata)> {
+/// BackOtter: `path` may be a short path to it past `PATH_MAX`; the error
+/// names `shown`, the file's own path.
+fn open_regular(path: &Path, shown: &Path) -> io::Result<(std::fs::File, std::fs::Metadata)> {
     let mut how = std::fs::OpenOptions::new();
     _ = how.read(true);
     #[cfg(unix)]
@@ -153,7 +155,7 @@ fn open_regular(path: &Path) -> io::Result<(std::fs::File, std::fs::Metadata)> {
     let f = how.open(path)?;
     let m = f.metadata()?;
     if !m.is_file() {
-        return Err(io::Error::other(format!("{} isn't a regular file", path.display())));
+        return Err(io::Error::other(format!("{} isn't a regular file", shown.display())));
     }
     Ok((f, m))
 }
@@ -241,7 +243,7 @@ pub(super) fn clone_file(src: &Path, dst: &Path, size: u64) -> Result<(), CloneF
             "reflinks not supported on this system",
         )));
     }
-    let (s, m) = open_regular(src_sys).map_err(CloneFailed::Failed)?;
+    let (s, m) = open_regular(src_sys, src).map_err(CloneFailed::Failed)?;
     if m.len() != size {
         return Err(CloneFailed::Failed(io::Error::other(format!(
             "{} isn't {size} bytes",
@@ -283,7 +285,7 @@ fn break_link_with(
     // BackOtter: waits for the exit once XFS options are put back for it.
     let _making = super::making_entries();
     if CLONE_SUPPORTED {
-        match open_regular(sys)
+        match open_regular(sys, path)
             .map_err(CloneFailed::Failed)
             .and_then(|(f, _)| clone_over(&f, sys).map_err(|failed| failed.beside(path)))
         {
@@ -680,10 +682,13 @@ mod tests {
         std::fs::write(&f, b"x").unwrap();
         std::os::unix::fs::symlink(&f, &l).unwrap();
         nix::unistd::mkfifo(&p, nix::sys::stat::Mode::S_IRWXU).unwrap();
-        assert!(open_regular(&f).is_ok());
-        assert!(open_regular(&l).is_err());
-        assert!(open_regular(&p).is_err(), "a FIFO is no clone source");
-        assert!(open_regular(dir.path()).is_err());
+        assert!(open_regular(&f, &f).is_ok());
+        assert!(open_regular(&l, &l).is_err());
+        assert!(open_regular(&p, &p).is_err(), "a FIFO is no clone source");
+        assert!(open_regular(dir.path(), dir.path()).is_err());
+        // The error names the path it is given to name, not the one opened.
+        let err = open_regular(dir.path(), Path::new("long/x")).unwrap_err();
+        assert_eq!(err.to_string(), "long/x isn't a regular file");
         for src in [&l, &p] {
             assert!(clone_file(src, &dir.path().join("dst"), 1).is_err());
         }
