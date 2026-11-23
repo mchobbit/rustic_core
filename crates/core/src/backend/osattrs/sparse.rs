@@ -487,7 +487,7 @@ mod tests {
 
     use super::*;
 
-    /// A file with holes that SEEK_HOLE finds, here (a file system that
+    /// A file with holes that `SEEK_HOLE` finds, here (a file system that
     /// keeps holes), or `None`.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn sparse_file(dir: &Path, name: &str, len: u64) -> Option<std::path::PathBuf> {

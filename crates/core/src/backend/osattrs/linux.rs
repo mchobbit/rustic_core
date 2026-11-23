@@ -327,6 +327,7 @@ const fn wanted_flags(current: u32, flags: u32) -> u32 {
     (current & !KEPT_LATE) | (flags & KEPT_LATE)
 }
 
+#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
 pub(super) fn file_flags(
     path: &Path,
     _typ: &NodeType,
@@ -1057,6 +1058,7 @@ fn prepare_dir_with(
 }
 
 /// The numeric owner the restore gives is all there is.
+#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
 pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
@@ -1158,10 +1160,12 @@ pub(super) fn prepare_dir_for_options(path: &Path, node: &Node, known_bko: bool)
     }
 }
 
+#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
 pub(super) fn restore_acls(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::unnecessary_wraps, reason = "the signature every system's module has")]
 pub(super) fn restore_symlink_mode(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
