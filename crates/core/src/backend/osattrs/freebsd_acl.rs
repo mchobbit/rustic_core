@@ -75,8 +75,6 @@ pub(super) struct Os {
     pub pc_acl_extended: i32,
     /// `_PC_ACL_NFS4`: whether it has NFSv4 ACLs.
     pub pc_acl_nfs4: i32,
-    /// Whether a symlink has ACLs of its own.
-    pub symlink_acls: bool,
 }
 
 #[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
@@ -87,7 +85,6 @@ pub(super) const FREEBSD: Os = Os {
     system_extattrs: FREEBSD_SYSTEM_EXTATTRS,
     pc_acl_extended: 59,
     pc_acl_nfs4: 64,
-    symlink_acls: false,
 };
 
 #[cfg_attr(not(target_os = "netbsd"), allow(dead_code))]
@@ -98,8 +95,6 @@ pub(super) const NETBSD: Os = Os {
     system_extattrs: NETBSD_SYSTEM_EXTATTRS,
     pc_acl_extended: 14,
     pc_acl_nfs4: 17,
-    // `setfacl -h` gives a symlink its own on FFSv2ea.
-    symlink_acls: true,
 };
 
 /// The types of ACL (`acl_type_t`).

@@ -331,10 +331,11 @@ fn fill_system_extattrs(path: &Path, node: &mut Node) -> io::Result<()> {
         .map_err(io::Error::other)
 }
 
+/// Records the ACLs of the file at `path` in `node`, a symlink's own too:
+/// both systems give a symlink ACLs (`setfacl -h`), and on UFS mounted
+/// `acls` one made in a directory with a default ACL inherits an access
+/// ACL (`ufs_makeinode`), as a file does.
 fn fill_acls(path: &Path, node: &mut Node) -> io::Result<()> {
-    if node.is_symlink() && !sys::OS.symlink_acls {
-        return Ok(());
-    }
     let attrs = &mut node.meta.generic_attributes;
     let mut keep = |typ| match get_acl(path, typ) {
         Ok(acl) => freebsd_acl::keep_acl(sys::OS, attrs, typ, &acl).map_err(io::Error::other),
@@ -380,18 +381,15 @@ pub(super) fn restore_system_extattrs(path: &Path, node: &Node) -> io::Result<()
     first_err.map_or(Ok(()), Err)
 }
 
-/// Restores the ACLs. If a POSIX.1e access ACL can't be set, the mode
-/// restored before it has the ACL's mask in its group bits, which would give
-/// the owning group all that named users and groups had; they are narrowed
-/// to the group's own access.
+/// Restores the ACLs, a symlink's own too. If a POSIX.1e access ACL can't
+/// be set, the mode restored before it has the ACL's mask in its group bits,
+/// which would give the owning group all that named users and groups had;
+/// they are narrowed to the group's own access.
 ///
 /// # Errors
 ///
 /// * If an ACL couldn't be set: the first error.
 pub(super) fn restore_acls(path: &Path, node: &Node) -> io::Result<()> {
-    if node.is_symlink() && !sys::OS.symlink_acls {
-        return Ok(());
-    }
     let mut first_err = None;
     let mut restore = |typ: AclType, failed: &dyn Fn(&[AclEntry]) -> io::Result<()>| {
         let name = sys::OS.attribute(typ);
@@ -415,7 +413,7 @@ pub(super) fn restore_acls(path: &Path, node: &Node) -> io::Result<()> {
         let p = c_path(path)?;
         let mode = libc::mode_t::try_from(mode).map_err(io::Error::other)?;
         // SAFETY: p is a C string. Without following a symlink, which can
-        // have an ACL on NetBSD.
+        // have an ACL of its own.
         _ = check(unsafe {
             libc::fchmodat(libc::AT_FDCWD, p.as_ptr(), mode, libc::AT_SYMLINK_NOFOLLOW)
         })
@@ -442,6 +440,89 @@ mod tests {
             assert!(!no_acls(&err(code)) && unsupported(&err(code)), "{code}");
         }
         assert!(!no_acls(&err(libc::EIO)) && !unsupported(&err(libc::EIO)));
+    }
+
+    /// A directory for a test that sets ACLs, and the type of ACL its file
+    /// system has (`TMPDIR`'s: UFS mounted `acls` or FFSv2ea mounted
+    /// `posix1eacls` for POSIX.1e, ZFS for NFSv4). `None`, and a line on
+    /// stderr, where it has none: the test then tests nothing.
+    fn acl_dir(test: &str) -> Option<(tempfile::TempDir, AclType)> {
+        let dir = tempfile::tempdir().unwrap();
+        let typ = if path_conf(dir.path(), sys::OS.pc_acl_nfs4).ok() == Some(1) {
+            AclType::Nfs4
+        } else if path_conf(dir.path(), sys::OS.pc_acl_extended).ok() == Some(1) {
+            AclType::Access
+        } else {
+            eprintln!("{test}: no ACLs on {}: nothing tested", dir.path().display());
+            return None;
+        };
+        Some((dir, typ))
+    }
+
+    /// An ACL of type `typ` that gives user 4242 read access on top of
+    /// `mode`: more than the mode says.
+    fn acl_with_a_user(typ: AclType, mode: u32) -> Vec<AclEntry> {
+        let entry = |tag, id, perm, entry_type| AclEntry { tag, id, perm, entry_type, flags: 0 };
+        if typ == AclType::Nfs4 {
+            // user:4242:r-----:allow, ahead of the mode's own entries.
+            let mut acl = vec![entry(0x02, 4242, 0x08, 0x0100)];
+            acl.extend(freebsd_acl::nfs4_trivial_acl(mode));
+            acl
+        } else {
+            let none = freebsd_acl::UNDEFINED_ID;
+            vec![
+                entry(freebsd_acl::USER_OBJ, none, mode >> 6 & 7, 0),
+                entry(0x02, 4242, 4, 0),
+                entry(freebsd_acl::GROUP_OBJ, none, mode >> 3 & 7, 0),
+                entry(freebsd_acl::MASK, none, 7, 0),
+                entry(0x20, none, mode & 7, 0),
+            ]
+        }
+    }
+
+    fn node_of(name: &str, typ: NodeType, mode: u32) -> Node {
+        let meta = crate::backend::node::Metadata { mode: Some(mode), ..Default::default() };
+        Node::new_node(std::ffi::OsStr::new(name), typ, meta)
+    }
+
+    fn symlink_node() -> Node {
+        let typ = NodeType::from_link(Path::new("target"));
+        node_of("link", typ, 0o755)
+    }
+
+    /// A symlink's own ACL is recorded and set on another symlink, on
+    /// FreeBSD as on NetBSD (G4-02), without a look at what it points to.
+    #[test]
+    fn symlink_acls_are_kept_and_restored() {
+        let Some((dir, typ)) = acl_dir("symlink_acls_are_kept_and_restored") else {
+            return;
+        };
+        let (target, link, restored) =
+            (dir.path().join("target"), dir.path().join("link"), dir.path().join("restored"));
+        std::fs::write(&target, "x").unwrap();
+        std::os::unix::fs::symlink("target", &link).unwrap();
+        std::os::unix::fs::symlink("target", &restored).unwrap();
+        let acl = acl_with_a_user(typ, 0o755);
+        set_acl(&link, typ, &acl).unwrap();
+        let of_target = get_acl(&target, typ).unwrap();
+        assert_ne!(of_target, acl, "the ACL went to the symlink's target");
+
+        let mut node = symlink_node();
+        fill_acls(&link, &mut node).unwrap();
+        let kept = node.meta.generic_attributes.get::<Vec<AclEntry>>(sys::OS.attribute(typ));
+        assert_eq!(kept.map(Result::unwrap), Some(acl.clone()), "the symlink's ACL not kept");
+
+        restore_acls(&restored, &node).unwrap();
+        assert_eq!(get_acl(&restored, typ).unwrap(), acl);
+        assert_eq!(get_acl(&target, typ).unwrap(), of_target);
+
+        // A symlink without an ACL of its own gets no attribute.
+        let bare = dir.path().join("bare");
+        std::os::unix::fs::symlink("target", &bare).unwrap();
+        let mut plain = symlink_node();
+        fill_acls(&bare, &mut plain).unwrap();
+        let kept = plain.meta.generic_attributes.get::<Vec<AclEntry>>(sys::OS.attribute(typ));
+        assert!(kept.is_none(), "a symlink without an ACL got one: {kept:?}");
     }
 
     #[test]

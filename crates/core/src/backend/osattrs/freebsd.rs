@@ -280,7 +280,7 @@ pub(super) fn clear_restricting_flags(path: &Path) -> io::Result<()> {
         .map_err(|err| path_error("lchflags", path, &err))
 }
 
-/// Restores the ACLs (FreeBSD has none on symlinks).
+/// Restores the ACLs, a symlink's too.
 pub(super) fn restore_acls(path: &Path, node: &Node) -> io::Result<()> {
     freebsd_netbsd::restore_acls(path, node)
 }

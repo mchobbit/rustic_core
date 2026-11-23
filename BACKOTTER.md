@@ -44,7 +44,13 @@ that either program restores what the other backed up.
     (UFS) no flags get no attribute, and `uarch` alone, which only
     `chflags(1)` sets there, is kept.
   - `freebsd.acl_access`, `freebsd.acl_default`: POSIX.1e ACLs (UFS mounted
-    `acls`), access and directories' default.
+    `acls`), access and directories' default. A symlink's own ACL is kept
+    and restored too (`setfacl -h`; on UFS a symlink made in a directory
+    with a default ACL inherits one, and ZFS takes an NFSv4 one), read and
+    set without following it (`__acl_get_link`, `__acl_set_link`), since
+    0.14.0+backotter.2: until then FreeBSD's symlinks were taken to have
+    none, and a snapshot made before has none for them, as BackOtter's
+    restic's have none (a restore of one gives a symlink no ACL).
   - `freebsd.acl_nfs4`: NFSv4 ACLs (ZFS, UFS mounted `nfsv4acls`). An ACL
     the backup may not read (`EACCES`, `EPERM`: an NFSv4 ACL that denies
     the user `read_acl`) is warned about ("ignoring attributes of ...") and
@@ -132,8 +138,8 @@ that either program restores what the other backed up.
     and by the same rules (NetBSD took FreeBSD's ACL code), on FFSv2ea
     (`newfs -O 2ea`) mounted with `posix1eacls` or `nfs4acls`; plain FFSv2
     has neither ACLs nor extended attributes, and gets none, quietly.
-    Unlike FreeBSD, NetBSD gives symlinks ACLs of their own, which are kept
-    and restored. The ACL system calls go by their numbers
+    As on FreeBSD, symlinks have ACLs of their own, which are kept and
+    restored. The ACL system calls go by their numbers
     (`__acl_get_link` 487, `__acl_set_link` 488, `lpathconf` 499), and
     NetBSD's `pathconf(2)` names are its own (`_PC_ACL_EXTENDED` 14,
     `_PC_ACL_NFS4` 17, where FreeBSD has 59 and 64); the rest is one module,
