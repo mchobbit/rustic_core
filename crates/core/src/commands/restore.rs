@@ -497,6 +497,7 @@ pub(crate) fn restore_repository<S: IndexedTree>(
         without_sockets(node_streamer),
         &file_infos.hardlink_candidates,
         &file_infos.unbroken,
+        &failed,
         file_infos.dirs,
         opts,
         dest,
@@ -505,12 +506,12 @@ pub(crate) fn restore_repository<S: IndexedTree>(
 
     // BackOtter: files whose contents couldn't be written fail the restore,
     // as in BackOtter's restic (exit 1), once everything else is restored.
-    if failed > 0 {
+    if !failed.is_empty() {
         return Err(RusticError::new(
             ErrorKind::InputOutput,
             "The contents of `{count}` files could not be restored; see the errors above.",
         )
-        .attach_context("count", failed.to_string()));
+        .attach_context("count", failed.len().to_string()));
     }
 
     Ok(RestoreOutcome { errors })
@@ -1272,6 +1273,7 @@ fn restore_metadata(
     mut node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
     hardlink_candidates: &BTreeMap<HardlinkKey, PathBuf>,
     unbroken: &BTreeSet<PathBuf>,
+    contents_failed: &BTreeSet<PathBuf>,
     mut dirs: DirChanges,
     opts: RestoreOptions,
     dest: &LocalDestination,
@@ -1328,7 +1330,16 @@ fn restore_metadata(
                     osattrs::clear_restricting_flags(&target);
                 }
             }
-            if set_metadata(dest, opts, path, node, create, tally) {
+            // BackOtter: a file whose contents couldn't be restored, by
+            // any of its names (a hard link's later names aren't in the
+            // plan: their first name is), gets no times (set_metadata).
+            let failed = !contents_failed.is_empty()
+                && node.is_file()
+                && (contents_failed.contains(path)
+                    || hardlink_key(node)
+                        .and_then(|key| hardlink_candidates.get(&key))
+                        .is_some_and(|first| contents_failed.contains(first)));
+            if set_metadata(dest, opts, path, node, create, failed, tally) {
                 LateAttrs {
                     flags: osattrs::file_flags(node),
                     dos_flags: osattrs::zfs_dos_flags(node),
@@ -1658,6 +1669,13 @@ fn hardlink_key(node: &Node) -> Option<HardlinkKey> {
 /// which then gets nothing else, as in BackOtter's restic: one warning for
 /// it (restic reports an error), not one more for each step after. Each
 /// failure BackOtter's restic counts as an error is counted in `tally`.
+///
+/// BackOtter: a file whose contents couldn't be restored
+/// (`contents_failed`, which the restore's error is for) gets everything
+/// but its times, the birth time too (FreeBSD and NetBSD set it as an
+/// mtime): with the snapshot's size and mtime the next restore would take
+/// it for restored (`RestorePlan::match_file`), leave the wrong contents
+/// and report nothing. With another mtime the next restore writes it.
 // TODO: Return a result here, introduce errors and get rid of logging.
 fn set_metadata(
     dest: &LocalDestination,
@@ -1665,6 +1683,7 @@ fn set_metadata(
     path: &PathBuf,
     node: &Node,
     create: bool,
+    contents_failed: bool,
     tally: &mut RestoreTally,
 ) -> bool {
     debug!("setting metadata for {}", path.display());
@@ -1751,6 +1770,13 @@ fn set_metadata(
         set_attributes(tally);
     }
     osattrs::restore_acls(&target, node).unwrap_or_else(|err| tally.io(path, &err, true));
+    if contents_failed {
+        debug!(
+            "restore {}: times not set, its contents were not restored",
+            path.display()
+        );
+        return true;
+    }
     // BackOtter: the birth time just before the times, which on FreeBSD and
     // NetBSD replace the earlier mtime it is set as.
     osattrs::restore_birthtime(&target, node).unwrap_or_else(|err| {
@@ -1870,10 +1896,10 @@ impl PackInfo {
 ///
 /// # Returns
 ///
-/// BackOtter: the number of files whose contents couldn't be written (one
-/// that can't be opened for writing, say), each reported once, with an
-/// error, and left as they are; stock rustic stopped at the first, or
-/// panicked.
+/// BackOtter: the files whose contents couldn't be written (one that can't
+/// be opened for writing, say), by their paths in the snapshot, each
+/// reported once, with an error, and left as they are; stock rustic stopped
+/// at the first, or panicked.
 #[allow(clippy::too_many_lines)]
 fn restore_contents<S: Open>(
     repo: &Repository<S>,
@@ -1883,7 +1909,7 @@ fn restore_contents<S: Open>(
     sparse: &[bool],
     restore_info: RestoreInfo,
     restore_size: u64,
-) -> RusticResult<usize> {
+) -> RusticResult<BTreeSet<PathBuf>> {
     let be = repo.dbe();
 
     // BackOtter: fewer readers on a small machine (see the constants).
@@ -2068,7 +2094,8 @@ fn restore_contents<S: Open>(
     p.finish();
 
     // BackOtter: closes what is left open (nothing, once every write ran).
-    Ok(writer.finish())
+    let failed = writer.finish();
+    Ok(failed.into_iter().map(|i| filenames[i].clone()).collect())
 }
 
 /// BackOtter: the existing directories whose XFS options came off before the
@@ -2908,6 +2935,41 @@ mod tests {
         assert!(fills_holes(bko.sparse(SparseRestore::No), &plain));
         assert!(!fills_holes(RestoreOptions::default(), &plain));
         assert!(!fills_holes(RestoreOptions::default().origin(SnapshotOrigin::Restic), &plain));
+    }
+
+    /// ForkAudit1 G6-01: a file whose contents couldn't be restored gets
+    /// its metadata but for its times, so that the next restore, which
+    /// trusts a size and an mtime that match, writes it; any other file
+    /// gets the node's times.
+    #[cfg(unix)]
+    #[test]
+    fn contents_failed_sets_no_times() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = LocalDestination::new(dir.path().to_str().unwrap(), true, false).unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "old").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut node = Node::new_node(
+            "f".as_ref(),
+            NodeType::File,
+            crate::backend::node::Metadata::default(),
+        );
+        node.meta.mode = Some(0o640);
+        node.meta.mtime = Some(Timestamp::from_second(1_600_000_000).unwrap());
+        let opts = RestoreOptions::default().no_ownership(true);
+        let path = PathBuf::from("f");
+        let mut tally = RestoreTally::new();
+        let stat = || std::fs::metadata(&file).unwrap();
+
+        assert!(set_metadata(&dest, opts, &path, &node, false, true, &mut tally));
+        assert_eq!(stat().mode() & 0o7777, 0o640, "the rest of its metadata is set");
+        assert_ne!(stat().mtime(), 1_600_000_000);
+
+        assert!(set_metadata(&dest, opts, &path, &node, false, false, &mut tally));
+        assert_eq!(stat().mtime(), 1_600_000_000);
+        assert_eq!(tally.errors, 0);
     }
 
     /// A destination is fresh when it doesn't exist, or holds only what a

@@ -285,14 +285,18 @@ impl<'a> FilesWriter<'a> {
     }
 
     /// Closes the handles left (none, unless a pack wasn't read) and gives
-    /// the number of files that couldn't be written.
-    pub(super) fn finish(self) -> usize {
+    /// the files that couldn't be written, by index: the restore's error
+    /// counts them, and its metadata pass leaves them without the
+    /// snapshot's times.
+    pub(super) fn finish(self) -> BTreeSet<usize> {
         debug!(
             "restore: {} files sized, {} handles opened again after their eviction",
             self.sized.load(Ordering::Relaxed),
             self.reopened.load(Ordering::Relaxed)
         );
-        lock(&self.failed).len()
+        self.failed
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -440,7 +444,7 @@ mod tests {
                 (0, _) => assert!(reopened > 0, "{threads} threads"),
                 _ => eprintln!("max_idle {max_idle}, {threads} threads: {reopened} reopened"),
             }
-            assert_eq!(writer.finish(), 0);
+            assert_eq!(writer.finish(), BTreeSet::new());
             check(dir.path(), &contents);
         }
     }
@@ -470,7 +474,7 @@ mod tests {
         assert_eq!(writer.sized.load(Ordering::Relaxed), FILES);
         assert_eq!(writer.reopened.load(Ordering::Relaxed), 0);
         assert_eq!(writer.open(), 0, "handles left open");
-        assert_eq!(writer.finish(), 0);
+        assert_eq!(writer.finish(), BTreeSet::new());
         check(dir.path(), &contents);
     }
 
@@ -494,7 +498,8 @@ mod tests {
         write_all(&writer, &blobs, 4);
         assert_eq!(writer.open(), 0, "handles left open");
         assert_eq!(writer.sized.load(Ordering::Relaxed), FILES - 1);
-        assert_eq!(writer.finish(), 1);
+        // The one that failed, by index, for the metadata pass.
+        assert_eq!(writer.finish(), BTreeSet::from([2]));
         assert!(dir.path().join(&names[2]).is_dir());
         for i in [0, 1, 3] {
             assert_eq!(fs::read(dir.path().join(&names[i])).unwrap(), contents[i]);
@@ -560,7 +565,7 @@ mod tests {
         assert!(most <= 2 * THREADS + MAX_IDLE, "{most} open");
         assert_eq!(fds_under(&root), 0, "files left open");
         assert_eq!(writer.open(), 0);
-        assert_eq!(writer.finish(), 0);
+        assert_eq!(writer.finish(), BTreeSet::new());
         check(&root, &contents);
     }
 
@@ -605,7 +610,7 @@ mod tests {
         write_all(&writer, &rest, 4);
         assert_eq!(writer.open(), 0, "handles left open");
         assert_eq!(writer.sized.load(Ordering::Relaxed), contents.len());
-        assert_eq!(writer.finish(), 0);
+        assert_eq!(writer.finish(), BTreeSet::new());
         check(dir.path(), &contents);
         for name in &names {
             let f = File::open(dir.path().join(name)).unwrap();

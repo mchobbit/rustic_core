@@ -1271,6 +1271,64 @@ fn test_restore_existing_file_gone_is_no_panic(set_up_repo: Result<RepoOpen>) ->
     Ok(())
 }
 
+/// BackOtter (ForkAudit1 G6-01): a file whose contents couldn't be restored
+/// (it is there with the snapshot's size and other contents, and can't be
+/// opened for writing) doesn't get the snapshot's mtime, nor does another
+/// name of it (a hard link): the restore fails, and the next one, with the
+/// same options, which trusts a size and an mtime that match, writes the
+/// file once it can. With the snapshot's mtime the next restore left the
+/// wrong contents and reported nothing. Not as root, who may write it.
+#[rstest]
+#[cfg(not(windows))]
+fn test_restore_failed_contents_get_no_mtime(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if nix::unistd::geteuid().is_root() {
+        return Ok(());
+    }
+    let source = tempdir()?;
+    let s = source.path();
+    let data = noise(300_000, 5);
+    fs::write(s.join("f"), &data)?;
+    fs::write(s.join("l"), &data[..1000])?;
+    fs::hard_link(s.join("l"), s.join("l2"))?;
+    fs::write(s.join("z"), "z")?;
+    let old = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+    for name in ["f", "l", "z"] {
+        filetime::set_file_mtime(s.join(name), old)?;
+    }
+    let repo = backed_up(set_up_repo?, s)?;
+    let target = tempdir()?;
+    let t = target.path().join("test");
+    fs::create_dir(&t)?;
+    for (name, len) in [("f", data.len()), ("l", 1000)] {
+        fs::write(t.join(name), vec![0x5a; len])?;
+        fs::set_permissions(t.join(name), fs::Permissions::from_mode(0o444))?;
+    }
+    let mtime = |name: &str| fs::metadata(t.join(name)).map(|m| m.mtime());
+
+    let err = restore_to(&repo, target.path(), RestoreOptions::default())
+        .expect_err("the contents of f and l not restored");
+    assert!(err.to_string().contains("could not be restored"), "{err}");
+    // The rest is restored, metadata and all.
+    assert_eq!(fs::read_to_string(t.join("z"))?, "z");
+    assert_eq!(mtime("z")?, old.unix_seconds());
+    let after_first = [mtime("f")?, mtime("l")?, mtime("l2")?];
+
+    for name in ["f", "l"] {
+        fs::set_permissions(t.join(name), fs::Permissions::from_mode(0o644))?;
+    }
+    restore_to(&repo, target.path(), RestoreOptions::default())?;
+    assert!(fs::read(t.join("f"))? == data, "f still has its old contents");
+    assert!(fs::read(t.join("l"))? == data[..1000], "l still has its old contents");
+    assert!(fs::read(t.join("l2"))? == data[..1000], "l2 still has its old contents");
+    for (name, first) in ["f", "l", "l2"].into_iter().zip(after_first) {
+        assert_ne!(first, old.unix_seconds(), "{name} got the snapshot's mtime without its contents");
+        assert_eq!(mtime(name)?, old.unix_seconds(), "{name}");
+    }
+    Ok(())
+}
+
 /// BackOtter (D7): `--exact --delete` over a hard-linked pair whose names
 /// are two immutable files with other names each, unexpected ones: the
 /// pair gets a file of its own, and both unexpected names go, the second
