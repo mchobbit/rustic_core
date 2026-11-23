@@ -51,7 +51,7 @@ unsafe extern "C" {
 /// ([`fill_attributes`]). `None` for other types of file, on other file
 /// systems, and where it can't be opened (not readable, gone, replaced).
 pub(super) fn open_for_attrs(path: &Path, typ: &NodeType, m: &std::fs::Metadata) -> Option<File> {
-    if !matches!(typ, NodeType::File | NodeType::Dir) || !on_zfs(path, m) {
+    if !matches!(typ, NodeType::File | NodeType::Dir) || !on_zfs(path, typ, m) {
         return None;
     }
     open_for_project(path, typ, Some(m))
@@ -162,38 +162,67 @@ fn restore_zfs_project(path: &Path, node: &Node) -> io::Result<()> {
 
 pub(super) fn file_flags(
     path: &Path,
-    _typ: &NodeType,
+    typ: &NodeType,
     m: &std::fs::Metadata,
     _f: Option<&std::fs::File>,
 ) -> io::Result<Option<u32>> {
-    Ok(freebsd_file_flags(m.st_flags(), on_zfs(path, m)))
+    Ok(freebsd_file_flags(m.st_flags(), on_zfs(path, typ, m)))
 }
 
-/// Whether the file at `path`, with metadata `m` (its lstat), is on ZFS,
-/// by `statfs(2)`'s `f_fstypename`, once per file system (device): it
-/// decides what the archive flag alone means ([`freebsd_file_flags`]). A
-/// symlink is on the file system of its directory (`statfs(2)` follows it).
-/// When `statfs(2)` fails, it isn't.
-fn on_zfs(path: &Path, m: &std::fs::Metadata) -> bool {
+/// Whether the file at `path`, of type `typ`, with metadata `m` (its
+/// lstat), is on ZFS, once per file system (device): it decides what the
+/// archive flag alone means ([`freebsd_file_flags`]) and whether the file
+/// has a ZFS project. It is where `statfs(2)`'s `f_fstypename` says `zfs`
+/// (a symlink is on the file system of its directory: `statfs(2)` follows
+/// it), and under any other name where it answers ZFS's project ioctl
+/// ([`answers_as_zfs`]): a nullfs mount of a ZFS dataset, as a jail's, is
+/// `nullfs` there and passes the files' flags, projects and ioctls through.
+/// When neither can be told (`statfs(2)` fails, nothing to open), it isn't,
+/// and the next file of that file system is asked again.
+fn on_zfs(path: &Path, typ: &NodeType, m: &std::fs::Metadata) -> bool {
     static ZFS: Mutex<BTreeMap<u64, bool>> = Mutex::new(BTreeMap::new());
-    let mut known = ZFS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(&zfs) = known.get(&m.st_dev()) {
+    // Not held while the file system is asked: two threads may both ask.
+    let known = || ZFS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(&zfs) = known().get(&m.st_dev()) {
         return zfs;
     }
-    let on = if m.file_type().is_symlink() {
-        match path.parent() {
-            Some(dir) if dir.as_os_str().is_empty() => PathBuf::from("."),
-            Some(dir) => dir.to_path_buf(),
-            None => path.to_path_buf(),
-        }
-    } else {
-        path.to_path_buf()
+    let dir = || match path.parent() {
+        Some(dir) if dir.as_os_str().is_empty() => PathBuf::from("."),
+        Some(dir) => dir.to_path_buf(),
+        None => path.to_path_buf(),
     };
-    match fs_type(&on) {
-        Ok(name) => *known.entry(m.st_dev()).or_insert(name == "zfs"),
+    let on = if m.file_type().is_symlink() { dir() } else { path.to_path_buf() };
+    let named_zfs = fs_type(&on)
+        .inspect_err(|err| debug!("statfs {}: {err}", on.display()))
+        .is_ok_and(|name| name == "zfs");
+    let zfs = if named_zfs {
+        Some(true)
+    } else if matches!(typ, NodeType::File | NodeType::Dir) {
+        answers_as_zfs(path, typ, m)
+    } else {
+        // Not opened itself (a symlink, a device, a FIFO): its directory.
+        answers_as_zfs(&dir(), &NodeType::Dir, m)
+    };
+    zfs.is_some_and(|zfs| *known().entry(m.st_dev()).or_insert(zfs))
+}
+
+/// Whether the regular file or directory at `path`, of type `typ`, answers
+/// ZFS's project ioctl (`ZFS_IOC_FSGETXATTR`), which only ZFS has: another
+/// file system says `ENOTTY`. `None` when that can't be told: it can't be
+/// opened, isn't of type `typ`, isn't on the device of `m`, or the ioctl
+/// fails some other way.
+fn answers_as_zfs(path: &Path, typ: &NodeType, m: &std::fs::Metadata) -> Option<bool> {
+    let f = open_for_project(path, typ, None)
+        .inspect_err(|err| debug!("open {} to tell its file system: {err}", path.display()))
+        .ok()
+        .flatten()
+        .filter(|f| f.metadata().is_ok_and(|fm| fm.st_dev() == m.st_dev()))?;
+    match zfs_xattr(&f, ZFS_IOC_FSGETXATTR, &mut ZfsXattr::default()) {
+        Ok(()) => Some(true),
+        Err(err) if err.raw_os_error() == Some(libc::ENOTTY) => Some(false),
         Err(err) => {
-            debug!("statfs {}: {err}", on.display());
-            false
+            debug!("ZFS_IOC_FSGETXATTR {}: {err}", path.display());
+            None
         }
     }
 }
@@ -318,4 +347,52 @@ pub(super) fn xattrs(_path: &Path) -> io::Result<Vec<ExtendedAttribute>> {
 /// Extended attributes go through the xattr crate here.
 pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "extended attributes go through xattr").into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// G4-04: a file is on ZFS by what it answers, whatever `statfs(2)`
+    /// calls its mount: with `TMPDIR` under a nullfs mount of a ZFS dataset
+    /// (`BKO_TEST_NULLFS_LOWER=zfs` says so; of another file system, any
+    /// other value), a file, a directory and a symlink are on ZFS, so a new
+    /// file's archive flag gets no attribute and it is opened for its
+    /// project. On ZFS itself and on UFS as before.
+    #[test]
+    fn on_zfs_by_what_the_file_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = fs_type(dir.path()).unwrap();
+        let lower = std::env::var("BKO_TEST_NULLFS_LOWER").ok();
+        let zfs = match (name.as_str(), lower.as_deref()) {
+            ("nullfs", None) => {
+                eprintln!("on_zfs_by_what_the_file_answers: TMPDIR on nullfs, BKO_TEST_NULLFS_LOWER not set: nothing tested");
+                return;
+            }
+            ("nullfs", Some(lower)) => lower == "zfs",
+            (name, _) => name == "zfs",
+        };
+        let (file, link) = (dir.path().join("f"), dir.path().join("l"));
+        std::fs::write(&file, "x").unwrap();
+        std::os::unix::fs::symlink("f", &link).unwrap();
+        let lstat = |path: &Path| std::fs::symlink_metadata(path).unwrap();
+
+        // Not through on_zfs's memory of the device: each asked itself.
+        let m = lstat(&file);
+        assert_eq!(answers_as_zfs(&file, &NodeType::File, &m), Some(zfs), "{name}");
+        assert_eq!(answers_as_zfs(dir.path(), &NodeType::Dir, &m), Some(zfs), "{name}");
+        // Not the file `m` is of, by its type or its device.
+        assert_eq!(answers_as_zfs(&file, &NodeType::Dir, &m), None);
+        assert_eq!(answers_as_zfs(Path::new("/dev"), &NodeType::Dir, &m), None);
+
+        let symlink = NodeType::from_link(Path::new("f"));
+        for (path, typ) in [(&link, &symlink), (&file, &NodeType::File)] {
+            assert_eq!(on_zfs(path, typ, &lstat(path)), zfs, "{name}: {}", path.display());
+        }
+        assert_eq!(on_zfs(dir.path(), &NodeType::Dir, &lstat(dir.path())), zfs, "{name}");
+        assert_eq!(open_for_attrs(&file, &NodeType::File, &m).is_some(), zfs, "{name}");
+        // ZFS gave the new file its archive flag: nothing to record there.
+        let flags = file_flags(&file, &NodeType::File, &m, None).unwrap();
+        assert_eq!(flags, None, "{name}: st_flags {:#x}", m.st_flags());
+    }
 }

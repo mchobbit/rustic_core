@@ -36,8 +36,12 @@ that either program restores what the other backed up.
     ID as it is. Accepted difference (both tools): a bcachefs file given its
     directory's project ID by hand comes back inheriting it.
   - `freebsd.file_flags`: FreeBSD's `chflags(1)` flags (`st_flags`). ZFS
-    (`statfs(2)`'s `f_fstypename` `zfs`, looked up once per file system; a
-    symlink's is its directory's) sets `uarch` on every file it writes, as
+    (`statfs(2)`'s `f_fstypename` `zfs`, or, under another name, a file or
+    directory that answers ZFS's project ioctl, `ZFS_IOC_FSGETXATTR`, which
+    other file systems refuse with `ENOTTY`: a nullfs mount of a ZFS
+    dataset, as a jail's, is `nullfs` to `statfs(2)` and its files are
+    ZFS's all the same; looked up once per file system; a symlink's is its
+    directory's) sets `uarch` on every file it writes, as
     Linux's ZFS its archive DOS flag, so there a file with `uarch` alone gets
     no attribute, and one with no flags at all gets 0 (archive cleared),
     which the restore sets, as any value it finds. On other file systems
