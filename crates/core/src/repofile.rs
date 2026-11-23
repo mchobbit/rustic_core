@@ -141,8 +141,12 @@ impl SerializeAs<Timestamp> for RusticTime {
 /// BackOtter: a node's time `ts` at `offset`, as restic writes it (Go's
 /// RFC 3339 with nanoseconds): with `Z` for a zero offset, not `+00:00`.
 /// Either form is read; only the trees' bytes, and so their ids, differ.
+/// In UTC too where the offset has seconds (a zone's local mean time,
+/// before it took a standard time: Paris +00:09:21 until 1911, Monrovia
+/// -00:44:30 until 1972): RFC 3339 has no place for them, so the time
+/// would be read back wrong by up to half a minute.
 fn timestamp_to_string(ts: Timestamp, offset: Offset) -> String {
-    if offset == Offset::UTC {
+    if offset == Offset::UTC || offset.seconds() % 60 != 0 {
         ts.to_string()
     } else {
         ts.display_with_offset(offset).to_string()
@@ -197,6 +201,40 @@ mod tests {
         assert_eq!(timestamp_to_string(ts, offset(2)), "2001-09-09T03:46:40.5+02:00");
         for s in ["2001-09-09T01:46:40.5Z", "2001-09-09T01:46:40.5+00:00"] {
             assert_eq!(s.parse::<Timestamp>().unwrap(), ts);
+        }
+    }
+
+    #[test]
+    fn node_times_at_offsets_with_seconds() {
+        // BackOtter: an offset RFC 3339 can't hold gives the time in UTC,
+        // which reads back as it was: Europe/Paris in 1850 (+00:09:21 gave
+        // "1850-06-01T12:09:21+00:09", read back 21 s late), Africa/Monrovia
+        // at the epoch (-00:44:30).
+        let paris = Offset::from_seconds(9 * 60 + 21).unwrap();
+        let ts: Timestamp = "1850-06-01T12:00:00Z".parse().unwrap();
+        assert_eq!(timestamp_to_string(ts, paris), "1850-06-01T12:00:00Z");
+        let monrovia = Offset::from_seconds(-(44 * 60 + 30)).unwrap();
+        let epoch1 = Timestamp::new(1, 0).unwrap();
+        assert_eq!(
+            timestamp_to_string(epoch1, monrovia),
+            "1970-01-01T00:00:01Z"
+        );
+        // Whole minutes keep their offset, as restic writes them.
+        let kolkata = Offset::from_seconds(5 * 3600 + 30 * 60).unwrap();
+        assert_eq!(
+            timestamp_to_string(epoch1, kolkata),
+            "1970-01-01T05:30:01+05:30"
+        );
+        // Whatever the offset, the string is the time.
+        let nanos: Timestamp = "1850-06-01T12:00:00.123456789Z".parse().unwrap();
+        for seconds in [
+            0, 1, 29, 30, 59, 60, 561, -2670, 3600, 19_270, -86_399, 93_599,
+        ] {
+            let offset = Offset::from_seconds(seconds).unwrap();
+            for ts in [ts, epoch1, nanos] {
+                let s = timestamp_to_string(ts, offset);
+                assert_eq!(s.parse::<Timestamp>().unwrap(), ts, "{s} at {seconds}");
+            }
         }
     }
 }

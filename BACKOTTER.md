@@ -1139,7 +1139,12 @@ that either program restores what the other backed up.
   time zone). Either form is read by both tools, and means the same time;
   only the trees' bytes, and so their ids, differed. Other offsets were
   already written alike (`+02:00`). A snapshot's own `time` still has
-  `+00:00` (stock rustic).
+  `+00:00` (stock rustic). A time whose zone offset has seconds (a zone's
+  local mean time: Europe/Paris, +00:09:21 until 1911; Africa/Monrovia,
+  -00:44:30 until 1972) is written in UTC as well, since RFC 3339 has no
+  seconds in an offset: stock rustic, and BackOtter's restic, write the
+  local time with the offset's minutes only, and the time reads back
+  wrong by up to a minute (a file dated 1850 at Europe/Paris, 21 s late).
 - Accepted difference (both tools): the two tools' snapshots of one tree
   have the same nodes but not the same trees' bytes, so not the same tree
   IDs, even in one repository. rustic writes a symlink's `linktarget` and
