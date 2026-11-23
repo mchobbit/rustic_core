@@ -1687,13 +1687,33 @@ on Unix). The others hold formats and maps, with no `unsafe`, and are
 built everywhere (`bsd_extattr.rs` on Unix), so that they are tested on
 any system: `bsd_flags.rs`, `freebsd_acl.rs`, `illumos_acl.rs`,
 `illumos_project.rs`, `illumos_sysattr.rs`, `illumos_xattrmeta.rs` and
-`haiku_attrs.rs`.
+`haiku_attrs.rs`. `osattrs.rs` itself keeps what the restore and the
+backup call; its errors and how a restore reports and counts them are in
+`errors.rs`, what goes around the xattr crate in `xattr.rs`, and its tests
+in `tests.rs` (`osattrs.rs` re-exports the first two whole).
+
+The allow of `unsafe` is not for the tree: `osattrs.rs` puts it on each
+module that makes system calls (the systems' modules but `other.rs`,
+`bsd_held.rs`, `freebsd_netbsd.rs`, `illumos_idmap.rs`) and on the
+functions that do in `osattrs.rs`, `sparse.rs` and `sparse/seek.rs`; the
+other modules are under the workspace's deny, and the tree warns
+`clippy::undocumented_unsafe_blocks`.
+
+`sparse.rs` names the systems whose `SEEK_HOLE` the backup probes with
+(Linux and Android, FreeBSD, illumos, macOS) in one place, for three
+modules: `sparse/seek.rs` (those systems: the seeks, and reading a file
+by its extents), `sparse/no_seek.rs` (the others: the blocks decide, a
+file is read plainly) and `sparse/hole_reader.rs` (the reader, built for
+the tests on every system).
 
 `SEEK_HOLE` and `SEEK_DATA` take 64-bit offsets (`lseek64`) on Linux
 (glibc and musl) and Android: on a 32-bit glibc or Android system `off_t`
 has 32 bits, and a file over 2 GiB would otherwise be neither marked
 `unix.sparse` nor read by its extents (Go's restic seeks with 64-bit
-offsets there too).
+offsets there too). `fallocate(2)`, `statfs(2)` and `fstatfs(2)` are the
+64-bit ones there for the same reason (`sparse::seek::lfs`), and a file
+system's magic number is the low 32 bits of `f_type`, which is a signed
+32-bit word on 32-bit glibc.
 
 Not handled, as no BackOtter build needs it: on Windows, which isn't a
 BackOtter platform, a marked file is restored without holes: NTFS needs
