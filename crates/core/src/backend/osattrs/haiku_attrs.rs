@@ -130,13 +130,17 @@ pub(super) fn stats(file: &impl AttrFile) -> io::Result<Option<(Stats, Unreadabl
     Ok(Some((stats, unreadable)))
 }
 
-/// The attribute `name`, which `fs_stat_attr(3)` said is `stat`. One that
-/// grew since is read again: a single read of its old size would give only
-/// the start of it. One of more than `max` bytes, as its size says before
-/// any of it is read, or once it has grown past that, is an error
+/// The attribute `name`, which `fs_stat_attr(3)` said is `stat`, whole,
+/// whatever its size. One that grew since is read again: a single read of
+/// its old size would give only the start of it. One of more than `max`
+/// bytes ([`NATIVE_XATTR_MAX`](super::NATIVE_XATTR_MAX), the most a
+/// repository can hold), as its size says before any of it is read, or
+/// once it has grown past that, is an error
 /// ([`xattr_too_large`](super::xattr_too_large)), and no memory is taken
-/// for it: an attribute in an inode of its own has any size, and a damaged
-/// file system can claim any.
+/// for it; one whose size no memory can be had for is an error too
+/// ([`xattr_buffer`](super::xattr_buffer)), where an allocation that fails
+/// ends the backup: an attribute in an inode of its own has any size, and
+/// a damaged file system can claim any.
 fn read_attr(
     file: &impl AttrFile,
     name: &CStr,
@@ -145,11 +149,13 @@ fn read_attr(
 ) -> io::Result<Option<Attr>> {
     for _ in 0..READ_TRIES {
         if stat.size > max {
-            return Err(super::xattr_too_large(stat.size));
+            return Err(super::xattr_too_large(stat.size, max));
         }
-        let size = usize::try_from(stat.size).map_err(io::Error::other)?;
         // A byte more, to see whether there is more.
-        let mut value = vec![0_u8; size + 1];
+        let mut value = super::xattr_buffer(stat.size.saturating_add(1))?;
+        // It fits a usize: there is memory for it.
+        let size = usize::try_from(stat.size).map_err(io::Error::other)?;
+        value.resize(size + 1, 0);
         let Some(n) = file.read(name, stat.type_code, &mut value)? else {
             return Ok(None);
         };
@@ -170,7 +176,7 @@ fn read_attr(
 
 /// A file's attributes of one kind, by name, and those of that kind left
 /// out, each with why: its name isn't UTF-8, which a node can't hold, it
-/// couldn't be read, or it is larger than a backup keeps
+/// couldn't be read, or it is larger than a repository can hold
 /// ([`NATIVE_XATTR_MAX`](super::NATIVE_XATTR_MAX)).
 pub(super) type Kept = (BTreeMap<String, Attr>, Unreadable);
 
@@ -752,14 +758,56 @@ mod tests {
         assert!(bfs.get(b"user.a").is_some() && bfs.get(b"user.bad").is_some());
     }
 
+    /// The review of ForkAudit1 G5-07's fix: an attribute is kept whole
+    /// whatever its size, as far as a repository can hold it. One of 16 MiB
+    /// and a byte is, of either kind, which that fix's first limit left out
+    /// of the backup with a warning: a restore of the snapshot then had
+    /// none to give a new file, and took it off the file it was backed up
+    /// from, which now keeps it untouched.
+    #[test]
+    fn an_attribute_over_16_mib_is_kept() {
+        let big: Vec<u8> = (0..=u8::MAX).cycle().take((16 << 20) + 1).collect();
+        let bfs = FakeBfs::with(&[
+            (b"big", attr(RAWT, &big)),
+            (b"small", attr(RAWT, b"s")),
+            (b"user.big", attr(XATTR_TYPE, &big)),
+        ]);
+        // Compared without assert_eq!, which would print 16 MiB of them.
+        let (typed, bad) = read_kind(&bfs, false).unwrap().unwrap();
+        assert!(bad.is_empty(), "{:?}", names(&bad));
+        let whole = typed == want(&[("big", attr(RAWT, &big)), ("small", attr(RAWT, b"s"))]);
+        assert!(whole, "the typed attributes aren't what the file has");
+        let (xattrs, bad) = read_kind(&bfs, true).unwrap().unwrap();
+        assert!(bad.is_empty(), "{:?}", names(&bad));
+        let whole = xattrs == want(&[("user.big", attr(XATTR_TYPE, &big))]);
+        assert!(whole, "the extended attribute isn't what the file has");
+
+        // A restore in place: nothing removed, nothing written.
+        apply(&bfs, &typed, false).unwrap();
+        apply(&bfs, &xattrs, true).unwrap();
+        assert_eq!((bfs.removes.get(), bfs.writes.get()), (0, 0));
+        // To a new file: both.
+        let new = FakeBfs::default();
+        apply(&new, &typed, false).unwrap();
+        apply(&new, &xattrs, true).unwrap();
+        let value = |name: &[u8]| new.get(name).unwrap().attr.value;
+        let whole = value(b"big") == big && value(b"user.big") == big;
+        assert!(whole, "the new file's aren't what was restored");
+    }
+
     /// ForkAudit1 G5-07 (RustAudit1 R4-06): an attribute whose size is over
-    /// `NATIVE_XATTR_MAX` is left out by that size, without being read (or
-    /// memory taken for it), and the others are kept; one that grows past
-    /// it while read too. A restore still reads one of any size the node
-    /// has.
+    /// the most a repository can hold (`NATIVE_XATTR_MAX`) is left out by
+    /// that size, without being read (or memory taken for it), and the
+    /// others are kept; one that grows past it while read too, and one
+    /// whose size no memory can be had for, which ended the backup. A
+    /// restore still reads one of any size the node has.
     #[test]
     fn an_attribute_too_large_is_left_out() {
         let max = crate::backend::osattrs::NATIVE_XATTR_MAX;
+        // The largest value whose base64 text fits a blob's 32-bit length.
+        assert_eq!(max, 3_221_225_469);
+        assert_eq!(max.div_ceil(3) * 4, u64::from(u32::MAX) - 3);
+        assert!((max + 1).div_ceil(3) * 4 > u64::from(u32::MAX));
         let bfs = FakeBfs::with(&[
             (b"huge", attr(RAWT, b"claims more")),
             (b"small", attr(RAWT, b"s")),
@@ -769,17 +817,33 @@ mod tests {
         assert_eq!(got, want(&[("small", attr(RAWT, b"s"))]));
         assert_eq!(names(&bad), [b"huge"]);
         assert_eq!(bad[0].1.kind(), io::ErrorKind::FileTooLarge);
-        assert!(
-            bad[0]
-                .1
-                .to_string()
-                .starts_with("too large to keep (18446744073709551615 bytes")
+        assert_eq!(
+            bad[0].1.to_string(),
+            "too large to keep (18446744073709551615 bytes, over 3221225469)"
         );
         assert_eq!(bfs.reads.get(), 1);
 
         _ = bfs.claimed.borrow_mut().insert(b"huge".to_vec(), max + 1);
         let (_, bad) = read_kind(&bfs, false).unwrap().unwrap();
         assert_eq!(names(&bad), [b"huge"]);
+        assert_eq!(
+            bad[0].1.to_string(),
+            "too large to keep (3221225470 bytes, over 3221225469)"
+        );
+        assert_eq!(bfs.reads.get(), 2);
+
+        // A size that no memory can be had for, were it let through: an
+        // error for this attribute, unread, not the end of the process.
+        let stat = Stat {
+            type_code: RAWT,
+            size: 1 << 60,
+        };
+        let err = read_attr(&bfs, c"huge", stat, u64::MAX).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+        assert_eq!(
+            err.to_string(),
+            "no memory for its 1152921504606846977 bytes"
+        );
         assert_eq!(bfs.reads.get(), 2);
 
         // Past the largest while it's read: the second stat says so.
@@ -788,6 +852,7 @@ mod tests {
         let stat = grows.stat(c"a").unwrap().unwrap();
         let err = read_attr(&grows, c"a", stat, 7).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(err.to_string(), "too large to keep (10 bytes, over 7)");
         assert_eq!(
             read_attr(&grows, c"a", stat, 10).unwrap().unwrap().value,
             b"longer now"

@@ -1261,17 +1261,33 @@ that either program restores what the other backed up.
   there, not in value.
 - An extended attribute is a file of any size on illumos (a named
   attribute, an SMB alternate data stream) and on Haiku (a BFS attribute
-  in an inode of its own), and a node holds its value inline, in base64:
-  a backup keeps one of at most 16 MiB (`osattrs::NATIVE_XATTR_MAX`,
-  twice the largest data blob). A larger one is left out by its size,
-  before any of it is read, with the warning of an attribute that couldn't
-  be read (`ignoring extended attribute NAME of PATH: too large to keep (N
-  bytes, over 16777216)`; on Haiku one that isn't an extended attribute is
-  named in `ignoring attributes of PATH: ...`), counted the same, and the
-  file's others are kept (0.14.0+backotter.2; before, any size was read
-  whole into memory, and a damaged BFS that claimed a huge size aborted
-  the backup). BackOtter's restic has no such limit yet: above it the two
-  tools' nodes differ.
+  in an inode of its own), and a backup keeps it whole whatever its size,
+  as far as a repository can hold it. A node holds the value inline, in
+  base64, and its tree is one blob, whose length is kept in 32 bits: the
+  most is 3221225469 bytes (`osattrs::NATIVE_XATTR_MAX`, 3 GiB less 3,
+  the largest value whose base64 text is under 4 GiB). A tree with a
+  larger one can't be saved by either tool, and the backup failed on it
+  (stock rustic's "Failed to convert data length", restic's "blob is
+  larger than 4GB"). The value is read into memory once, and its tree
+  takes several times its size there on the way into the repository and
+  out of it: for 220 MiB of attributes on one file, measured on OmniOS
+  r151058, 1.75 GiB at the backup's peak and 1.3 GiB at a restore's.
+  One over the most is left out by its size, before any of it is read,
+  with the warning of an attribute that couldn't be read (`ignoring
+  extended attribute NAME of PATH: too large to keep (N bytes, over
+  3221225469)`; on Haiku one that isn't an extended attribute is named in
+  `ignoring attributes of PATH: ...`), counted the same, and the file's
+  others are kept; so is one whose size no memory can be had for (`no
+  memory for its N bytes`: on a small machine, or a size a damaged BFS
+  made up), which ended the backup (0.14.0+backotter.2). As for any
+  attribute a backup couldn't read, a restore in place of that snapshot
+  takes it off the file. There is no smaller limit: 0.14.0+backotter.2's
+  first, 16 MiB, never in a release, left out attributes that had
+  restored until then, and a restore then lost them. Several attributes
+  that fit one by one and not together in their directory's tree still
+  fail the backup, as a tree too large for any other reason does.
+  BackOtter's restic reads one of any size too and fails on the tree of
+  one over the limit: below it the two tools' nodes are the same.
 - Extended attributes are read whole, however large, on Linux
   (`osattrs::xattr_get`, `xattr_list`: `lgetxattr(2)` and `llistxattr(2)`
   with the size they give, again on `ERANGE`). The xattr crate 1.6 (1.6.1,

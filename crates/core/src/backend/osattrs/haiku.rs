@@ -556,6 +556,56 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The review of ForkAudit1 G5-07's fix, on BFS itself: attributes of
+    /// 16 MiB and a byte, of both kinds, are backed up whole, restored to a
+    /// new file, and left on the file they came from by a restore in place.
+    /// That fix's first limit left them out of the backup with a warning,
+    /// so a restore had none to give, and took them off a file that had
+    /// them.
+    #[test]
+    fn attributes_over_16_mib_are_kept() {
+        let dir = scratch("over16");
+        let (file, new) = (dir.join("file"), dir.join("new"));
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::write(&new, b"x").unwrap();
+        let big: Vec<u8> = (0..=u8::MAX).cycle().take((16 << 20) + 1).collect();
+        let want = typed(&[("big", attr(RAWT, &big)), ("small", attr(RAWT, b"s"))]);
+        let xattrs = [ExtendedAttribute {
+            name: "user.big".to_string(),
+            value: Some(big.clone()),
+        }];
+        restore_attributes(&file, &node_with(&want)).unwrap();
+        set_xattrs(&file, &xattrs).unwrap();
+
+        // What a backup keeps of `path`: nothing left out.
+        let kept_of = |path: &Path| {
+            let mut node = Node::default();
+            fill_attributes(path, &mut node, None).unwrap();
+            let read = xattrs_read(path).unwrap();
+            assert!(read.unreadable.is_empty(), "{:?}", read.unreadable);
+            let typed: Attrs = node
+                .meta
+                .generic_attributes
+                .get(HAIKU_ATTRIBUTES)
+                .unwrap()
+                .unwrap();
+            (node, typed.0, read.attrs)
+        };
+        let (node, got, got_xattrs) = kept_of(&file);
+        assert!(got == want && got_xattrs == xattrs);
+
+        restore_attributes(&new, &node).unwrap();
+        set_xattrs(&new, &got_xattrs).unwrap();
+        let (_, got, got_xattrs) = kept_of(&new);
+        assert!(got == want && got_xattrs == xattrs);
+
+        restore_attributes(&file, &node).unwrap();
+        set_xattrs(&file, &got_xattrs).unwrap();
+        let (_, got, got_xattrs) = kept_of(&file);
+        assert!(got == want && got_xattrs == xattrs);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn in_place_restores() {
         let dir = scratch("in-place");

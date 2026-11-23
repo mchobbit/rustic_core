@@ -26,27 +26,64 @@ pub(crate) struct XattrsRead {
     pub(crate) unreadable: Vec<(String, io::Error)>,
 }
 
-/// BackOtter: the largest extended attribute a backup keeps where one is a
-/// file of any size: an illumos named attribute (`runat(1)`, an SMB
-/// alternate data stream) and a BFS attribute in an inode of its own. 16
-/// MiB, twice the largest data blob. A node holds its attributes' values
-/// inline, base64-encoded in its tree's JSON, and the backup reads each
-/// whole into memory: a larger one is left out with a warning, counted as
-/// any attribute that couldn't be read, and the file's others are kept.
-/// Linux's are 64 KiB at most, and the BSDs' are read whole.
-pub(crate) const NATIVE_XATTR_MAX: u64 = 16 << 20;
+/// BackOtter: the largest extended attribute a repository can hold, where
+/// one is a file of any size: an illumos named attribute (`runat(1)`, an
+/// SMB alternate data stream) and a BFS attribute in an inode of its own.
+/// A node holds its attributes' values inline, base64-encoded in its
+/// tree's JSON, and a tree is one blob, whose length a pack's header and
+/// the index keep in 32 bits: this is the most bytes whose base64 text is
+/// no longer than that, 3 GiB less 3. A tree with a larger value can't be
+/// saved by either tool (`encrypt_data`'s "Failed to convert data length",
+/// restic's "blob is larger than 4GB"), and the backup failed on it.
+///
+/// It is no limit for memory's sake: every attribute a repository can hold
+/// is kept, as it was before 0.14.0+backotter.2, whose first limit of 16
+/// MiB left out attributes that had restored until then (the review of
+/// ForkAudit1 G5-07's fix). One over it is left out with a warning,
+/// counted as any attribute that couldn't be read, and the file's others
+/// are kept; so is one no memory can be had for ([`xattr_buffer`]). Linux's
+/// are 64 KiB at most, and the BSDs' are read whole.
+pub(crate) const NATIVE_XATTR_MAX: u64 = (u32::MAX as u64 / 4) * 3;
 
 /// BackOtter: the error for an extended attribute of `size` bytes, over
-/// [`NATIVE_XATTR_MAX`].
+/// `max` ([`NATIVE_XATTR_MAX`]).
 #[cfg_attr(
     not(any(test, target_os = "illumos", target_os = "haiku")),
     allow(dead_code)
 )]
-pub(crate) fn xattr_too_large(size: u64) -> io::Error {
+pub(crate) fn xattr_too_large(size: u64, max: u64) -> io::Error {
     io::Error::new(
         io::ErrorKind::FileTooLarge,
-        format!("too large to keep ({size} bytes, over {NATIVE_XATTR_MAX})"),
+        format!("too large to keep ({size} bytes, over {max})"),
     )
+}
+
+/// BackOtter: an empty buffer with room for `size` bytes of an extended
+/// attribute's value, taken at once and for its size alone, so that a
+/// value read into it is in memory once.
+///
+/// # Errors
+///
+/// * If the memory can't be had (`ErrorKind::OutOfMemory`): an attribute
+///   of up to [`NATIVE_XATTR_MAX`] bytes on a small machine, or a size a
+///   damaged file system made up. The backup leaves that attribute out as
+///   one it couldn't read, where an allocation that fails ends the process.
+#[cfg_attr(
+    not(any(test, target_os = "illumos", target_os = "haiku")),
+    allow(dead_code)
+)]
+pub(crate) fn xattr_buffer(size: u64) -> io::Result<Vec<u8>> {
+    let mut value = Vec::new();
+    usize::try_from(size)
+        .ok()
+        .and_then(|size| value.try_reserve_exact(size).ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("no memory for its {size} bytes"),
+            )
+        })?;
+    Ok(value)
 }
 
 impl From<Vec<ExtendedAttribute>> for XattrsRead {
