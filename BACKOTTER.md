@@ -1777,7 +1777,12 @@ commit but for these:
 
 The versions in the commits from before the rebase read
 0.14.0+backotter.N with their old N (their messages name 0.13.0's); the
-first version on 0.14.0 is 0.14.0+backotter.1.
+first version on 0.14.0 is 0.14.0+backotter.1. 0.14.0+backotter.2 is .1
+with the fixes of ForkAudit1's re-run of 2026-11-23, each named
+"0.14.0+backotter.2" above where it changes what a backup keeps or a
+restore does. The repository format is unchanged, and what is new in a
+node is optional and ignored by a reader that doesn't know it (a FreeBSD
+symlink's ACL attributes, the SIDs of an illumos attribute's owner).
 
 Upstream's changes that came with 0.14.0 and touch what the fork does:
 #561's `error_count` (above, beside `items_incomplete`); #563, backup
