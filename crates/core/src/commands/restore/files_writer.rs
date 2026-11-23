@@ -50,6 +50,7 @@ pub(super) const fn max_idle(threads: usize) -> usize {
 /// BackOtter: the files of a restore, written through a handle each while
 /// they have writes under way, and kept open (up to [`max_idle`]) while
 /// they have writes to come.
+#[derive(Debug)]
 pub(super) struct FilesWriter<'a> {
     dest: &'a LocalDestination,
     filenames: &'a [PathBuf],
@@ -70,7 +71,7 @@ pub(super) struct FilesWriter<'a> {
 }
 
 /// Files of a [`FilesWriter`], by their place in the bucket.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Bucket {
     /// The size each file gets at its first write; 0 once it is sized (a
     /// file of 0 bytes has no writes).

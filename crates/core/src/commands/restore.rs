@@ -1484,7 +1484,7 @@ fn restore_metadata(
 /// BackOtter: what the metadata pass leaves for the late flags pass: each
 /// file's late attributes, once per file (`flags_linked`, by its hard-link
 /// key).
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct LatePass {
     file_flags: Vec<(PathBuf, NodeType, LateAttrs, Vec<ExtendedAttribute>)>,
     flags_linked: BTreeSet<HardlinkKey>,
@@ -1513,9 +1513,9 @@ fn link_name(
     dirs: &mut DirChanges,
     late: &mut LatePass,
     tally: &mut RestoreTally,
-) -> Result<(), String> {
+) -> std::io::Result<()> {
     let (Ok(first), Ok(target)) = (dest.path(canonical), dest.path(path)) else {
-        return dest.hard_link(canonical, path).map_err(|err| err.to_string());
+        return dest.hard_link(canonical, path).map_err(std::io::Error::other);
     };
     dirs.change_parent(&target);
     if sets {
@@ -1537,8 +1537,7 @@ fn link_name(
     let in_the_way = std::fs::symlink_metadata(walkdir::short_path(&target)).is_ok();
     let replaced = RefCell::new(Replaced::default());
     let (linked, put_back) = remove_held(&target, sets && in_the_way, &replaced, |_| {
-        dest.hard_link(canonical, path)
-            .map_err(|err| std::io::Error::other(err.to_string()))
+        dest.hard_link(canonical, path).map_err(std::io::Error::other)
     });
     if let Err(err) = put_back {
         error!(
@@ -1547,12 +1546,13 @@ fn link_name(
         );
         tally.always();
     }
-    linked.map_err(|err| err.to_string())
+    linked
 }
 
 /// BackOtter: the metadata the restore sets last, once every file has
 /// everything else: file flags, and before them ZFS's DOS flags, FAT's
 /// attributes and XFS's options (Linux).
+#[derive(Debug)]
 struct LateAttrs {
     flags: Option<u32>,
     dos_flags: Option<u64>,
@@ -1818,6 +1818,7 @@ fn warn_metadata_failed(
 
 /// BackOtter: the bytes of pack data [`restore_contents`] may hold at once
 /// ([`constants::MAX_RESTORE_BYTES_IN_FLIGHT`]).
+#[derive(Debug)]
 struct ByteBudget {
     total: u64,
     free: Mutex<u64>,
@@ -1860,6 +1861,7 @@ impl ByteBudget {
 
 /// Bytes taken from a [`ByteBudget`], given back on drop (a panic or an early
 /// return too).
+#[derive(Debug)]
 struct BudgetGuard<'a> {
     budget: &'a ByteBudget,
     bytes: u64,
@@ -2670,6 +2672,7 @@ struct FileLocation {
 }
 
 /// BackOtter: what [`RestorePlan::match_file`] found for a file.
+#[derive(Debug)]
 enum FileMatch {
     /// It is there, of the right size (and mtime): left as it is.
     Existing,
@@ -2679,6 +2682,7 @@ enum FileMatch {
 
 /// BackOtter: a file matched blob by blob ([`RestorePlan::match_file`]), for
 /// [`RestorePlan::push_file`].
+#[derive(Debug)]
 struct MatchedFile {
     /// Its name.
     name: PathBuf,
@@ -3013,6 +3017,48 @@ mod tests {
         assert!(set_metadata(&dest, opts, &path, &node, false, false, &mut tally));
         assert_eq!(stat().mtime(), 1_600_000_000);
         assert_eq!(tally.errors, 0);
+    }
+
+    /// RustAudit1 R5-16: the budget of bytes in flight gives out no more
+    /// than it has, makes a taker wait until enough is given back (by the
+    /// drop of a guard, in a panic's unwinding too), and gives a taker of
+    /// more than the whole budget the whole of it, alone.
+    #[test]
+    fn byte_budget_waits_and_gives_back() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let free = |budget: &ByteBudget| *budget.free.lock().unwrap_or_else(PoisonError::into_inner);
+        let budget = ByteBudget::new(10);
+        let first = budget.acquire(8);
+        assert_eq!(free(&budget), 2);
+        let got = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| {
+                let guard = budget.acquire(5);
+                got.store(true, AtomicOrdering::SeqCst);
+                guard.bytes
+            });
+            // 5 of 2 free: it waits until the 8 are given back.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!got.load(AtomicOrdering::SeqCst), "5 bytes taken of 2 free");
+            drop(first);
+            assert_eq!(waiter.join().unwrap(), 5);
+        });
+        assert!(got.load(AtomicOrdering::SeqCst));
+        assert_eq!(free(&budget), 10, "the waiter's guard gave its bytes back");
+
+        // More than the whole budget: the whole budget, once it is free.
+        let all = budget.acquire(100);
+        assert_eq!((all.bytes, free(&budget)), (10, 0));
+        drop(all);
+
+        // A guard dropped by a panic's unwinding gives its bytes back.
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = budget.acquire(7);
+            panic!("a write task panics, holding 7 bytes");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(free(&budget), 10);
     }
 
     /// ForkAudit1 G6-03: restricting flags that didn't go back on the

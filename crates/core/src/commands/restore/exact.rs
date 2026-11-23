@@ -131,11 +131,24 @@ impl std::fmt::Display for CloneFailed {
     }
 }
 
+impl std::error::Error for CloneFailed {
+    /// What made the clone fail: for [`Self::Failed`], whose message is
+    /// that error's own, the error's source; for [`Self::TempLeft`], the
+    /// error (its message is in this one's, with what kept the temporary
+    /// file there).
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Failed(err) => err.source(),
+            Self::TempLeft { err, .. } => Some(err),
+        }
+    }
+}
+
 impl From<CloneFailed> for io::Error {
     fn from(failed: CloneFailed) -> Self {
         match failed {
             CloneFailed::Failed(err) => err,
-            left @ CloneFailed::TempLeft { .. } => Self::other(left.to_string()),
+            left @ CloneFailed::TempLeft { .. } => Self::other(left),
         }
     }
 }
@@ -866,7 +879,12 @@ mod tests {
                     remove: io::Error::from_raw_os_error(libc::EPERM),
                 })
             });
-            assert!(left.unwrap_err().to_string().contains(".bko-exact-1"));
+            let left = left.unwrap_err();
+            assert!(left.to_string().contains(".bko-exact-1"));
+            // RustAudit1 R5-06: the clone's error is its source, not only
+            // text in its message.
+            let cause = left.get_ref().and_then(|e| e.source()).map(ToString::to_string);
+            assert_eq!(cause.as_deref(), Some("no reflinks"));
             assert!(has_other_names(&foo), "the file is left as it is");
         }
 
