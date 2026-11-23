@@ -36,6 +36,8 @@ mod exact;
 pub use exact::CloneSources;
 // BackOtter: one handle per file while it has blobs to come.
 mod files_writer;
+#[cfg(test)]
+mod test_log;
 
 pub(crate) mod constants {
     /// The maximum number of reader threads to use for restoring.
@@ -1716,7 +1718,7 @@ fn set_metadata(
                 path.display()
             );
         } else {
-            warn!("restore {}: setting {what} failed.", path.display());
+            warn_metadata_failed(path, &format!("setting {what}"), err);
             tally.dest(err);
         }
     };
@@ -1757,7 +1759,7 @@ fn set_metadata(
     }
     dest.set_permission(path, node, mode_zero_if_missing(opts, node))
         .unwrap_or_else(|err| {
-            warn!("restore {}: chmod failed.", path.display());
+            warn_metadata_failed(path, "chmod", &err);
             tally.dest(&err);
         });
     if node.is_symlink() {
@@ -1784,10 +1786,27 @@ fn set_metadata(
         tally.count(&err, true);
     });
     dest.set_times(path, &node.meta).unwrap_or_else(|err| {
-        warn!("restore {}: setting file times failed.", path.display());
+        warn_metadata_failed(path, "setting file times", &err);
         tally.dest(&err);
     });
     true
+}
+
+/// BackOtter: warns that `what`, a step of setting the metadata of `path`
+/// (its owner, mode or times), failed, and why. Two lines: the first is
+/// stock rustic's, `restore PATH: WHAT failed.`, as it always was, since
+/// bko-holt matches it whole (the root of a FreeBSD msdosfs takes no owner,
+/// mode or times, and a restore whose only errors are those passes); the
+/// second gives the error, which stock rustic and this left out, so that
+/// nothing said what refused it (an immutable file, a read-only file
+/// system, a quota).
+fn warn_metadata_failed(
+    path: &Path,
+    what: &str,
+    err: &local_destination::LocalDestinationErrorKind,
+) {
+    warn!("restore {}: {what} failed.", path.display());
+    warn!("restore {}: {what}: {err}", path.display());
 }
 
 /// BackOtter: the bytes of pack data [`restore_contents`] may hold at once
@@ -2970,6 +2989,51 @@ mod tests {
         assert!(set_metadata(&dest, opts, &path, &node, false, false, &mut tally));
         assert_eq!(stat().mtime(), 1_600_000_000);
         assert_eq!(tally.errors, 0);
+    }
+
+    /// ForkAudit1 G6-02: a step of the metadata that fails (here each of
+    /// them: nothing is at the path) is warned of on a line that is stock
+    /// rustic's to the letter, which bko-holt matches whole, and the next
+    /// line gives its cause.
+    #[cfg(unix)]
+    #[test]
+    fn metadata_warnings_give_the_cause() {
+        test_log::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = LocalDestination::new(dir.path().to_str().unwrap(), true, false).unwrap();
+        let name = "g602-nothing-here";
+        let mut node = Node::new_node(
+            name.as_ref(),
+            NodeType::File,
+            crate::backend::node::Metadata::default(),
+        );
+        node.meta.mode = Some(0o644);
+        node.meta.mtime = Some(Timestamp::from_second(1_600_000_000).unwrap());
+        let path = PathBuf::from(name);
+        for (opts, owner) in [
+            (RestoreOptions::default().numeric_id(true), "setting UID/GID"),
+            (RestoreOptions::default(), "setting User/Group"),
+        ] {
+            let before = test_log::lines(name).len();
+            let mut tally = RestoreTally::new();
+            assert!(set_metadata(&dest, opts, &path, &node, false, false, &mut tally));
+            assert!(tally.errors >= 3, "owner, mode and times: {}", tally.errors);
+            let lines = test_log::lines(name).split_off(before);
+            for what in [owner, "chmod", "setting file times"] {
+                let failed = format!("restore {name}: {what} failed.");
+                let at = lines
+                    .iter()
+                    .position(|(level, line)| *level == log::Level::Warn && *line == failed)
+                    .unwrap_or_else(|| panic!("no line {failed:?} in {lines:?}"));
+                let (level, cause) = &lines[at + 1];
+                assert_eq!(*level, log::Level::Warn);
+                assert!(
+                    cause.starts_with(&format!("restore {name}: {what}: "))
+                        && cause.contains("No such file or directory"),
+                    "{cause}"
+                );
+            }
+        }
     }
 
     /// A destination is fresh when it doesn't exist, or holds only what a
