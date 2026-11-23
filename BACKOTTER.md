@@ -759,7 +759,8 @@ that either program restores what the other backed up.
   metadata and the time its last entry was made; never one that
   exists and is sticky or that others may write in, mode bits 01000 or
   0002, even an empty one such as /tmp or /dev/shm; rustic's
-  BACKOTTER.md has the whole rule). It goes by the name it's saved as
+  BACKOTTER.md has the whole rule), or, fresh or not, under `--exact` or
+  rustic's `--target-metadata`. It goes by the name it's saved as
   (`--as-path`), and `/` still has no node, as in restic.
 - A regular file without a mode is restored with permissions 0000 where
   that is what it had: restic leaves a mode of 0 out of its JSON (and so
