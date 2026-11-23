@@ -1379,7 +1379,7 @@ fn test_restore_exact_delete_link_group_in_the_way(set_up_repo: Result<RepoOpen>
 /// other, opened by descriptors (a path that deep is too long for a system
 /// call): each one's, `top`'s first.
 #[cfg(target_os = "linux")]
-fn open_chain(top: &Path, names: &[String]) -> Result<Vec<std::os::fd::OwnedFd>> {
+pub(super) fn open_chain(top: &Path, names: &[String]) -> Result<Vec<std::os::fd::OwnedFd>> {
     use nix::fcntl::{OFlag, open, openat};
     use nix::sys::stat::Mode;
 
@@ -1396,7 +1396,7 @@ fn open_chain(top: &Path, names: &[String]) -> Result<Vec<std::os::fd::OwnedFd>>
 /// BackOtter: the file `name` in the directory `dir`, opened by `how`
 /// (`O_NOFOLLOW` too), with `mode` if it is made.
 #[cfg(target_os = "linux")]
-fn file_at(
+pub(super) fn file_at(
     dir: &std::os::fd::OwnedFd,
     name: &str,
     how: nix::fcntl::OFlag,
@@ -1501,60 +1501,4 @@ fn test_backup_restore_past_path_max(set_up_repo: Result<RepoOpen>) -> Result<()
     let delete = RestoreOptions::default().delete(true);
     assert_eq!(restore_counting(&repo, target.path(), delete)?, 0);
     check()
-}
-
-/// BackOtter (RustAudit1 XR1-01): a custom ignore file in a directory past
-/// `PATH_MAX` can't be read (the ignore crate looks for it by its path,
-/// `ENAMETOOLONG`, as if there were none), so what it excludes is backed
-/// up; the backup warns, naming it, and counts it as incomplete
-/// (`--strict-exit`). rustic-bko 0.11.4+backotter.20 backed `secret.key` up
-/// without a word. One at a short path is applied as ever.
-#[rstest]
-#[cfg(target_os = "linux")]
-fn test_backup_past_path_max_ignorefile(set_up_repo: Result<RepoOpen>) -> Result<()> {
-    use nix::fcntl::OFlag;
-    use nix::sys::stat::{Mode, mkdirat};
-    use rustic_core::{LocalSourceFilterOptions, PathList};
-
-    let source = tempdir()?;
-    fs::write(source.path().join(".rusticignore"), "top.secret\n")?;
-    fs::write(source.path().join("top.secret"), "x")?;
-    let names: Vec<String> = (0..120).map(|i| format!("d{i:03}{}", "x".repeat(36))).collect();
-    let deep: PathBuf = names.iter().collect();
-    assert!(source.path().join(&deep).join(".rusticignore").as_os_str().len() > 4096);
-    for (i, name) in names.iter().enumerate() {
-        let fds = open_chain(source.path(), &names[..i])?;
-        mkdirat(fds.last().unwrap(), name.as_str(), Mode::from_bits_truncate(0o755))?;
-    }
-    let fds = open_chain(source.path(), &names)?;
-    let write = |name: &str, data: &[u8]| -> Result<()> {
-        let mut f = file_at(fds.last().unwrap(), name, OFlag::O_WRONLY | OFlag::O_CREAT, 0o644)?;
-        f.write_all(data)?;
-        Ok(())
-    };
-    write(".rusticignore", b"secret.key\n")?;
-    write("secret.key", b"secret")?;
-    write("kept", b"kept")?;
-    drop(fds);
-
-    let repo = set_up_repo?.to_indexed_ids()?;
-    let filter = LocalSourceFilterOptions::default().custom_ignorefiles(vec![".rusticignore".to_string()]);
-    let opts = BackupOptions::default()
-        .as_path(PathBuf::from_str("test")?)
-        .ignore_filter_opts(filter);
-    let paths = PathList::from_iter(Some(source.path().to_path_buf()));
-    let snap = repo.backup(&opts, &paths, SnapshotFile::default())?;
-    let repo = repo.to_indexed()?;
-    let node = repo.node_from_snapshot_path("latest", |_| true)?;
-    let listed: Vec<PathBuf> = repo
-        .ls(&node, &LsOptions::default())?
-        .map(|item| item.map(|(p, _)| p))
-        .collect::<Result<_, _>>()?;
-    let test = PathBuf::from("test");
-    assert!(!listed.contains(&test.join("top.secret")), "the short one not applied");
-    assert!(listed.contains(&test.join(&deep).join("kept")), "{} entries", listed.len());
-    let applied = !listed.contains(&test.join(&deep).join("secret.key"));
-    let incomplete = snap.summary.as_ref().map_or(0, |s| s.items_incomplete);
-    assert!(applied || incomplete == 1, "secret.key backed up, {incomplete} incomplete");
-    Ok(())
 }
