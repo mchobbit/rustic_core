@@ -67,6 +67,8 @@ mod illumos_idmap;
 mod illumos_project;
 mod illumos_sysattr;
 mod illumos_xattrmeta;
+#[cfg(test)]
+pub(crate) mod malformed;
 #[cfg(unix)]
 mod sparse;
 
