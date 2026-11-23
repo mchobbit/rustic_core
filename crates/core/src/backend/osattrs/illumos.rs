@@ -59,11 +59,10 @@ pub(super) const ZFS_DOS_FLAGS: Option<&str> = None;
 const ACE_GETACL: libc::c_int = 4;
 const ACE_SETACL: libc::c_int = 5;
 const ACE_GETACLCNT: libc::c_int = 6;
-const O_XATTR: libc::c_int = 0x4000;
 
 /// `ace_t` from `<sys/acl.h>`.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 struct RawAce {
     who: u32,
     mask: u32,
@@ -95,7 +94,7 @@ unsafe extern "C" {
 /// What an ACL is read from or written to: the file at a path, with
 /// `acl(2)`, which follows symlinks (they have no ACL of their own anyway),
 /// or an open file, with `facl(2)`, which errors name by its path.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum AclOf<'a> {
     Path(&'a Path),
     File(&'a File, &'a Path),
@@ -216,7 +215,7 @@ fn sysattr_view(path: &Path, typ: &NodeType, write: bool) -> io::Result<File> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
-        Ok(f) => (f, O_XATTR | libc::O_CLOEXEC | rw),
+        Ok(f) => (f, libc::O_XATTR | libc::O_CLOEXEC | rw),
         Err(err) if matches!(typ, NodeType::File) && err.raw_os_error() == Some(libc::EACCES) => {
             (attr_dir_unopened(path).map_err(|_| err)?, libc::O_CLOEXEC | rw)
         }
@@ -337,7 +336,7 @@ fn fill_acl(path: &Path, node: &mut Node, sids: &mut SidNamer) -> io::Result<()>
 
 /// Finds the SIDs of a node's ephemeral ids, keeping idmap's first failure
 /// for [`SidNamer::report`].
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct SidNamer(Option<io::Error>);
 
 impl SidNamer {
@@ -424,7 +423,7 @@ fn aces_with_ids(attr: &'static str, entries: &mut [AceEntry]) -> Option<io::Err
 /// inheritance: an immutable or nodump file has `xflags` 0, and keeps both
 /// when they are set to 0 (checked on OmniOS r151058).
 #[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ZfsXattr {
     xflags: u32,
     projid: u32,
@@ -795,7 +794,7 @@ fn attr_dir(path: &Path) -> io::Result<Option<File>> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
-    let how = O_XATTR | libc::O_RDONLY | libc::O_CLOEXEC;
+    let how = libc::O_XATTR | libc::O_RDONLY | libc::O_CLOEXEC;
     // SAFETY: "." is a C string.
     match check(unsafe { libc::openat(f.as_raw_fd(), c".".as_ptr(), how) }) {
         // SAFETY: fd is a new file descriptor, owned by nothing else.

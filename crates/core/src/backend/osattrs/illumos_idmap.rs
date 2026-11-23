@@ -13,7 +13,7 @@
 use std::{
     collections::BTreeMap,
     ffi::{CStr, CString, c_char, c_int, c_void},
-    io, ptr,
+    fmt, io, ptr,
     sync::{Mutex, OnceLock},
 };
 
@@ -43,6 +43,13 @@ struct Idmap {
     sid_by_gid: GetSidById,
     uid_by_sid: GetIdBySid,
     gid_by_sid: GetIdBySid,
+}
+
+impl fmt::Debug for Idmap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Function pointers, which say nothing.
+        f.debug_struct("Idmap").finish_non_exhaustive()
+    }
 }
 
 /// libidmap, opened once.
