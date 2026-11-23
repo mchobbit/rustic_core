@@ -21,7 +21,7 @@ use serde_derive::{Deserialize, Serialize};
 use serde_with::{DefaultOnNull, base64::Base64, serde_as};
 
 use super::{
-    acl_set_error, bsd_extattr, c_path, check,
+    RestoreErrors, acl_set_error, bsd_extattr, c_path, check,
     freebsd_acl::{self, AclEntry, AclType, MAX_ENTRIES, Os},
     path_error,
 };
@@ -370,11 +370,12 @@ struct SystemExtattrs(#[serde_as(as = "BTreeMap<_, DefaultOnNull<Base64>>")] BTr
 /// # Errors
 ///
 /// * If they can't be read, other than because the file system or the user
-///   can't have them.
+///   can't have them: the system extended attributes' error, the ACLs', or
+///   one that holds both.
 pub(super) fn fill_attributes(path: &Path, node: &mut Node) -> io::Result<()> {
     let extattrs = fill_system_extattrs(path, node);
     let acls = fill_acls(path, node);
-    extattrs.and(acls)
+    RestoreErrors::result([extattrs, acls].into_iter().filter_map(Result::err).collect())
 }
 
 fn fill_system_extattrs(path: &Path, node: &mut Node) -> io::Result<()> {
@@ -449,8 +450,8 @@ fn fill_acls(path: &Path, node: &mut Node) -> io::Result<()> {
 ///
 /// # Errors
 ///
-/// * If one couldn't be set or removed, or they couldn't be listed: the
-///   first error.
+/// * If one couldn't be set or removed, or they couldn't be listed: each
+///   error ([`RestoreErrors`]).
 pub(super) fn restore_system_extattrs(path: &Path, node: &Node) -> io::Result<()> {
     let Some(attrs) = node
         .meta
@@ -460,14 +461,14 @@ pub(super) fn restore_system_extattrs(path: &Path, node: &Node) -> io::Result<()
         return Ok(());
     };
     let attrs = attrs.map_err(io::Error::other)?;
-    let mut first_err = None;
+    let mut errors = Vec::new();
     for (name, value) in &attrs.0 {
         // One with that value already is left: no change time moves.
         if get_system_extattr(path, name.as_bytes()).is_ok_and(|has| &has == value) {
             continue;
         }
         if let Err(err) = set_system_extattr(path, name, value) {
-            _ = first_err.get_or_insert(err);
+            errors.push(err);
         }
     }
     match list_extattrs(path, libc::EXTATTR_NAMESPACE_SYSTEM) {
@@ -479,17 +480,15 @@ pub(super) fn restore_system_extattrs(path: &Path, node: &Node) -> io::Result<()
                     continue;
                 }
                 if let Err(err) = delete_system_extattr(path, &name) {
-                    _ = first_err.get_or_insert(err);
+                    errors.push(err);
                 }
             }
         }
         // Not root, or no extended attributes here: the sets said so.
         Err(err) if unsupported(&err) => {}
-        Err(err) => {
-            _ = first_err.get_or_insert(path_error("extattr_list_link system", path, &err));
-        }
+        Err(err) => errors.push(path_error("extattr_list_link system", path, &err)),
     }
-    first_err.map_or(Ok(()), Err)
+    RestoreErrors::result(errors)
 }
 
 /// Whether a node without the generic attribute `name` leaves what the
@@ -514,19 +513,25 @@ pub(super) fn absent_is_unknown(name: &str) -> bool {
 ///
 /// # Errors
 ///
-/// * If an ACL couldn't be set or removed: the first error.
+/// * If an ACL couldn't be set or removed: each error ([`RestoreErrors`]),
+///   and after a POSIX.1e access ACL's that of the `chmod(2)` that narrows
+///   the group bits, if it failed too.
 pub(super) fn restore_acls(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
-    let mut first_err = known_bko.then(|| strip_acls(path, node).err()).flatten();
+    let mut errors = Vec::new();
+    if known_bko {
+        errors.extend(strip_acls(path, node).err());
+    }
     let mut restore = |typ: AclType, failed: &dyn Fn(&[AclEntry]) -> io::Result<()>| {
         let name = sys::OS.attribute(typ);
-        let Some(acl) = node.meta.generic_attributes.get::<Vec<AclEntry>>(name) else {
-            return;
+        let acl = match node.meta.generic_attributes.get::<Vec<AclEntry>>(name) {
+            None => return,
+            Some(Ok(acl)) => acl,
+            Some(Err(err)) => return errors.push(io::Error::other(err)),
         };
-        let result = acl.map_err(io::Error::other).and_then(|acl| {
-            set_acl(path, typ, &acl).or_else(|err| failed(&acl).and(Err(err)))
-        });
-        if let Err(err) = result {
-            _ = first_err.get_or_insert(err);
+        if let Err(err) = set_acl(path, typ, &acl) {
+            // The ACL's error, the cause, first; the fallback's after it.
+            errors.push(err);
+            errors.extend(failed(&acl).err());
         }
     };
     restore(AclType::Nfs4, &|_| Ok(()));
@@ -547,7 +552,7 @@ pub(super) fn restore_acls(path: &Path, node: &Node, known_bko: bool) -> io::Res
         Ok(())
     });
     restore(AclType::Default, &|_| Ok(()));
-    first_err.map_or(Ok(()), Err)
+    RestoreErrors::result(errors)
 }
 
 /// Takes from the file at `path` the ACLs its file system has a type of and
@@ -565,7 +570,8 @@ pub(super) fn restore_acls(path: &Path, node: &Node, known_bko: bool) -> io::Res
 /// # Errors
 ///
 /// * If an ACL couldn't be read (but not where the file system has none),
-///   set or removed: the first error.
+///   set or removed: the access ACL's error, the default ACL's, or one that
+///   holds both ([`RestoreErrors`]).
 fn strip_acls(path: &Path, node: &Node) -> io::Result<()> {
     let has = |typ| node.meta.generic_attributes.value(sys::OS.attribute(typ)).is_some();
     let current = |typ| match get_acl(path, typ) {
@@ -610,7 +616,7 @@ fn strip_acls(path: &Path, node: &Node) -> io::Result<()> {
         }
         delete_default_acl(path)
     });
-    access.and(default)
+    RestoreErrors::result([access, default].into_iter().filter_map(Result::err).collect())
 }
 
 #[cfg(test)]

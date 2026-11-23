@@ -953,7 +953,10 @@ pub(crate) struct RestoreErrors(Vec<io::Error>);
 impl RestoreErrors {
     /// `Ok` for no errors, the error itself for one, and one that holds them
     /// all for more.
-    #[cfg_attr(not(target_os = "illumos"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "illumos", target_os = "freebsd", target_os = "netbsd")),
+        allow(dead_code)
+    )]
     fn result(mut errors: Vec<io::Error>) -> io::Result<()> {
         match errors.len() {
             0 => Ok(()),

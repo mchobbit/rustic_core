@@ -20,7 +20,7 @@ use jiff::Timestamp;
 use log::debug;
 
 use super::{
-    Unsupported, XattrErrors,
+    RestoreErrors, Unsupported, XattrErrors,
     bsd_flags::{
         FREEBSD_KEPT_FLAGS as KEPT_FLAGS, freebsd_file_flags,
     },
@@ -282,9 +282,15 @@ pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
 }
 
 /// Restores the system extended attributes and the ZFS project.
+///
+/// # Errors
+///
+/// * If either couldn't be set: the project's error, the attributes', or
+///   one that holds both ([`RestoreErrors`]).
 pub(super) fn restore_attributes(path: &Path, node: &Node) -> io::Result<()> {
     let extattrs = freebsd_netbsd::restore_system_extattrs(path, node);
-    restore_zfs_project(path, node).and(extattrs)
+    let project = restore_zfs_project(path, node);
+    RestoreErrors::result([project, extattrs].into_iter().filter_map(Result::err).collect())
 }
 
 pub(super) use super::bsd_held::clear_restricting_flags;
