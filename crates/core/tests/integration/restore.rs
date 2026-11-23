@@ -1248,6 +1248,70 @@ fn test_restore_exact_flags_left_where_nothing_changes(
     Ok(())
 }
 
+/// BackOtter (ForkAudit1 G4-03, Linux): a flag a file has and its node
+/// doesn't goes at a restore of a snapshot of BackOtter's, plain or
+/// `--exact`: one set since the backup (`chattr +d`), and one a file the
+/// restore makes gets from its directory (`d/old`, older than its
+/// directory's flag). A second `--exact` restore then changes nothing; it
+/// used to set such a file's metadata again on every run, exit 0, the flag
+/// still there. In a snapshot not BackOtter's the flag stays. Where the
+/// tests' directory has `chattr +d` for its owner (ext4, XFS, btrfs,
+/// tmpfs).
+#[rstest]
+#[cfg(target_os = "linux")]
+fn test_restore_takes_off_flags_the_node_lacks(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    let source = tempdir()?;
+    let s = source.path();
+    fs::create_dir(s.join("d"))?;
+    fs::write(s.join("d/old"), "old")?;
+    fs::write(s.join("plain"), "plain")?;
+    fs::write(s.join("a"), "linked")?;
+    fs::hard_link(s.join("a"), s.join("b"))?;
+    if !chattr("+d", &s.join("d")) {
+        eprintln!("no nodump flag in {}", s.display());
+        return Ok(());
+    }
+    let repo = backed_up(set_up_repo?, s)?;
+    let target = tempdir()?;
+    let t = target.path().join("test");
+    let exact = RestoreOptions::default().exact(true).numeric_id(true);
+    assert_eq!(restore_counting(&repo, target.path(), exact)?, 0);
+    assert!(has_attr(&t.join("d"), 'd'));
+    assert!(!has_attr(&t.join("d/old"), 'd'));
+
+    // Set since the backup: on a file, a hard-linked file and a directory
+    // made for it.
+    assert!(chattr("+d", &t.join("plain")));
+    assert!(chattr("+d", &t.join("b")));
+    fs::remove_file(t.join("d/old"))?;
+    assert_eq!(restore_counting(&repo, target.path(), exact)?, 0);
+    for name in ["plain", "a", "b", "d/old"] {
+        assert!(!has_attr(&t.join(name), 'd'), "{name} kept nodump");
+    }
+    assert!(has_attr(&t.join("d"), 'd'), "the node's own flag went");
+    let before = inodes(target.path())?;
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert_eq!(restore_counting(&repo, target.path(), exact)?, 0);
+    assert_eq!(inodes(target.path())?, before, "a second --exact wrote");
+
+    // A plain restore too.
+    assert!(chattr("+d", &t.join("plain")));
+    fs::remove_file(t.join("d/old"))?;
+    assert_eq!(
+        restore_counting(&repo, target.path(), RestoreOptions::default())?,
+        0
+    );
+    assert!(!has_attr(&t.join("plain"), 'd'), "plain kept nodump");
+    assert!(!has_attr(&t.join("d/old"), 'd'), "d/old got nodump from d");
+
+    // Not in a snapshot of another program's, which says nothing of flags.
+    assert!(chattr("+d", &t.join("plain")));
+    let other = RestoreOptions::default().origin(SnapshotOrigin::Other);
+    restore_with(&repo, target.path(), other, |node| node)?;
+    assert!(has_attr(&t.join("plain"), 'd'), "another snapshot: kept");
+    Ok(())
+}
+
 /// BackOtter (D6, D7): `--exact` over an immutable file with other names:
 /// the snapshot's name gets a file of its own, the unexpected name in the
 /// destination, which sorts before it, is removed all the same (--delete:

@@ -980,8 +980,7 @@ that either program restores what the other backed up.
     `bsd_held::restore_no_flags`, with the attributes, one flag at a time
     where they can't all change). The restricting ones came off before the
     restore changed the file. A file with a new file's flags is not
-    written to. On Linux a flag the node lacks still stays (the late flags
-    pass sets only a node's own);
+    written to. On Linux: the next item;
   - a node with `freebsd.system_extattrs` (`netbsd.`) gives the file
     exactly those: one with the node's value already is left, any other
     the file has is removed (but for those UFS and FFSv2ea store ACLs in).
@@ -993,6 +992,56 @@ that either program restores what the other backed up.
   BackOtter's restic does none of this yet (`nodeRestoreACLs` returns for
   a node without the attribute, `restorer.go` queues flags only for a node
   that has them): it needs the same for the two to restore alike.
+- On Linux a restore acts on a missing `linux.inode_flags`,
+  `linux.zfs_dos_flags` and `linux.fat_attrs` the same way (after
+  0.14.0+backotter.2; before, the late flags pass set only what a node
+  holds, so a flag the node lacks stayed, exit 0, and `--exact` set such a
+  file's metadata again on every run: ForkAudit1 G4-03), in a snapshot of
+  BackOtter's only, for regular files and directories (symlinks and
+  special files have none), with the attributes, not in the late pass,
+  which would hold a row for every file (`restore_absent` in
+  `osattrs/linux.rs`; the file is opened once, read-only, not following a
+  symlink):
+  - a node without `linux.inode_flags` had none of the `chattr(1)` flags,
+    and the file loses those it has: one set since the backup (`chattr
+    +d`), one btrfs gave it (`m`, on a file that didn't compress), and
+    those a file or directory the restore made got from the directory it
+    was made in, when that was there already with flags of its own (ext4,
+    XFS and tmpfs hand down `d`, btrfs `c`, `m` and `C`, ext4 most of
+    them). They go as the late pass sets a node's own: all at once
+    (`FS_IOC_SETFLAGS`, which on btrfs takes the `btrfs.compression`
+    property off with `c`), one at a time where that is refused, the file
+    system's own flags left as they are. The restricting ones (`i`, `a`)
+    came off before the restore changed the file. Two flags can't go
+    there, and stay with a warning for each file, at every restore:
+    casefolding (`F`) on a directory with entries (the late pass's
+    warning, above), and btrfs's no-copy-on-write (`C`) on a regular file
+    with data, which btrfs keeps without an error ("no-copy-on-write (C)
+    not cleared on FILE: the file has data"). `--exact` goes on counting
+    those as differences. So a file the restore makes in a directory that
+    is there with `C`, and whose node has none, comes back
+    no-copy-on-write (its checksums and compression off): not when the
+    directory is restored with it (a directory gets its flags last);
+  - a node without `linux.zfs_dos_flags` had archive alone: on ZFS a file
+    with other kept DOS flags (hidden, system, read-only, offline, sparse,
+    nounlink set since the backup; archive cleared) gets archive alone,
+    immutable, append-only, nodump and reparse left as they are;
+  - a node without `linux.fat_attrs` had archive alone if a regular file
+    (read-only or not: its mode says which, and is set before), nothing if
+    a directory: on FAT a file with other attributes (hidden, system,
+    archive cleared; a directory's read-only or archive) gets those.
+  A file that has just that is not written to. One whose flags can't be
+  read (a file a restore not run as root can't open, a file system without
+  them) is left as it is, silently: a backup records none for it either. A
+  flag that can't be changed is a warning naming it, and an error, but
+  for a permission refused to a restore not run as root, which is only
+  the warning (as for the other attributes; the late pass counts that
+  too). In any other snapshot they are unknown and stay. A project ID
+  (off bcachefs) and XFS options that a node lacks still stay, as said
+  with each above. BackOtter's restic doesn't do this yet
+  (`internal/restorer/restorer.go` queues flags, DOS flags and FAT
+  attributes only for a node that has them): it needs the same for the
+  two to restore alike.
 - `merge` makes a snapshot of other snapshots' nodes: it is BackOtter's
   only if every snapshot merged is. Otherwise the program version it is
   given loses its `+backotter`, each word cut there (`rustic

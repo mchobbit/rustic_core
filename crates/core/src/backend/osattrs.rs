@@ -932,7 +932,10 @@ pub(crate) fn restore_owner(path: &Path, node: &Node) -> io::Result<()> {
 /// attributes gets a new file's, where it has others. On the BSDs a node
 /// without file flags had none then (a new file's), and its file loses the
 /// kept flags it has now, but for the restricting ones, which came off
-/// before.
+/// before. On Linux likewise, for a regular file or directory: the inode
+/// flags, and on ZFS and FAT the DOS flags and attributes, that a node
+/// without `linux.inode_flags`, `linux.zfs_dos_flags` or `linux.fat_attrs`
+/// didn't have.
 ///
 /// `owners` says whether the restore sets owners (not `--no-ownership`): on
 /// illumos each extended attribute has an owner and group of its own, set

@@ -436,6 +436,19 @@ const fn wanted_fat_attrs(current: u32, attrs: u32) -> u32 {
     (current & !FAT_KEPT) | (attrs & FAT_KEPT)
 }
 
+/// The FAT attributes a regular file or (`dir`) directory that has `current`
+/// had when its node holds no `linux.fat_attrs` in a snapshot of
+/// BackOtter's: those [`fat_attrs_attribute`] records nothing for. Archive
+/// alone for a regular file, with read-only as the file has it (its mode
+/// says which, and is set before); none for a directory.
+const fn no_fat_attrs(current: u32, dir: bool) -> u32 {
+    if dir {
+        0
+    } else {
+        (current & FAT_READONLY) | FAT_ARCHIVE
+    }
+}
+
 /// The XFS options of a directory (`dir`) or regular file whose
 /// `FS_IOC_FSGETXATTR` gave `attr`, if it has any: the [`xfs_kept`] flags,
 /// with the extent size hint where its flag or its inheritance is set, and
@@ -705,6 +718,11 @@ const fn dos_flags_attribute(flags: u64) -> Option<u64> {
     }
 }
 
+/// The DOS flags a file had when its node holds no `linux.zfs_dos_flags` in
+/// a snapshot of BackOtter's: those [`dos_flags_attribute`] records nothing
+/// for, archive alone.
+const NO_DOS_FLAGS: u64 = ZFS_ARCHIVE;
+
 pub(super) fn restore_file_flags(
     path: &Path,
     typ: &NodeType,
@@ -725,22 +743,39 @@ pub(super) fn restore_file_flags(
             path.display()
         );
     }
-    let compression = xattrs
+    restore_flags_open(&f, path, current, flags, btrfs_compression(xattrs))
+}
+
+/// The value of btrfs's compression property among the extended attributes
+/// `xattrs` of a node, if it has one.
+fn btrfs_compression(xattrs: &[ExtendedAttribute]) -> Option<&[u8]> {
+    xattrs
         .iter()
         .find(|attr| attr.name == BTRFS_COMPRESSION)
-        .and_then(|attr| attr.value.as_deref());
+        .and_then(|attr| attr.value.as_deref())
+}
+
+/// [`restore_flags_with`] for the file open as `f`, at `path`, which has the
+/// flags `current`.
+fn restore_flags_open(
+    f: &File,
+    path: &Path,
+    current: u32,
+    flags: u32,
+    compression: Option<&[u8]>,
+) -> io::Result<()> {
     restore_flags_with(
         path,
         current,
         flags,
         compression,
-        || get_flags(&f),
-        |flags| set_flags(&f, flags),
-        |value| set_xattr(&f, BTRFS_COMPRESSION, value),
+        || get_flags(f),
+        |flags| set_flags(f, flags),
+        |value| set_xattr(f, BTRFS_COMPRESSION, value),
         |xflags| {
-            let mut attr = get_fsxattr(&f)?;
+            let mut attr = get_fsxattr(f)?;
             attr.xflags |= xflags;
-            set_fsxattr(&f, &attr)
+            set_fsxattr(f, &attr)
         },
     )
 }
@@ -1137,14 +1172,34 @@ pub(super) fn restore_owner(_path: &Path, _node: &Node) -> io::Result<()> {
     Ok(())
 }
 
-/// Restores the project ID, along with the extended attributes. A project
+/// Restores the project ID, along with the extended attributes
+/// ([`restore_project_id`]), and in a snapshot of BackOtter's (`known_bko`)
+/// gives a regular file or directory whose node has no inode flags, ZFS DOS
+/// flags or FAT attributes a new file's, where it has others
+/// ([`restore_absent`]).
+pub(super) fn restore_attributes(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
+    let project = restore_project_id(path, node, known_bko);
+    let absent = if known_bko {
+        restore_absent(path, node)
+    } else {
+        Ok(())
+    };
+    RestoreErrors::result(
+        [project, absent]
+            .into_iter()
+            .filter_map(Result::err)
+            .collect(),
+    )
+}
+
+/// Restores the project ID. A project
 /// ID of 0 is the default, and left as it is; but on bcachefs a file without
 /// one gets 0, where it inherited another from its directory (whose project
 /// ID the restore gives it before its entries, [`prepare_dir_for_options`]),
 /// as in BackOtter's restic: where its node has 0, or none in a snapshot of
 /// BackOtter's (`known_bko`). A node without one in another snapshot says
 /// nothing about it: the file keeps what it has or inherited.
-pub(super) fn restore_attributes(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
+fn restore_project_id(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
     let projid = match node.meta.generic_attributes.number(LINUX_PROJECT_ID) {
         None if !known_bko => return Ok(()),
         None | Some(0) => {
@@ -1161,6 +1216,129 @@ pub(super) fn restore_attributes(path: &Path, node: &Node, known_bko: bool) -> i
     };
     let f = open_for_flags(path, &node.node_type, None)?;
     set_projid(path, &f, projid)
+}
+
+/// BackOtter (ForkAudit1 G4-03): gives the regular file or directory at
+/// `path` what `node` says it had where `node` holds no `linux.inode_flags`,
+/// no `linux.zfs_dos_flags` or no `linux.fat_attrs`, in a snapshot of
+/// BackOtter's, which records each wherever a file has more than a new
+/// file's: no inode flags of those the late flags pass sets ([`KEPT_LATE`]);
+/// on ZFS the DOS flag archive alone ([`NO_DOS_FLAGS`]); on FAT archive
+/// alone for a regular file and nothing for a directory ([`no_fat_attrs`]).
+/// The late flags pass sets only what a node holds, so a flag set since the
+/// backup (`chattr +d`, hidden), or one a file the restore made got from
+/// its directory, stayed, and `restore --exact`, which counts it as a
+/// difference, set such a file's metadata again on every run. The
+/// restricting flags (`i`, `a`) came off before the restore changed the
+/// file. A file that has just those is not written to; one whose flags
+/// can't be read (it can't be opened, a file system without them) is left
+/// as it is, as a backup records none for it. Symlinks and special files
+/// have none.
+///
+/// Two flags can't change here, and stay with a warning each: casefolding
+/// (`F`), which only an empty directory takes ([`prepare_dir_for_flags`]
+/// cleared it on one), and btrfs's no-copy-on-write (`C`) on a file with
+/// data, which btrfs keeps without an error.
+///
+/// # Errors
+///
+/// * If a flag or attribute couldn't be changed: as the late flags pass
+///   reports it for a node that holds them, naming those refused.
+fn restore_absent(path: &Path, node: &Node) -> io::Result<()> {
+    let typ = &node.node_type;
+    let dir = match typ {
+        NodeType::File => false,
+        NodeType::Dir => true,
+        _ => return Ok(()),
+    };
+    let lacks = |name| node.meta.generic_attributes.value(name).is_none();
+    let (flags, dos, fat) = (
+        lacks(LINUX_INODE_FLAGS),
+        lacks(LINUX_ZFS_DOS_FLAGS),
+        lacks(LINUX_FAT_ATTRS),
+    );
+    if !(flags || dos || fat) {
+        return Ok(());
+    }
+    let f = match open_for_flags(path, typ, None) {
+        Ok(f) => f,
+        Err(err) => {
+            debug!("flags a node hasn't got not looked for: {err}");
+            return Ok(());
+        }
+    };
+    let on = statfs_type(&f).ok();
+    let mut errors = Vec::new();
+    if dos && on == Some(ZFS_SUPER_MAGIC) {
+        match get_dos_flags(&f) {
+            Ok(current) => errors.extend(
+                restore_dos_flags_with(path, current, NO_DOS_FLAGS, |flags| {
+                    set_dos_flags(&f, flags)
+                })
+                .err(),
+            ),
+            Err(err) => debug!("ZFS DOS flags of {} left: {err}", path.display()),
+        }
+    }
+    if fat && on == Some(MSDOS_SUPER_MAGIC) {
+        match get_u32(&f, FAT_IOCTL_GET_ATTRIBUTES) {
+            Ok(current) => errors.extend(
+                restore_fat_attrs_with(path, current, no_fat_attrs(current, dir), |attrs| {
+                    set_u32(&f, FAT_IOCTL_SET_ATTRIBUTES, attrs)
+                })
+                .err(),
+            ),
+            Err(err) => debug!("FAT attributes of {} left: {err}", path.display()),
+        }
+    }
+    if flags {
+        let compression = btrfs_compression(&node.meta.extended_attributes);
+        errors.extend(restore_no_flags(&f, path, typ, compression).err());
+    }
+    RestoreErrors::result(errors)
+}
+
+/// [`restore_absent`]'s inode flags: takes the [`KEPT_LATE`] flags off the
+/// regular file or directory open as `f`, at `path`, where it has any, as
+/// [`restore_file_flags`] would for a node that holds no flag
+/// (`compression`: the node's `btrfs.compression`, which then stays).
+fn restore_no_flags(
+    f: &File,
+    path: &Path,
+    typ: &NodeType,
+    compression: Option<&[u8]>,
+) -> io::Result<()> {
+    let current = match get_flags(f) {
+        Ok(current) => current,
+        // A backup records none for such a file either (`file_flags`): a
+        // file system without flags, which is nothing to say of each file.
+        Err(err) => {
+            if !unsupported(&err) {
+                debug!("file flags of {} left: {err}", path.display());
+            }
+            return Ok(());
+        }
+    };
+    if casefold_differs(typ, current, 0) {
+        warn!(
+            "casefolding (F) not restored on {}: directory not empty or not supported",
+            path.display()
+        );
+    }
+    if current & KEPT_LATE == 0 {
+        return Ok(());
+    }
+    let cleared = restore_flags_open(f, path, current, 0, compression);
+    if current & FS_NOCOW_FL != 0
+        && cleared.is_ok()
+        && get_flags(f).is_ok_and(|now| now & FS_NOCOW_FL != 0)
+    {
+        warn!(
+            "no-copy-on-write (C) not cleared on {}: the file has data",
+            path.display()
+        );
+    }
+    cleared
 }
 
 /// Gives the regular file or directory `f`, at `path`, the project ID
@@ -2386,7 +2564,317 @@ mod tests {
             .generic_attributes
             .set(LINUX_PROJECT_ID, &0)
             .unwrap();
+        restore_project_id(Path::new("/nonexistent/bko"), &node, true).unwrap();
+        // Nor for the flags the node hasn't got, which are looked for: a
+        // file that can't be opened is left as it is.
         restore_attributes(Path::new("/nonexistent/bko"), &node, true).unwrap();
+    }
+
+    /// The change time of the file at `path`, a moment later, so that a
+    /// write after this moves it.
+    fn ctime_of(path: &Path) -> (i64, i64) {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let m = std::fs::symlink_metadata(path).unwrap();
+        (m.ctime(), m.ctime_nsec())
+    }
+
+    fn flags_of(path: &Path, typ: &NodeType) -> u32 {
+        get_flags(&open_for_flags(path, typ, None).unwrap()).unwrap() & INODE_FLAGS
+    }
+
+    /// G4-03: what a node without the attribute stands for is what a backup
+    /// records no attribute for, whatever the file has now, and leaves the
+    /// attributes that aren't kept as they are.
+    #[test]
+    fn no_attribute_values_get_no_attribute() {
+        assert_eq!(dos_flags_attribute(NO_DOS_FLAGS), None);
+        for current in [
+            0,
+            ZFS_ARCHIVE,
+            ZFS_HIDDEN | ZFS_SYSTEM,
+            ZFS_DOS_KEPT,
+            u64::MAX,
+        ] {
+            let reset = wanted_dos_flags(current, NO_DOS_FLAGS);
+            assert_eq!(dos_flags_attribute(reset), None, "{current:#x}");
+            assert_eq!(
+                reset & !ZFS_DOS_KEPT,
+                current & !ZFS_DOS_KEPT,
+                "{current:#x}"
+            );
+        }
+        for current in 0..0x80_u32 {
+            for dir in [false, true] {
+                let reset = wanted_fat_attrs(current, no_fat_attrs(current, dir));
+                assert_eq!(fat_attrs_attribute(reset, dir), None, "{current:#x} {dir}");
+                assert_eq!(reset & !FAT_KEPT, current & !FAT_KEPT, "{current:#x} {dir}");
+                // A regular file's read-only is its mode's.
+                if !dir {
+                    assert_eq!(reset & FAT_READONLY, current & FAT_READONLY);
+                }
+                // What has no attribute already is not written to.
+                if fat_attrs_attribute(current, dir).is_none() {
+                    assert_eq!(reset, current, "{current:#x} {dir}");
+                }
+            }
+        }
+    }
+
+    /// G4-03: an inode flag a file has and its node doesn't goes in a
+    /// snapshot of BackOtter's, where a node without flags says its file
+    /// had none, and stays in any other; a file without such a flag isn't
+    /// written to, and a node's own flags are the late pass's. The late
+    /// flags pass alone, which sets a node's own flags, left it. Where the
+    /// tests' directory has `chattr +d` (ext4, XFS, btrfs, tmpfs).
+    #[test]
+    fn restore_takes_off_flags_the_node_lacks() {
+        let dir = tempfile::tempdir().unwrap();
+        for typ in [NodeType::File, NodeType::Dir] {
+            let path = dir.path().join(format!("{typ:?}"));
+            match typ {
+                NodeType::File => std::fs::write(&path, "x").unwrap(),
+                _ => std::fs::create_dir(&path).unwrap(),
+            }
+            let f = open_for_flags(&path, &typ, None).unwrap();
+            let set = get_flags(&f).and_then(|new_file| {
+                if new_file & KEPT_LATE != 0 {
+                    return Err(io::Error::other("the directory hands down flags"));
+                }
+                set_flags(&f, new_file | NODUMP)
+            });
+            if let Err(err) = set {
+                eprintln!("restore_takes_off_flags_the_node_lacks: {err}: nothing tested");
+                return;
+            }
+            let node = Node::new_node(OsStr::new("n"), typ.clone(), NodeMetadata::default());
+
+            restore_attributes(&path, &node, false).unwrap();
+            assert_eq!(flags_of(&path, &typ), NODUMP, "not BackOtter's: kept");
+            let mut own = node.clone();
+            own.meta
+                .generic_attributes
+                .set_u64(LINUX_INODE_FLAGS, NODUMP.into());
+            let before = ctime_of(&path);
+            restore_attributes(&path, &own, true).unwrap();
+            assert_eq!(flags_of(&path, &typ), NODUMP, "the node's own: kept");
+            assert_eq!(ctime_of(&path), before, "the node's own: written to");
+
+            restore_attributes(&path, &node, true).unwrap();
+            assert_eq!(flags_of(&path, &typ), 0, "{}", path.display());
+            let after = ctime_of(&path);
+            restore_attributes(&path, &node, true).unwrap();
+            assert_eq!(ctime_of(&path), after, "a second restore wrote to the file");
+        }
+        // A symlink has no flags, and what it points at keeps its own.
+        let (target, link) = (dir.path().join("File"), dir.path().join("link"));
+        let f = open_for_flags(&target, &NodeType::File, None).unwrap();
+        set_flags(&f, get_flags(&f).unwrap() | NODUMP).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let node = Node::new_node(
+            OsStr::new("n"),
+            NodeType::from_link(&target),
+            NodeMetadata::default(),
+        );
+        restore_attributes(&link, &node, true).unwrap();
+        // A regular file's node where a symlink is: not followed.
+        let node = Node::new_node(OsStr::new("n"), NodeType::File, NodeMetadata::default());
+        restore_attributes(&link, &node, true).unwrap();
+        assert_eq!(flags_of(&target, &NodeType::File), NODUMP);
+    }
+
+    /// G4-03, with root, on a loop vfat: a node without `linux.fat_attrs`
+    /// in a snapshot of BackOtter's gives a file archive alone and a
+    /// directory nothing, where they have other attributes; read-only stays
+    /// the mode's.
+    #[test]
+    fn restore_takes_off_fat_attrs_the_node_lacks() {
+        let Some(mnt) = LoopMount::new(64 << 20, "mkfs.vfat", &[]) else {
+            return;
+        };
+        let mnt = mnt.path();
+        let get = |p: &Path| get_u32(&File::open(p).unwrap(), FAT_IOCTL_GET_ATTRIBUTES).unwrap();
+        let set =
+            |p: &Path, a| set_u32(&File::open(p).unwrap(), FAT_IOCTL_SET_ATTRIBUTES, a).unwrap();
+        for (name, dir, attrs, want) in [
+            ("plain", false, 0x20, 0x20),
+            ("readonly", false, 0x21, 0x21),
+            ("hidden", false, 0x22, 0x20),
+            ("cleared", false, 0, 0x20),
+            ("rosystem", false, 0x05, 0x21),
+            ("pdir", true, 0x10, 0x10),
+            ("hdir", true, 0x12, 0x10),
+            ("adir", true, 0x30, 0x10),
+        ] {
+            let path = mnt.join(name);
+            let typ = if dir {
+                std::fs::create_dir(&path).unwrap();
+                NodeType::Dir
+            } else {
+                std::fs::write(&path, name).unwrap();
+                NodeType::File
+            };
+            set(&path, attrs);
+            assert_eq!(get(&path), attrs, "{name}");
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            let node = Node::new_node(OsStr::new("n"), typ.clone(), NodeMetadata::default());
+            restore_attributes(&path, &node, false).unwrap();
+            assert_eq!(get(&path), attrs, "{name}: not BackOtter's: kept");
+            let mut own = node.clone();
+            own.meta
+                .generic_attributes
+                .set_u64(LINUX_FAT_ATTRS, (attrs & FAT_KEPT).into());
+            restore_attributes(&path, &own, true).unwrap();
+            assert_eq!(get(&path), attrs, "{name}: the node's own: kept");
+            restore_attributes(&path, &node, true).unwrap();
+            assert_eq!(get(&path), want, "{name}");
+            assert_eq!(
+                filled(&path, &typ)
+                    .meta
+                    .generic_attributes
+                    .number(LINUX_FAT_ATTRS),
+                None,
+                "{name}"
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode(),
+                mode,
+                "{name}"
+            );
+        }
+        // The root directory, which takes none, is not asked to.
+        let node = Node::new_node(OsStr::new("n"), NodeType::Dir, NodeMetadata::default());
+        restore_attributes(&mnt, &node, true).unwrap();
+    }
+
+    /// G4-03, with root, on a loop btrfs: the flags a new file gets from
+    /// its directory go where its node has none, and with compression its
+    /// property; no-copy-on-write goes from an empty file and a directory,
+    /// and stays on a file with data, which btrfs keeps it on.
+    #[test]
+    fn restore_takes_off_inherited_flags_on_btrfs() {
+        let Some(mnt) = LoopMount::new(256 << 20, "mkfs.btrfs", &["-q", "-f"]) else {
+            return;
+        };
+        let mnt = mnt.path();
+        let dir_node = Node::new_node(OsStr::new("n"), NodeType::Dir, NodeMetadata::default());
+        let file_node = Node::new_node(OsStr::new("n"), NodeType::File, NodeMetadata::default());
+        let set = |path: &Path, typ: &NodeType, flags: u32| {
+            let f = open_for_flags(path, typ, None).unwrap();
+            set_flags(&f, get_flags(&f).unwrap() | flags).unwrap();
+        };
+        let compression = |path: &Path| xattr_get(path, OsStr::new(BTRFS_COMPRESSION)).unwrap();
+
+        // Compression: the flag and the property, both handed down.
+        let c = mnt.join("c");
+        std::fs::create_dir(&c).unwrap();
+        set(&c, &NodeType::Dir, COMPR);
+        std::fs::write(c.join("f"), "data").unwrap();
+        set(&c.join("f"), &NodeType::File, NODUMP);
+        assert_eq!(flags_of(&c.join("f"), &NodeType::File), COMPR | NODUMP);
+        assert!(compression(&c.join("f")).is_some());
+        restore_attributes(&c.join("f"), &file_node, true).unwrap();
+        assert_eq!(flags_of(&c.join("f"), &NodeType::File), 0);
+        assert_eq!(compression(&c.join("f")), None);
+        restore_attributes(&c, &dir_node, true).unwrap();
+        assert_eq!(flags_of(&c, &NodeType::Dir), 0);
+        assert_eq!(compression(&c), None);
+
+        // No-copy-on-write.
+        let n = mnt.join("n");
+        std::fs::create_dir(&n).unwrap();
+        set(&n, &NodeType::Dir, NOCOW);
+        std::fs::write(n.join("empty"), "").unwrap();
+        std::fs::write(n.join("data"), "data").unwrap();
+        assert_eq!(flags_of(&n.join("data"), &NodeType::File), NOCOW);
+        restore_attributes(&n.join("empty"), &file_node, true).unwrap();
+        assert_eq!(flags_of(&n.join("empty"), &NodeType::File), 0);
+        restore_attributes(&n.join("data"), &file_node, true).unwrap();
+        assert_eq!(
+            flags_of(&n.join("data"), &NodeType::File),
+            NOCOW,
+            "btrfs took no-copy-on-write off a file with data: the warning is out of date"
+        );
+        restore_attributes(&n, &dir_node, true).unwrap();
+        assert_eq!(flags_of(&n, &NodeType::Dir), 0);
+    }
+
+    /// G4-03, with root, on a loop ext4 that folds case: the flags a
+    /// directory with entries has and its node doesn't go, but casefolding,
+    /// which ext4 changes on no directory with entries: it stays (with a
+    /// warning), and doesn't keep the others.
+    #[test]
+    fn restore_leaves_casefolding_the_node_lacks() {
+        let args = ["-q", "-F", "-O", "casefold"];
+        let Some(mnt) = LoopMount::new(64 << 20, "mkfs.ext4", &args) else {
+            return;
+        };
+        let d = mnt.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        let f = open_for_flags(&d, &NodeType::Dir, None).unwrap();
+        let new_dir = get_flags(&f).unwrap();
+        if let Err(err) = set_flags(&f, new_dir | FS_CASEFOLD_FL | NODUMP) {
+            eprintln!("restore_leaves_casefolding_the_node_lacks: {err}: nothing tested");
+            return;
+        }
+        std::fs::write(d.join("entry"), "x").unwrap();
+        assert_eq!(flags_of(&d.join("entry"), &NodeType::File), NODUMP);
+        let node = Node::new_node(OsStr::new("n"), NodeType::Dir, NodeMetadata::default());
+        restore_attributes(&d, &node, true).unwrap();
+        assert_eq!(flags_of(&d, &NodeType::Dir), FS_CASEFOLD_FL);
+        let after = ctime_of(&d);
+        restore_attributes(&d, &node, true).unwrap();
+        assert_eq!(
+            ctime_of(&d),
+            after,
+            "a second restore wrote to the directory"
+        );
+        // What it handed down goes from the file.
+        let node = Node::new_node(OsStr::new("n"), NodeType::File, NodeMetadata::default());
+        restore_attributes(&d.join("entry"), &node, true).unwrap();
+        assert_eq!(flags_of(&d.join("entry"), &NodeType::File), 0);
+    }
+
+    /// G4-03, where the tests run on ZFS (TMPDIR on a ZFS data set): a node
+    /// without `linux.zfs_dos_flags` in a snapshot of BackOtter's gives the
+    /// file archive alone, where it has other DOS flags.
+    #[test]
+    fn restore_takes_off_dos_flags_the_node_lacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, sub) = (dir.path().join("f"), dir.path().join("d"));
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::create_dir(&sub).unwrap();
+        if !is_zfs(&File::open(&file).unwrap()).unwrap() {
+            return;
+        }
+        let attribute = |path: &Path, typ: &NodeType| {
+            filled(path, typ)
+                .meta
+                .generic_attributes
+                .number_u64(LINUX_ZFS_DOS_FLAGS)
+        };
+        for (path, typ) in [(&file, NodeType::File), (&sub, NodeType::Dir)] {
+            let node = Node::new_node(OsStr::new("n"), typ.clone(), NodeMetadata::default());
+            for flags in [ZFS_HIDDEN | ZFS_SYSTEM | ZFS_ARCHIVE, 0] {
+                restore_zfs_dos_flags(path, &typ, flags).unwrap();
+                let had = attribute(path, &typ);
+                assert_eq!(had, Some(flags), "{}", path.display());
+                restore_attributes(path, &node, false).unwrap();
+                assert_eq!(attribute(path, &typ), had, "not BackOtter's: kept");
+                let mut own = node.clone();
+                own.meta
+                    .generic_attributes
+                    .set_u64(LINUX_ZFS_DOS_FLAGS, flags);
+                restore_attributes(path, &own, true).unwrap();
+                assert_eq!(attribute(path, &typ), had, "the node's own: kept");
+                restore_attributes(path, &node, true).unwrap();
+                assert_eq!(attribute(path, &typ), None, "{}", path.display());
+                let f = open_for_flags(path, &typ, None).unwrap();
+                assert_eq!(get_dos_flags(&f).unwrap() & ZFS_DOS_KEPT, ZFS_ARCHIVE);
+                let after = ctime_of(path);
+                restore_attributes(path, &node, true).unwrap();
+                assert_eq!(ctime_of(path), after, "a second restore wrote to the file");
+            }
+        }
     }
 
     #[test]
