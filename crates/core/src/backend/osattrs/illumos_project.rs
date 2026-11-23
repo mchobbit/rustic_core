@@ -75,4 +75,26 @@ mod tests {
         assert_eq!(p(5, false).xflags(0x2000_0008), 0x8);
         assert_eq!(p(5, true).xflags(0x8), 0x2000_0008);
     }
+
+    /// `BackOtter` (`ForkAudit1` F2): a project from another machine, cut short
+    /// or with any bit flipped: refused, or read into one whose xflags keep
+    /// every flag but inheritance as they are.
+    #[test]
+    fn project_malformed() {
+        use crate::backend::osattrs::malformed::every_json_mutation;
+
+        _ = every_json_mutation::<ZfsProject>(
+            "zfs_project",
+            r#"{"id":4294967294,"inherit":true}"#,
+            |p| {
+                let x = p.xflags(0x8000_0008);
+                if x & !PROJ_INHERIT != 0x8000_0008 & !PROJ_INHERIT
+                    || (x & PROJ_INHERIT != 0) != p.inherit
+                {
+                    return Err(format!("xflags {x:#x}"));
+                }
+                Ok(())
+            },
+        );
+    }
 }

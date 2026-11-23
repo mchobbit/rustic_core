@@ -328,4 +328,68 @@ mod tests {
         assert!(json.starts_with(r#"{"uid":1500,"gid":2147483651,"group_sid":"S-1-5-"#), "{json}");
         assert_eq!(serde_json::from_str::<XattrMeta>(&json).unwrap(), group);
     }
+
+    /// `BackOtter` (`ForkAudit1` F2): `illumos.xattr_meta` from another machine,
+    /// cut short or with any bit flipped: refused, or read into metadata
+    /// whose names are refused or are plain names of attribute files, and
+    /// whose ACL and times can be looked at, without a panic.
+    #[test]
+    fn xattr_meta_malformed() {
+        use crate::backend::osattrs::malformed::every_json_mutation;
+
+        let json = concat!(
+            r#"{"a name with spaces":{"uid":0,"gid":0,"mode":384,"#,
+            r#""mtime":"2001-09-09T01:46:40.000000005Z","atime":"2001-09-09T01:46:40.000000005Z"},"#,
+            r#""note":{"uid":1500,"gid":1501,"mode":416,"#,
+            r#""mtime":"2001-09-09T01:46:40.123456789Z","atime":"2001-09-09T01:46:40Z","#,
+            r#""acl":[{"who":60001,"mask":1},{"who":2147483650,"mask":2,"flags":64,"type":1,"sid":"S-1-5-21-1111-2222-3333-513"}]},"#,
+            r#""stream":{"uid":2147483650,"gid":2147483651,"owner_sid":"S-1-5-21-1111-2222-3333-1001","#,
+            r#""group_sid":"S-1-5-21-1111-2222-3333-513","mode":384,"#,
+            r#""mtime":"2001-09-09T01:46:40Z","atime":"2001-09-09T01:46:40Z"}}"#
+        );
+        let whole = serde_json::from_str::<Value>(json).unwrap();
+        _ = every_json_mutation::<BTreeMap<String, XattrMeta>>("xattr_meta", json, |metas| {
+            // `--exact`'s comparisons take any of them.
+            let value = serde_json::to_value(metas).map_err(|err| err.to_string())?;
+            if !same_but_owners(&value, &value) {
+                return Err("not the same as itself".to_string());
+            }
+            _ = same_but_owners(&value, &whole);
+            for (name, meta) in metas {
+                let refused = attr_name_refused(name).is_some();
+                let plain = !name.is_empty()
+                    && name != "."
+                    && name != ".."
+                    && !name.contains(['/', '\0'])
+                    && !SYSTEM_VIEWS.contains(&name.as_str());
+                if refused == plain {
+                    return Err(format!("{name:?}: refused {refused}"));
+                }
+                _ = super::super::illumos_acl::is_trivial(&meta.acl);
+                for e in &meta.acl {
+                    _ = e.sid.as_deref().map(super::super::illumos_acl::split_sid);
+                }
+                for sid in [&meta.owner_sid, &meta.group_sid].into_iter().flatten() {
+                    _ = super::super::illumos_acl::split_sid(sid);
+                }
+                _ = restored_owner(meta, (Some(meta.uid), None), (1, 2));
+                _ = super::super::unix_time(meta.mtime);
+                _ = super::super::unix_time(meta.atime);
+            }
+            Ok(())
+        });
+        for name in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "/",
+            "../x",
+            "a\0b",
+            "SUNWattr_rw",
+            "SUNWattr_ro",
+        ] {
+            assert!(attr_name_refused(name).is_some(), "{name:?} not refused");
+        }
+    }
 }

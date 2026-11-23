@@ -389,8 +389,57 @@ mod tests {
             assert_eq!(split_sid(sid), None, "malformed SID {sid:?} split");
         }
         assert_eq!(split_sid("S-1-5"), Some(("S-1", 5)));
-        for sid in [] as [&str; 0] {
-            assert_eq!(split_sid(sid), None, "malformed SID {sid:?} split");
-        }
+    }
+
+    /// `BackOtter` (`ForkAudit1` F2): `illumos.acl` from another machine, cut
+    /// short or with any bit flipped: refused, or read, without a panic.
+    #[test]
+    fn acl_malformed() {
+        use crate::backend::osattrs::malformed::every_json_mutation;
+
+        let json = concat!(
+            r#"[{"who":2147483650,"mask":1,"sid":"S-1-5-21-1111-2222-3333-1004"},"#,
+            r#"{"who":2147483651,"mask":2,"flags":64,"type":1,"sid":"S-1-5-21-1111-2222-3333-1005"},"#,
+            r#"{"who":4294967295,"mask":1966495,"flags":4096},{"who":60001,"mask":1}]"#
+        );
+        _ = every_json_mutation::<Vec<AceEntry>>("illumos.acl", json, |acl| {
+            _ = is_trivial(acl);
+            for e in acl {
+                // What a restore would write over it is trivial, whatever
+                // the entry's mask is taken for a mode.
+                if !is_trivial(&trivial(e.mask, is_group(e))) {
+                    return Err(format!("trivial({:#o}) isn't", e.mask));
+                }
+                _ = (names_sid(e), is_group(e), e.sid.as_deref().map(split_sid));
+            }
+            Ok(())
+        });
+    }
+
+    /// `BackOtter` (`ForkAudit1` F2): SIDs cut short or with any bit flipped are
+    /// refused, or split only into a prefix starting `S-` and a digit, and
+    /// a RID of digits (`ForkAudit1` G5-09: `S-1` no longer splits as
+    /// `("S", 1)`).
+    #[test]
+    fn sids_malformed() {
+        use crate::backend::osattrs::malformed::{Found, every_mutation};
+
+        let sid = "S-1-5-21-1111-2222-3333-1001";
+        _ = every_mutation("SID", sid.as_bytes(), |input, _| {
+            let Ok(s) = std::str::from_utf8(input) else {
+                return Found::Refused;
+            };
+            match split_sid(s) {
+                None => Found::Refused,
+                Some((prefix, rid))
+                    if prefix.strip_prefix("S-").is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+                        && s == format!("{prefix}-{}", &s[prefix.len() + 1..])
+                        && s[prefix.len() + 1..].parse() == Ok(rid) =>
+                {
+                    Found::Decoded
+                }
+                Some(split) => Found::Wrong(format!("split as {split:?}")),
+            }
+        });
     }
 }

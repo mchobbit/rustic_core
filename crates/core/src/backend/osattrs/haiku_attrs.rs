@@ -963,4 +963,51 @@ mod tests {
         // No zeros left behind.
         assert!(fs.0.get(b"e").is_none());
     }
+
+    /// `BackOtter` (`ForkAudit1` F2): `haiku.attributes` from another machine,
+    /// cut short or with any bit flipped: refused, or read and restored onto
+    /// a file with attributes of both kinds without a panic. A restore that
+    /// succeeds leaves the file's attributes other than its extended
+    /// attributes exactly those wanted, and its extended attributes alone.
+    #[test]
+    fn attrs_malformed() {
+        use crate::backend::osattrs::malformed::every_json_mutation;
+
+        let json = concat!(
+            r#"{"BEOS:TYPE":{"type":1296649555,"value":"dGV4dC9wbGFpbgA="},"#,
+            r#""empty":{"type":1380013908,"value":""},"#,
+            r#""big":{"type":1380013908,"value":"QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB"},"#,
+            r#""an xattr":{"type":1480676434,"value":"eA=="}}"#
+        );
+        let before: &[(&[u8], Attr)] = &[
+            (b"BEOS:TYPE", attr(MIMS, b"application/octet-stream\0")),
+            (b"old", attr(RAWT, b"old")),
+            (b"user.kept", attr(XATTR_TYPE, b"kept")),
+            (b"\xff not UTF-8", attr(RAWT, b"kept too")),
+        ];
+        _ = every_json_mutation::<Attrs>("haiku.attributes", json, |attrs| {
+            let (want, rejected) = typed(attrs.clone());
+            if rejected.iter().any(|n| attrs.0[n].type_code != XATTR_TYPE) {
+                return Err(format!("rejected {rejected:?}"));
+            }
+            let bfs = FakeBfs::with(before);
+            if apply(&bfs, &want, false).is_err() {
+                return Ok(());
+            }
+            let have: BTreeMap<_, _> = bfs
+                .attrs
+                .borrow()
+                .iter()
+                .filter(|(_, a)| a.attr.type_code != XATTR_TYPE)
+                .filter_map(|(n, a)| Some((String::from_utf8(n.clone()).ok()?, a.attr.clone())))
+                .collect();
+            if have != want {
+                return Err(format!("restored as {have:?}"));
+            }
+            if bfs.get(b"user.kept").map(|a| a.attr) != Some(attr(XATTR_TYPE, b"kept")) {
+                return Err("an extended attribute changed".to_string());
+            }
+            Ok(())
+        });
+    }
 }

@@ -531,4 +531,60 @@ mod tests {
         assert_eq!(buf[44..60], unhex("ffffffff fffffffe 00000000 3b9ac9ff"));
         assert_eq!(View::parse(&buf).unwrap().crtime(), Some(t));
     }
+
+    /// `BackOtter` (`ForkAudit1` F2): a view cut short is refused (it has lost
+    /// its end); one with any bit flipped is refused or read, and what is
+    /// read gives a mask, a creation time and an nvlist that reads back as
+    /// the mask, without a panic.
+    #[test]
+    fn views_malformed() {
+        use crate::backend::osattrs::malformed::{Found, every_mutation};
+
+        for (what, view) in [
+            ("SUNWattr_rw", SUNWATTR_RW),
+            ("crtime", NVLIST_CRTIME),
+            ("hidden", NVLIST_HIDDEN),
+            ("owner SID", NVLIST_OWNER_SID),
+            ("plain", SUNWATTR_PLAIN),
+            ("SID", SUNWATTR_SID),
+        ] {
+            let buf = unhex(view);
+            _ = every_mutation(what, &buf, |input, cut| {
+                let Ok(view) = View::parse(input) else {
+                    return Found::Refused;
+                };
+                if cut {
+                    return Found::Wrong(format!("a view cut short at {} read", input.len()));
+                }
+                let mask = view.mask();
+                _ = view.kept_mask();
+                _ = view.crtime();
+                // What a reset writes leaves nothing to reset.
+                if let Some(reset) = view.reset_mask(AV_QUARANTINED | RESTRICTING) {
+                    let after = view.mask_nvlist(reset);
+                    match View::parse(&after).map(|v| v.reset_mask(AV_QUARANTINED | RESTRICTING)) {
+                        Ok(None) => {}
+                        other => return Found::Wrong(format!("reset to {reset:#x}, then {other:?}")),
+                    }
+                }
+                let have = BITS
+                    .iter()
+                    .filter(|(name, _)| view.has_boolean(name))
+                    .fold(0, |m, (_, bit)| m | bit);
+                for want in [0, mask, !mask, u32::MAX] {
+                    let nv = view.mask_nvlist(want);
+                    match View::parse(&nv) {
+                        Ok(back) if back.mask() == want & have => {}
+                        other => {
+                            return Found::Wrong(format!(
+                                "mask {want:#x}'s nvlist reads back as {:?}",
+                                other.map(|b| b.mask())
+                            ));
+                        }
+                    }
+                }
+                Found::Decoded
+            });
+        }
+    }
 }
