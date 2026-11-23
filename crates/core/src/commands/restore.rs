@@ -1895,6 +1895,11 @@ mod tests {
         );
         node.meta.mode = Some(0o640);
         node.meta.mtime = Some(Timestamp::from_second(1_600_000_000).unwrap());
+        // A birth time too, which FreeBSD and NetBSD set as an mtime first.
+        node.meta.generic_attributes.set_timestamp(
+            crate::backend::node::generic_attributes::UNIX_BIRTHTIME,
+            Timestamp::from_second(1_500_000_000).unwrap(),
+        );
         let opts = RestoreOptions::default().no_ownership(true);
         let path = PathBuf::from("f");
         let mut tally = RestoreTally::new();
@@ -1908,7 +1913,11 @@ mod tests {
             0o640,
             "the rest of its metadata is set"
         );
-        assert_ne!(stat().mtime(), 1_600_000_000);
+        assert!(
+            ![1_600_000_000, 1_500_000_000].contains(&stat().mtime()),
+            "a time of the node's set: {}",
+            stat().mtime()
+        );
 
         assert!(set_metadata(
             &dest, opts, &path, &node, false, false, &mut tally
