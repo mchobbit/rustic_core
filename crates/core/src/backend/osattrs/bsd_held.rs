@@ -88,6 +88,14 @@ pub(super) fn clear_restricting_flags(path: &Path) -> io::Result<()> {
 
 /// Clears the restricting flags of the file at `path`, held for putting
 /// back ([`HeldFlags`]).
+///
+/// # Errors
+///
+/// * If the file can't be `lstat`ed (the error as it is).
+/// * If the file opened for holding isn't the one `lstat`ed (its device and
+///   inode differ): "replaced while it was read".
+/// * If its flags can't be set: `fchflags(2)`'s error on the file held,
+///   `lchflags(2)`'s (`chflagsat(2)`'s on OpenBSD) on one cleared by path.
 pub(super) fn clear_restricting_flags_held(path: &Path) -> io::Result<HeldFlags> {
     let m = std::fs::symlink_metadata(path)?;
     if st_flags(&m) & RESTRICTING == 0 {
@@ -131,6 +139,11 @@ pub(super) fn clear_restricting_flags_held(path: &Path) -> io::Result<HeldFlags>
 
 /// Sets `cleared`, the restricting flags [`clear_restricting_flags_held`]
 /// cleared, again on the file open as `f` (at `path`, for errors).
+///
+/// # Errors
+///
+/// * If the file's flags can't be read (`fstat(2)`, the error as it is) or
+///   set (`fchflags(2)`).
 pub(super) fn put_back_restricting_flags(f: &File, path: &Path, cleared: u32) -> io::Result<()> {
     let flags = st_flags(&f.metadata()?);
     if flags | cleared == flags {
@@ -140,6 +153,11 @@ pub(super) fn put_back_restricting_flags(f: &File, path: &Path, cleared: u32) ->
 }
 
 /// Sets `cleared` again on the file at `path`, by path.
+///
+/// # Errors
+///
+/// * If the file's flags can't be read (`lstat(2)`, the error as it is) or
+///   set (`lchflags(2)`, `chflagsat(2)` on OpenBSD).
 pub(super) fn put_back_restricting_flags_path(path: &Path, cleared: u32) -> io::Result<()> {
     let flags = st_flags(&std::fs::symlink_metadata(path)?);
     if flags | cleared == flags {

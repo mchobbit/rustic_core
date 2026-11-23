@@ -136,6 +136,12 @@ fn new_raw_acl() -> Box<RawAcl> {
 }
 
 /// The ACL of type `typ` of the file at `path`, without following a symlink.
+///
+/// # Errors
+///
+/// * If `path` holds a NUL, or `__acl_get_link(2)` fails: its errno, without
+///   the path (the caller adds it, and tells unsupported ACLs apart).
+/// * If the system says the ACL has more entries than a `struct acl` holds.
 fn get_acl(path: &Path, typ: AclType) -> io::Result<Vec<AclEntry>> {
     let p = c_path(path)?;
     let mut raw = new_raw_acl();
@@ -159,6 +165,13 @@ fn get_acl(path: &Path, typ: AclType) -> io::Result<Vec<AclEntry>> {
 
 /// Sets the ACL of type `typ` of the file at `path`, without following a
 /// symlink.
+///
+/// # Errors
+///
+/// * If `acl` has more entries than a `struct acl` holds, or `path` holds a
+///   NUL.
+/// * If `__acl_set_link(2)` fails: with the path, and `Unsupported` where
+///   the file system has no ACLs ([`acl_set_error`]).
 fn set_acl(path: &Path, typ: AclType, acl: &[AclEntry]) -> io::Result<()> {
     if acl.len() > MAX_ENTRIES {
         return Err(io::Error::new(
@@ -187,6 +200,10 @@ fn set_acl(path: &Path, typ: AclType, acl: &[AclEntry]) -> io::Result<()> {
 /// Removes the default ACL of the directory at `path`
 /// (`__acl_delete_link(2)`, as `setfacl -k`): setting one without entries is
 /// refused.
+///
+/// # Errors
+///
+/// * If `path` holds a NUL, or `__acl_delete_link(2)` fails: with the path.
 fn delete_default_acl(path: &Path) -> io::Result<()> {
     let p = c_path(path)?;
     // SAFETY: p is a C string.
@@ -195,6 +212,13 @@ fn delete_default_acl(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// `lpathconf(2)`'s value of `name` for the file at `path`, without
+/// following a symlink.
+///
+/// # Errors
+///
+/// * If `path` holds a NUL, or `lpathconf(2)` fails: its errno, without the
+///   path.
 fn path_conf(path: &Path, name: i32) -> io::Result<libc::c_long> {
     let p = c_path(path)?;
     // SAFETY: p is a C string.
@@ -266,6 +290,12 @@ fn extattr_read(
 /// The names of the user extended attributes of the file at `path`, as the
 /// xattr crate names them (`user.NAME`, by the name's bytes), without
 /// following a symlink.
+///
+/// # Errors
+///
+/// * If `path` holds a NUL, or they can't be listed ([`extattr_read`]):
+///   the errno as it is, without the path, which the caller adds
+///   (`ignore/mapper.rs`).
 pub(super) fn user_extattr_names(path: &Path) -> io::Result<Vec<OsString>> {
     let names = list_extattrs(path, libc::EXTATTR_NAMESPACE_USER)?;
     Ok(names.iter().map(|n| bsd_extattr::user_name(n)).collect())
