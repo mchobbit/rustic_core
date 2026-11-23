@@ -216,36 +216,51 @@ fn no_acls(err: &io::Error) -> bool {
     matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL))
 }
 
-/// Calls an `extattr_*_link(2)` function with a buffer of `size`, or no
-/// buffer when `size` is 0, and returns what it returns.
-fn extattr_call(
-    size: usize,
-    f: impl FnOnce(*mut libc::c_void, usize) -> libc::ssize_t,
-) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0_u8; size];
-    let ptr = if size == 0 {
-        ptr::null_mut()
-    } else {
-        buf.as_mut_ptr().cast()
-    };
-    let n = usize::try_from(check(f(ptr, size))?).unwrap_or(usize::MAX);
-    buf.truncate(n.min(size));
-    if size == 0 {
-        buf.resize(n, 0); // just the size
-    }
-    Ok(buf)
+/// How many times [`extattr_read`] reads a list or value whose size keeps
+/// changing before it gives up.
+const EXTATTR_READS: usize = 4;
+
+/// The size of an extended attribute list or value: what an
+/// `extattr_*_link(2)` function `f` returns when given no buffer.
+fn extattr_size(f: impl Fn(*mut libc::c_void, usize) -> libc::ssize_t) -> io::Result<usize> {
+    Ok(usize::try_from(check(f(ptr::null_mut(), 0))?).unwrap_or(usize::MAX))
 }
 
-/// Reads an extended attribute list or value: first its size, then the
-/// data.
+/// Reads an extended attribute list or value through an
+/// `extattr_*_link(2)` function `f`: first its size, then the data into a
+/// buffer of that size. `extattr_get_link(2)` and `extattr_list_link(2)`
+/// copy what fits and say nothing of the rest, so a read that fills the
+/// buffer is checked against the size again: if it changed meanwhile, as a
+/// value rewritten or a name added does, the list or value is read again,
+/// up to [`EXTATTR_READS`] times.
+///
+/// # Errors
+///
+/// * If `f` fails (its errno, without the path), or the size changed with
+///   each read.
 fn extattr_read(
     f: impl Fn(*mut libc::c_void, usize) -> libc::ssize_t,
 ) -> io::Result<Vec<u8>> {
-    let size = extattr_call(0, &f)?.len();
-    if size == 0 {
-        return Ok(Vec::new());
+    let mut size = extattr_size(&f)?;
+    for _ in 0..EXTATTR_READS {
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let mut buf = vec![0_u8; size];
+        let n = usize::try_from(check(f(buf.as_mut_ptr().cast(), size))?).unwrap_or(usize::MAX);
+        if n < size {
+            buf.truncate(n);
+            return Ok(buf);
+        }
+        let now = extattr_size(&f)?;
+        if now == size {
+            return Ok(buf);
+        }
+        size = now;
     }
-    extattr_call(size, f)
+    Err(io::Error::other(format!(
+        "its size changed with each of {EXTATTR_READS} reads"
+    )))
 }
 
 /// The names of the user extended attributes of the file at `path`, as the
@@ -817,6 +832,48 @@ mod tests {
     #[test]
     fn raw_acl_is_struct_acl() {
         assert_eq!(size_of::<RawAcl>(), 4088);
+    }
+
+    /// A fake `extattr_*_link(2)`: the list or value is `values[i]` (the
+    /// last one once they run out) at its `i`th call, and it copies what
+    /// fits, as the real ones do.
+    fn fake_extattr(values: &[&'static str]) -> impl Fn(*mut libc::c_void, usize) -> libc::ssize_t {
+        let values: Vec<&'static [u8]> = values.iter().map(|v| v.as_bytes()).collect();
+        let calls = std::cell::Cell::new(0);
+        move |data, n| {
+            let i = calls.get();
+            calls.set(i + 1);
+            let value = values[i.min(values.len() - 1)];
+            let k = if data.is_null() {
+                value.len()
+            } else {
+                let k = value.len().min(n);
+                // SAFETY: data points to n bytes, and k is at most n.
+                unsafe { ptr::copy_nonoverlapping(value.as_ptr(), data.cast::<u8>(), k) };
+                k
+            };
+            libc::ssize_t::try_from(k).unwrap()
+        }
+    }
+
+    #[test]
+    fn extattr_read_rereads_what_changed() {
+        // Read as it is.
+        assert_eq!(extattr_read(fake_extattr(&["value"])).unwrap(), b"value");
+        assert!(extattr_read(fake_extattr(&[""])).unwrap().is_empty());
+        // Grown from 10 to 20 bytes between the size and the read: the read
+        // that filled its 10 bytes is done again with 20.
+        let (short, long) = ("0123456789", "0123456789abcdefghij");
+        assert_eq!(extattr_read(fake_extattr(&[short, long])).unwrap(), long.as_bytes());
+        // Shrunk: what was read is all there is.
+        assert_eq!(extattr_read(fake_extattr(&[short, "01234"])).unwrap(), b"01234");
+        // Gone after the size: nothing.
+        assert!(extattr_read(fake_extattr(&[short, ""])).unwrap().is_empty());
+        // Growing with each call: given up on, not kept cut short.
+        let growing =
+            ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh", "abcdefghi"];
+        let err = extattr_read(fake_extattr(&growing)).unwrap_err();
+        assert!(err.to_string().contains("changed with each"), "{err}");
     }
 
     #[test]
