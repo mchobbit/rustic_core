@@ -523,8 +523,16 @@ that either program restores what the other backed up.
   which the xattr crate doesn't support: they are read and written through
   `openat(2)` with `O_XATTR`, without the `SUNWattr_ro` and `SUNWattr_rw`
   system attribute views, and stored in name order, not the attribute
-  directory's, as BackOtter's restic does. A restore creates an
-  attribute file with mode 0600, so that it is never readable by others
+  directory's, as BackOtter's restic does. An attribute is read and
+  removed by its name's bytes, and a node keeps a name that isn't UTF-8
+  with U+FFFD for what isn't, as on the other systems and as BackOtter's
+  restic's JSON keeps it: a restore gives the file the attribute under
+  that name, and removes the one whose name no node can hold
+  (0.14.0+backotter.2; before, such an attribute was opened by the U+FFFD
+  name, so a backup left it out with "No such file or directory" and a
+  restore could not remove it). The listing's `readdir(3C)` errors are
+  errors (before, one cut the listing short, silently). A restore creates
+  an attribute file with mode 0600, so that it is never readable by others
   before it gets its own owner, mode, ACL and times (`illumos.xattr_meta`),
   with `fchownat(2)`, `fchmodat(2)`, `facl(2)` and `utimensat(2)` on the
   attribute directory, in that order, once the values are written (in

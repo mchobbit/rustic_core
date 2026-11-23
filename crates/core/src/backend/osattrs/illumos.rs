@@ -738,8 +738,10 @@ fn readdir_step<T>(read: impl FnOnce() -> Option<T>) -> io::Result<Option<T>> {
 }
 
 /// The names in an attribute directory, without the system attribute views,
-/// sorted, as BackOtter's restic stores them (not in directory order).
-fn attr_names(dir: &File) -> io::Result<Vec<String>> {
+/// sorted, as BackOtter's restic stores them (not in directory order): as
+/// their bytes, by which an attribute is opened and removed whatever they
+/// are. A node holds a name as UTF-8 ([`node_name`]).
+fn attr_names(dir: &File) -> io::Result<Vec<CString>> {
     // fdopendir(3C) takes over the descriptor it's given: give it its own.
     // SAFETY: dir is an open descriptor.
     let fd = check(unsafe { libc::dup(dir.as_raw_fd()) })?;
@@ -776,9 +778,10 @@ fn attr_names(dir: &File) -> io::Result<Vec<String>> {
         let name_ptr = unsafe { &raw const (*e).d_name }.cast();
         // SAFETY: d_name is a C string the kernel NUL-terminated inside the
         // record, which is valid until the next readdir.
-        let name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
-        if name != "." && name != ".." && !SYSTEM_VIEWS.contains(&&*name) {
-            names.push(name.into_owned());
+        let name = unsafe { CStr::from_ptr(name_ptr) };
+        let bytes = name.to_bytes();
+        if bytes != b"." && bytes != b".." && !SYSTEM_VIEWS.iter().any(|v| v.as_bytes() == bytes) {
+            names.push(name.to_owned());
         }
     };
     // SAFETY: d is an open DIR, closed once.
@@ -788,14 +791,20 @@ fn attr_names(dir: &File) -> io::Result<Vec<String>> {
     Ok(names)
 }
 
+/// The name a node holds for the attribute `name`: itself, with U+FFFD for
+/// what isn't UTF-8, as on every other system and as BackOtter's restic's
+/// JSON keeps it.
+fn node_name(name: &CStr) -> String {
+    name.to_string_lossy().into_owned()
+}
+
 /// Opens the extended attribute `name` in `dir`, an attribute directory. A
 /// new one is created with mode 0600, so that it is never readable by
 /// others before its own mode is restored ([`restore_attributes`]).
-fn open_attr(dir: &File, name: &str, how: libc::c_int) -> io::Result<File> {
-    let n = CString::new(name)?;
+fn open_attr(dir: &File, name: &CStr, how: libc::c_int) -> io::Result<File> {
     let mode: libc::c_uint = 0o600;
-    // SAFETY: n is a C string.
-    let fd = check(unsafe { libc::openat(dir.as_raw_fd(), n.as_ptr(), how | libc::O_CLOEXEC, mode) })?;
+    // SAFETY: name is a C string.
+    let fd = check(unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), how | libc::O_CLOEXEC, mode) })?;
     // SAFETY: fd is a new file descriptor, owned by nothing else.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
@@ -803,7 +812,9 @@ fn open_attr(dir: &File, name: &str, how: libc::c_int) -> io::Result<File> {
 /// The extended attributes of the file at `path`: on illumos, named
 /// attribute files (`runat(1)`, `fsattr(5)`), which the xattr crate doesn't
 /// support. One whose value can't be read is left out and named in
-/// `unreadable`, and the others are kept, as BackOtter's restic does.
+/// `unreadable`, and the others are kept, as BackOtter's restic does. One
+/// whose name isn't UTF-8 is read by its bytes and kept under its name with
+/// U+FFFD for what isn't ([`node_name`]).
 ///
 /// # Errors
 ///
@@ -816,10 +827,10 @@ pub(super) fn xattrs_read(path: &Path) -> io::Result<XattrsRead> {
     for name in attr_names(&dir)? {
         match attr_value(&dir, &name) {
             Ok(value) => read.attrs.push(ExtendedAttribute {
-                name,
+                name: node_name(&name),
                 value: Some(value),
             }),
-            Err(err) => read.unreadable.push((name, err)),
+            Err(err) => read.unreadable.push((node_name(&name), err)),
         }
     }
     Ok(read)
@@ -827,7 +838,7 @@ pub(super) fn xattrs_read(path: &Path) -> io::Result<XattrsRead> {
 
 /// The value of the extended attribute `name` in `dir`, an attribute
 /// directory.
-fn attr_value(dir: &File, name: &str) -> io::Result<Vec<u8>> {
+fn attr_value(dir: &File, name: &CStr) -> io::Result<Vec<u8>> {
     let mut value = Vec::new();
     _ = open_attr(dir, name, libc::O_RDONLY)?.read_to_end(&mut value)?;
     Ok(value)
@@ -836,7 +847,7 @@ fn attr_value(dir: &File, name: &str) -> io::Result<Vec<u8>> {
 /// Whether the extended attribute `name` in `dir`, an attribute directory,
 /// has the value `want`: false where it can't be read. Only one of the
 /// same size is read.
-fn attr_has_value(dir: &File, name: &str, want: &[u8]) -> bool {
+fn attr_has_value(dir: &File, name: &CStr, want: &[u8]) -> bool {
     open_attr(dir, name, libc::O_RDONLY).is_ok_and(|mut f| {
         let mut value = Vec::with_capacity(want.len());
         f.metadata().is_ok_and(|m| m.len() == want.len() as u64)
@@ -851,7 +862,9 @@ fn attr_has_value(dir: &File, name: &str, want: &[u8]) -> bool {
 /// One the file has already, with its node's value, is left as it is, as on
 /// every other system and in BackOtter's restic; one that can't be read is
 /// written. One whose name isn't an attribute file's, such as `..`, is
-/// refused ([`attr_name_refused`]).
+/// refused ([`attr_name_refused`]). One the file has that `attrs` hasn't is
+/// removed by its name's bytes, so one whose name isn't UTF-8 goes too (a
+/// node holds no such name).
 pub(super) fn set_xattrs(path: &Path, attrs: &[ExtendedAttribute]) -> Result<(), XattrErrors> {
     let Some(dir) = attr_dir(path)? else {
         // Each one named, as those that can't be set are.
@@ -871,14 +884,11 @@ pub(super) fn set_xattrs(path: &Path, attrs: &[ExtendedAttribute]) -> Result<(),
     let present = match attr_names(&dir) {
         Ok(names) => {
             for name in &names {
-                if !attrs.iter().any(|a| a.name == *name) {
-                    let n = CString::new(name.as_str()).map_err(io::Error::from);
-                    // SAFETY: n is a C string.
-                    let removed = n.and_then(|n| {
-                        check(unsafe { libc::unlinkat(dir.as_raw_fd(), n.as_ptr(), 0) })
-                    });
+                if !attrs.iter().any(|a| a.name.as_bytes() == name.to_bytes()) {
+                    // SAFETY: name is a C string.
+                    let removed = check(unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) });
                     if let Err(err) = removed {
-                        errors.push(format!("removing {name}"), err);
+                        errors.push(format!("removing {}", node_name(name)), err);
                     }
                 }
             }
@@ -895,11 +905,19 @@ pub(super) fn set_xattrs(path: &Path, attrs: &[ExtendedAttribute]) -> Result<(),
             errors.push(a.name.as_str(), err);
             continue;
         }
+        // No NUL in it: it wasn't refused.
+        let name = match CString::new(a.name.as_str()) {
+            Ok(name) => name,
+            Err(err) => {
+                errors.push(a.name.as_str(), err.into());
+                continue;
+            }
+        };
         let value = a.value.as_deref().unwrap_or_default();
-        if present.contains(&a.name) && attr_has_value(&dir, &a.name, value) {
+        if present.contains(&name) && attr_has_value(&dir, &name, value) {
             continue;
         }
-        let set = open_attr(&dir, &a.name, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)
+        let set = open_attr(&dir, &name, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)
             .and_then(|mut f| f.write_all(value));
         if let Err(err) = set {
             errors.push(a.name.as_str(), err);
@@ -938,8 +956,10 @@ pub(super) fn fill_xattr_meta(path: &Path, node: &mut Node) {
     };
     let mut sids = SidNamer::default();
     let metas: BTreeMap<_, _> = names
-        .into_iter()
-        .filter_map(|name| read_xattr_meta(&dir, path, &name, &mut sids).map(|meta| (name, meta)))
+        .iter()
+        .filter_map(|name| {
+            read_xattr_meta(&dir, path, name, &mut sids).map(|meta| (node_name(name), meta))
+        })
         .collect();
     if !metas.is_empty() {
         _ = node.meta.generic_attributes.set(ILLUMOS_XATTR_META, &metas);
@@ -949,13 +969,12 @@ pub(super) fn fill_xattr_meta(path: &Path, node: &mut Node) {
 
 /// The metadata of the attribute `name` in `dir`, the attribute directory
 /// of `path`, if it can be read.
-fn read_xattr_meta(dir: &File, path: &Path, name: &str, sids: &mut SidNamer) -> Option<XattrMeta> {
-    let at = attr_path(path, name);
-    let n = CString::new(name).ok()?;
+fn read_xattr_meta(dir: &File, path: &Path, name: &CStr, sids: &mut SidNamer) -> Option<XattrMeta> {
+    let at = attr_path(path, &node_name(name));
     let mut st = MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: n is a C string, st a stat buffer.
+    // SAFETY: name is a C string, st a stat buffer.
     let r = unsafe {
-        libc::fstatat(dir.as_raw_fd(), n.as_ptr(), st.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+        libc::fstatat(dir.as_raw_fd(), name.as_ptr(), st.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW)
     };
     if let Err(err) = check(r) {
         debug!("fstatat {}: {err}", at.display());
@@ -1101,7 +1120,7 @@ fn restore_one_xattr_meta(
     if let Some(err) = aces_with_ids(ILLUMOS_XATTR_META, &mut entries) {
         _ = unmapped.get_or_insert(err);
     }
-    let acl = open_attr(dir, name, libc::O_RDONLY | libc::O_NONBLOCK)
+    let acl = open_attr(dir, &n, libc::O_RDONLY | libc::O_NONBLOCK)
         .map_err(|err| path_error("openat", &at, &err))
         .and_then(|f| {
             let of = AclOf::File(&f, &at);
@@ -1139,6 +1158,11 @@ mod tests {
         }
     }
 
+    /// The attribute `name` in the attribute directory `adir`, open.
+    fn open_named(adir: &File, name: &str) -> File {
+        open_attr(adir, &CString::new(name).unwrap(), libc::O_RDONLY).unwrap()
+    }
+
     /// BackOtter: an extended attribute the file has already, with its
     /// node's value, isn't written again; the others are written, and those
     /// the node hasn't got removed. Nothing to check on a file system
@@ -1160,8 +1184,7 @@ mod tests {
         }
         let adir = attr_dir(&file).unwrap().unwrap();
         let mtime = |name: &str| {
-            open_attr(&adir, name, libc::O_RDONLY)
-                .unwrap()
+            open_named(&adir, name)
                 .metadata()
                 .unwrap()
                 .modified()
@@ -1246,6 +1269,54 @@ mod tests {
         assert_eq!(got.unwrap(), Some(1));
     }
 
+    /// ForkAudit1 G5-06 (RustAudit1 R4-05): an attribute whose name isn't
+    /// UTF-8 is read by its bytes and kept under its name with U+FFFD, as
+    /// on every other system, with its metadata, and a restore removes it
+    /// by its bytes. Before, it was opened and removed by the U+FFFD name:
+    /// "No such file or directory" at backup, and never removed.
+    #[test]
+    fn a_name_that_is_not_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"").unwrap();
+        if set_xattrs(&file, &[xattr("plain", b"p")]).is_err() {
+            eprintln!("no extended attributes in {}", dir.path().display());
+            return;
+        }
+        let adir = attr_dir(&file).unwrap().unwrap();
+        let raw = c"caf\xe9";
+        let made = open_attr(&adir, raw, libc::O_WRONLY | libc::O_CREAT)
+            .and_then(|mut f| f.write_all(b"latin-1"));
+        if let Err(err) = made {
+            eprintln!("no attribute names that aren't UTF-8 in {}: {err}", dir.path().display());
+            return;
+        }
+        assert_eq!(attr_names(&adir).unwrap(), [raw.to_owned(), c"plain".to_owned()]);
+        let read = xattrs_read(&file).unwrap();
+        assert!(read.unreadable.is_empty(), "{:?}", read.unreadable);
+        assert_eq!(read.attrs, [xattr("caf\u{fffd}", b"latin-1"), xattr("plain", b"p")]);
+        let mut node = file_node(0o644, 0, 0);
+        fill_xattr_meta(&file, &mut node);
+        let metas = node
+            .meta
+            .generic_attributes
+            .get::<BTreeMap<String, XattrMeta>>(ILLUMOS_XATTR_META)
+            .unwrap()
+            .unwrap();
+        assert_eq!(metas.keys().collect::<Vec<_>>(), ["caf\u{fffd}", "plain"]);
+
+        // A restore of that node: the file has the attribute under the name
+        // the node holds, and no longer the one it can't hold.
+        set_xattrs(&file, &read.attrs).unwrap();
+        assert_eq!(attr_names(&adir).unwrap(), [c"caf\u{fffd}".to_owned(), c"plain".to_owned()]);
+        assert_eq!(xattrs_read(&file).unwrap().attrs, read.attrs);
+
+        // And one the node hasn't got at all is removed.
+        drop(open_attr(&adir, raw, libc::O_WRONLY | libc::O_CREAT).unwrap());
+        set_xattrs(&file, &[]).unwrap();
+        assert_eq!(attr_names(&adir).unwrap(), Vec::<CString>::new());
+    }
+
     /// The node of a file with the mode `mode`, owned by `uid`:`gid`.
     fn file_node(mode: u32, uid: u32, gid: u32) -> Node {
         let meta = crate::backend::node::Metadata {
@@ -1260,7 +1331,7 @@ mod tests {
     /// The owner and group of the attribute `name` of `file`.
     fn attr_owner(file: &Path, name: &str) -> (u32, u32) {
         let adir = attr_dir(file).unwrap().unwrap();
-        let m = open_attr(&adir, name, libc::O_RDONLY).unwrap().metadata().unwrap();
+        let m = open_named(&adir, name).metadata().unwrap();
         (m.uid(), m.gid())
     }
 
@@ -1298,7 +1369,7 @@ mod tests {
         node.meta.generic_attributes.set(ILLUMOS_XATTR_META, &metas).unwrap();
         let mode = |name: &str| {
             let adir = attr_dir(&file).unwrap().unwrap();
-            open_attr(&adir, name, libc::O_RDONLY).unwrap().metadata().unwrap().mode() & 0o7777
+            open_named(&adir, name).metadata().unwrap().mode() & 0o7777
         };
 
         // --no-ownership: the attributes stay the restore's own (root's),
@@ -1487,7 +1558,7 @@ mod tests {
             return;
         }
         let adir = attr_dir(&file).unwrap().unwrap();
-        let attr_file = open_attr(&adir, "note", libc::O_RDONLY).unwrap();
+        let attr_file = open_named(&adir, "note");
         let at = attr_path(&file, "note");
         let mut acl = get_ace(AclOf::File(&attr_file, &at)).unwrap();
         acl.insert(0, nobody_reads());
