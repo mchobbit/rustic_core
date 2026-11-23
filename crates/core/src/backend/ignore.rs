@@ -499,7 +499,9 @@ impl Iterator for LocalSourceWalker {
                         && entry.file_type().unwrap().is_dir()
                         && entry.path().file_name().is_none() =>
                 {
-                    self.walker.next()
+                    // BackOtter: the entry after it is read as any other,
+                    // so a socket or door there is skipped too.
+                    continue;
                 }
                 item => item,
             }?;
@@ -660,6 +662,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(source.entries().count(), 0);
+    }
+
+    #[test]
+    fn socket_after_a_nameless_root_is_skipped() {
+        // BackOtter: a root directory without a name ("/", "sub/..") has no
+        // node; the entry read after it is filtered as any other. A socket
+        // that sorts first there got a node (RustAudit1 R7-01).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let _socket = UnixListener::bind(dir.path().join("0-socket")).unwrap();
+        std::fs::write(dir.path().join("a-file"), b"data").unwrap();
+
+        let source = LocalSource::new(
+            LocalSourceSaveOptions::default(),
+            &Excludes::default(),
+            &LocalSourceFilterOptions::default(),
+            &[dir.path().join("sub/..")],
+        )
+        .unwrap();
+        let names: Vec<_> = source
+            .entries()
+            .map(|entry| entry.unwrap().node.name().into_owned())
+            .collect();
+        assert_eq!(names, ["a-file", "sub"]);
     }
 
     #[test]
