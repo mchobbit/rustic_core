@@ -2014,10 +2014,22 @@ fn path_below(dir: &Path, path: &Path) -> Option<PathBuf> {
 /// BackOtter: refuses `dir`, a directory to clone from
 /// ([`Repository::clone_sources`]), when it is inside `dest`, the restore's
 /// destination, as [`path_below`] sees it.  `dest` itself is not refused:
-/// nothing is taken from it.
+/// nothing is taken from it.  Nor is a `dir` only written through `dest`
+/// that leaves it at once and resolves to a place outside it
+/// (`DEST/../seed`): no entry of `dest`, which the restore could change,
+/// is on its way.  One that goes through an entry of `dest` (a symlink
+/// there that leads out) is refused.
 fn clone_dir_outside(dir: &Path, dest: &Path) -> RusticResult<()> {
+    // `path_below` gives the path as written where the two resolve and
+    // `dir` isn't below `dest` then: inside only if it names an entry of
+    // `dest` before any `..`.
+    let names_entry = |rel: &Path| {
+        rel.components()
+            .find(|c| !matches!(c, std::path::Component::CurDir))
+            .is_some_and(|c| matches!(c, std::path::Component::Normal(_)))
+    };
     match path_below(dest, dir) {
-        Some(rel) if !rel.as_os_str().is_empty() => Err(RusticError::new(
+        Some(rel) if names_entry(&rel) => Err(RusticError::new(
             ErrorKind::InvalidInput,
             "The directory to clone from, `{dir}`, is inside the restore's destination `{dest}`, which the restore changes. Please clone from a directory outside the destination.",
         )
@@ -2080,11 +2092,21 @@ mod tests {
         {
             std::os::unix::fs::symlink(&old, tmp.path().join("link")).unwrap();
             assert!(clone_dir_outside(&tmp.path().join("link"), &dest).is_err());
+            // Through an entry of the destination that leads out of it:
+            // the restore may change that entry.
+            std::os::unix::fs::symlink(&beside, dest.join("out")).unwrap();
+            assert!(clone_dir_outside(&dest.join("out"), &dest).is_err());
         }
         clone_dir_outside(&dest, &dest).unwrap();
         clone_dir_outside(tmp.path(), &dest).unwrap();
         clone_dir_outside(&dest, &old).unwrap();
         clone_dir_outside(&beside, &dest).unwrap();
+        // Outside, written through the destination (the review of
+        // ForkAudit1 G8-03's fix): not refused; back inside is.
+        clone_dir_outside(&dest.join("../told"), &dest).unwrap();
+        clone_dir_outside(&dest.join("./../told"), &dest).unwrap();
+        clone_dir_outside(&dest.join(".."), &dest).unwrap();
+        assert!(clone_dir_outside(&dest.join("../t/old"), &dest).is_err());
     }
 
     #[test]

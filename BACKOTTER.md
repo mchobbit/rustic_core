@@ -1608,7 +1608,10 @@ that either program restores what the other backed up.
   file of its size, not the file cloned onto by any name: S11). A
   directory to clone from that is inside the restore's destination is
   refused before anything is written (`clone_sources`): the restore
-  changes what is there, so a later clone could take what it wrote. A
+  changes what is there, so a later clone could take what it wrote. One
+  outside it that is only written through it (`DEST/../seed`) is taken;
+  one reached through an entry of the destination (a symlink there that
+  leads out) is refused, as the restore may change that entry. A
   node of the `--clone-from` tree whose path would leave the directory
   (`..`, an absolute path: a damaged or crafted snapshot) names no source
   (0.14.0+backotter.2), as the restore itself refuses such a path. Only
