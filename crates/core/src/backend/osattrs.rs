@@ -361,6 +361,8 @@ const FICLONE: libc::Ioctl = libc::_IOW::<libc::c_int>(0x94, 9);
 /// BackOtter: whether [`prepare_file`] has nothing to do for `node`: no flag
 /// or option that goes on before the data, so that its contents may come
 /// whole from a clone (`restore --clone-from`).
+// `os::FLAGS_BEFORE_DATA` is 0 but on Linux.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::bad_bit_mask))]
 pub(crate) fn takes_nothing_before_data(node: &Node) -> bool {
     let flags = file_flags(node).is_none_or(|f| f & os::FLAGS_BEFORE_DATA == 0);
     #[cfg(target_os = "linux")]
@@ -378,6 +380,8 @@ pub(crate) fn takes_nothing_before_data(node: &Node) -> bool {
 /// # Errors
 ///
 /// * If the file can't be created, or the flags set.
+// `os::FLAGS_BEFORE_DATA` is 0 but on Linux.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::bad_bit_mask))]
 pub(crate) fn prepare_file(path: &Path, node: &Node) -> io::Result<()> {
     // BackOtter: past PATH_MAX, through a short path to it.
     let path = &*walkdir::short_path(path);
@@ -425,10 +429,9 @@ pub(crate) fn prepare_dir(path: &Path, node: &Node, known_bko: bool) -> io::Resu
     if os::FLAGS_BEFORE_ENTRIES == 0 {
         return Ok(());
     }
-    let flags = match node_flags(node, known_bko) {
-        Some(flags) => os::prepare_dir_for_flags(path, flags & os::FLAGS_BEFORE_ENTRIES),
-        None => Ok(()),
-    };
+    let flags = node_flags(node, known_bko).map_or(Ok(()), |flags| {
+        os::prepare_dir_for_flags(path, flags & os::FLAGS_BEFORE_ENTRIES)
+    });
     #[cfg(target_os = "linux")]
     os::prepare_dir_for_options(path, node, known_bko);
     flags
@@ -705,6 +708,8 @@ pub(crate) fn restore_zfs_dos_flags(
 ///
 /// * If they couldn't be set: an [`Unsupported`] error if the file system
 ///   isn't FAT, or refuses them as unsupported.
+// Nothing to fail but on Linux.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
 pub(crate) fn restore_fat_attrs(path: &Path, node_type: &NodeType, attrs: u32) -> io::Result<()> {
     // BackOtter: past PATH_MAX, through a short path to it.
     let path = &*walkdir::short_path(path);
@@ -746,6 +751,8 @@ pub(crate) fn clear_dir_xfs_options(path: &Path) -> Option<XfsOptions> {
 ///   (`EINVAL`: with an extent size hint's inheritance whose size isn't a
 ///   multiple of the realtime extent size) gets the rest, with an
 ///   [`Unsupported`] error for bit `0x100`.
+// Nothing to fail but on Linux.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
 pub(crate) fn restore_xfs_options(
     path: &Path,
     node_type: &NodeType,
@@ -824,7 +831,9 @@ fn os_preallocate(f: &File, len: u64) -> io::Result<()> {
     Err(io::Error::last_os_error())
 }
 
+// The signature of the systems that can.
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+#[allow(clippy::unnecessary_wraps)]
 fn os_preallocate(_f: &File, _len: u64) -> io::Result<()> {
     Ok(())
 }

@@ -316,6 +316,8 @@ fn hole_block(size: Option<u64>) -> u64 {
     target_vendor = "apple"
 ))]
 #[allow(unsafe_code)]
+// `f_bsize` is signed on Linux, and a `u32` or `u64` elsewhere.
+#[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)]
 fn fs_block_size(f: &File) -> Option<u64> {
     use std::os::fd::AsRawFd;
 
@@ -333,6 +335,8 @@ fn fs_block_size(f: &File) -> Option<u64> {
 /// the BSDs and macOS, is the size of the best transfer, not of a block).
 #[cfg(any(target_os = "netbsd", target_os = "illumos", target_os = "solaris"))]
 #[allow(unsafe_code)]
+// `f_bsize` is an `unsigned long`: a `u64` on the systems we build for.
+#[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)]
 fn fs_block_size(f: &File) -> Option<u64> {
     use std::os::fd::AsRawFd;
 
