@@ -1662,9 +1662,9 @@ pub(crate) fn set_native_xattrs(
 
 /// The names of the extended attributes of the file at `path`, as the xattr
 /// crate names them. On FreeBSD and NetBSD, those of the user namespace
-/// only, listed here: xattr 1.6 names the last attribute of the system
-/// namespace as one of the user namespace (which is kept as a generic
-/// attribute anyway).
+/// only, listed here: the xattr crate (1.6, and 1.7 the same) names the
+/// last attribute of the system namespace as one of the user namespace
+/// (which is kept as a generic attribute anyway).
 ///
 /// # Errors
 ///
@@ -1684,8 +1684,8 @@ pub(crate) fn xattr_list(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
 
 /// The value of the extended attribute `name` (as the xattr crate names it)
 /// of the file at `path`, not following a symlink; `None` where it has
-/// none. On Linux, read whole here: the xattr crate read a value over 4 KiB
-/// as empty (`os::xattr_get`).
+/// none. On Linux, read whole here: the xattr crate before 1.7 read a
+/// value over 4 KiB as empty (`os::xattr_get`).
 ///
 /// # Errors
 ///

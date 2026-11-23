@@ -1179,11 +1179,14 @@ pub(super) fn set_xattrs(_path: &Path, _attrs: &[ExtendedAttribute]) -> Result<(
 
 /// Reads what `getxattr(2)`-like `call` gives into a buffer of the size it
 /// gives for none, again while the value grows in between (`ERANGE`): the
-/// whole value, however large. The xattr crate (1.6, on rustix 1.1) takes a
-/// first 4 KiB and, for a larger value, asks rustix for its size with an
-/// empty buffer, which rustix 1.1 answers with 0: every value over 4 KiB
-/// was read as empty, and a backup kept a 15000-byte `user.*` attribute as
-/// empty (rocky10, tumbleweed). restic reads it whole.
+/// whole value, however large. The xattr crate before 1.7 (1.6, on rustix
+/// 1.1) took a first 4 KiB and, for a larger value, asked rustix for its
+/// size with an empty buffer, which rustix 1.1 answered with 0: every value
+/// over 4 KiB was read as empty, and a backup kept a 15000-byte `user.*`
+/// attribute as empty (rocky10, tumbleweed). restic reads it whole. xattr
+/// 1.7 asks for the size as this does (rustix's `*_query` calls), and is
+/// what `Cargo.lock` has now; this stays while `Cargo.toml` takes any
+/// xattr 1.x.
 fn read_whole(mut call: impl FnMut(*mut libc::c_void, usize) -> isize) -> io::Result<Vec<u8>> {
     loop {
         let size = call(std::ptr::null_mut(), 0);
