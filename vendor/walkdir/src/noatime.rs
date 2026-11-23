@@ -14,7 +14,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 /// An entry of a directory, as `readdir(3)` gives it.
-pub(crate) struct RawEntry {
+pub struct RawEntry {
     /// The directory's path joined with the entry's name.
     pub(crate) path: PathBuf,
     /// `d_type`, which may be `DT_UNKNOWN`.
@@ -25,7 +25,7 @@ pub(crate) struct RawEntry {
 
 /// The entries of a directory, but `.` and `..`, as `std::fs::ReadDir`
 /// gives them.
-pub(crate) struct ReadDir {
+pub struct ReadDir {
     dir: *mut libc::DIR,
     path: PathBuf,
     done: bool,
@@ -45,14 +45,15 @@ impl fmt::Debug for ReadDir {
 
 /// Opens the directory at `path` for reading, without updating its access
 /// time where the caller may ask for that.
-pub(crate) fn read_dir(path: &Path) -> io::Result<ReadDir> {
+pub fn read_dir(path: &Path) -> io::Result<ReadDir> {
     // Past PATH_MAX, through a short path to it (longpath.rs); its entries
     // keep the long one.
     let c_path = CString::new(crate::short_path(path).as_os_str().as_bytes())?;
     let how = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
     // SAFETY: c_path is a C string.
     let mut fd = unsafe { libc::open(c_path.as_ptr(), how | libc::O_NOATIME) };
-    if fd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+    if fd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    {
         // SAFETY: as above.
         fd = unsafe { libc::open(c_path.as_ptr(), how) };
     }
@@ -70,14 +71,24 @@ pub(crate) fn read_dir(path: &Path) -> io::Result<ReadDir> {
     Ok(ReadDir { dir, path: path.to_path_buf(), done: false })
 }
 
+/// Sets `errno` to 0, so that a null from `readdir(3)` can be told apart:
+/// the end of the stream, or an error.
 #[cfg(target_os = "android")]
-unsafe fn clear_errno() {
-    *libc::__errno() = 0;
+fn clear_errno() {
+    // SAFETY: __errno takes nothing, and gives this thread's errno.
+    let errno = unsafe { libc::__errno() };
+    // SAFETY: errno is valid for writes, for as long as the thread runs.
+    unsafe { *errno = 0 };
 }
 
+/// Sets `errno` to 0, so that a null from `readdir(3)` can be told apart:
+/// the end of the stream, or an error.
 #[cfg(not(target_os = "android"))]
-unsafe fn clear_errno() {
-    *libc::__errno_location() = 0;
+fn clear_errno() {
+    // SAFETY: __errno_location takes nothing, and gives this thread's errno.
+    let errno = unsafe { libc::__errno_location() };
+    // SAFETY: errno is valid for writes, for as long as the thread runs.
+    unsafe { *errno = 0 };
 }
 
 impl Iterator for ReadDir {
@@ -85,16 +96,15 @@ impl Iterator for ReadDir {
 
     fn next(&mut self) -> Option<io::Result<RawEntry>> {
         while !self.done {
-            // SAFETY: readdir(3) returns null at the end, setting errno only
-            // on an error; the entry it returns lives until the next call.
-            let ent = unsafe {
-                clear_errno();
-                #[cfg(all(target_os = "linux", target_env = "gnu"))]
-                let ent = libc::readdir64(self.dir);
-                #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-                let ent = libc::readdir(self.dir);
-                ent
-            };
+            clear_errno();
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            // SAFETY: self.dir is an open stream; readdir(3) returns null at
+            // the end, setting errno only on an error; the entry it returns
+            // lives until the next call.
+            let ent = unsafe { libc::readdir64(self.dir) };
+            #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+            // SAFETY: as above.
+            let ent = unsafe { libc::readdir(self.dir) };
             if ent.is_null() {
                 self.done = true;
                 let err = io::Error::last_os_error();
@@ -148,7 +158,8 @@ mod tests {
 
     #[test]
     fn reads_like_std() {
-        let dir = std::env::temp_dir().join(format!("walkdir-noatime-{}", std::process::id()));
+        let dir = std::env::temp_dir()
+            .join(format!("walkdir-noatime-{}", std::process::id()));
         fs::create_dir_all(dir.join("d")).unwrap();
         fs::write(dir.join("f"), b"x").unwrap();
         std::os::unix::fs::symlink("f", dir.join("l")).unwrap();

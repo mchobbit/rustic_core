@@ -183,12 +183,21 @@ pub(super) fn set_xattrs_all(
             .position(|(matched, _)| matched.as_ref() == Some(&curr_node_name))
         {
             // BackOtter: one with the right value already is left; one
-            // that can't be read is set below, as are the others.
+            // that can't be read is set below, as are the others. By its
+            // bytes: a node's attribute without a value (JSON null, which a
+            // backup saves for one whose value the file system wouldn't
+            // give) is set as an empty one, so the empty value the file
+            // then has is the right one, as in BackOtter's restic
+            // (bytes.Equal). 0.14.0+backotter.1 took the two for unequal
+            // and set it again on every restore (ForkAudit1 G7-04).
             Some(index) => {
-                let value = &extended_attributes[index].value;
+                let value = extended_attributes[index]
+                    .value
+                    .as_deref()
+                    .unwrap_or_default();
                 if calls
                     .get(filename, &curr_name)
-                    .is_ok_and(|curr| value == &curr)
+                    .is_ok_and(|curr| curr.is_some_and(|curr| curr == value))
                 {
                     done[index] = true;
                 }
@@ -663,6 +672,46 @@ mod xattr_tests {
         want.sort();
         assert_eq!(calls.names(), want);
         assert_eq!(*calls.sets.borrow(), ["system.mac"]);
+    }
+
+    /// BackOtter (ForkAudit1 G7-04): a node's attribute without a value
+    /// is set as an empty one, once: over the empty value the file then
+    /// has it isn't set again (0.14.0+backotter.1 set it on every restore,
+    /// moving the file's change time); over another value it is.
+    #[test]
+    fn xattr_without_value_is_the_empty_one() {
+        let file = Path::new("/r/f");
+        let os_name = osattrs::xattr_os_name("user.a");
+        let attrs = [ExtendedAttribute {
+            name: "user.a".to_string(),
+            value: None,
+        }];
+        let calls = FakeXattrs::with(&[], &[]);
+        set_xattrs_with(&calls, file, &attrs, false).unwrap();
+        assert_eq!(
+            calls.sets.borrow().as_slice(),
+            std::slice::from_ref(&os_name)
+        );
+        // Again, over its own result: no call.
+        set_xattrs_with(&calls, file, &attrs, false).unwrap();
+        assert_eq!(
+            calls.sets.borrow().as_slice(),
+            std::slice::from_ref(&os_name)
+        );
+        // An empty value in the node over the empty one, too.
+        set_xattrs_with(&calls, file, &[xattr("user.a", b"")], false).unwrap();
+        assert_eq!(
+            calls.sets.borrow().as_slice(),
+            std::slice::from_ref(&os_name)
+        );
+        // Over another value it is set, to the empty one.
+        let calls = FakeXattrs::with(&[(&os_name, b"x")], &[]);
+        set_xattrs_with(&calls, file, &attrs, false).unwrap();
+        assert_eq!(
+            calls.sets.borrow().as_slice(),
+            std::slice::from_ref(&os_name)
+        );
+        assert_eq!(calls.get(file, os_name.as_ref()).unwrap(), Some(Vec::new()));
     }
 }
 

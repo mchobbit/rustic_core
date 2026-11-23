@@ -228,10 +228,10 @@ impl DirEntry {
     pub(crate) fn from_entry(
         depth: usize,
         ent: &crate::noatime::RawEntry,
-    ) -> Result<DirEntry> {
+    ) -> Result<Self> {
         let ty = file_type(&ent.path, ent.d_type)
             .map_err(|err| Error::from_path(depth, ent.path.clone(), err))?;
-        Ok(DirEntry {
+        Ok(Self {
             path: ent.path.clone(),
             ty,
             follow_link: false,
@@ -366,14 +366,14 @@ fn file_type(path: &Path, d_type: u8) -> std::io::Result<FileType> {
     // Keep it only if it is what d_type says: the entry may have been
     // replaced by another type of file since it was read.
     let of_ty = match () {
-        _ if ty.is_dir() => libc::DT_DIR,
-        _ if ty.is_file() => libc::DT_REG,
-        _ if ty.is_symlink() => libc::DT_LNK,
-        _ if ty.is_fifo() => libc::DT_FIFO,
-        _ if ty.is_socket() => libc::DT_SOCK,
-        _ if ty.is_char_device() => libc::DT_CHR,
-        _ if ty.is_block_device() => libc::DT_BLK,
-        _ => libc::DT_UNKNOWN,
+        () if ty.is_dir() => libc::DT_DIR,
+        () if ty.is_file() => libc::DT_REG,
+        () if ty.is_symlink() => libc::DT_LNK,
+        () if ty.is_fifo() => libc::DT_FIFO,
+        () if ty.is_socket() => libc::DT_SOCK,
+        () if ty.is_char_device() => libc::DT_CHR,
+        () if ty.is_block_device() => libc::DT_BLK,
+        () => libc::DT_UNKNOWN,
     };
     if of_ty == d_type {
         if let Some(cell) = known {
