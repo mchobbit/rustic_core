@@ -18,6 +18,10 @@ use log::{debug, warn};
 
 use super::{
     HeldFlags, RestoreErrors, Unsupported, XattrErrors, path_error, set_flags_best_effort,
+    sparse::{
+        BCACHEFS_SUPER_MAGIC, FS_NOCOW_FL, ZFS_SUPER_MAGIC, get_flags, statfs_type,
+        statfs_type_path,
+    },
     unsupported, xattr_unsupported,
 };
 use crate::backend::node::{
@@ -48,7 +52,7 @@ const INODE_FLAGS: u32 = 0x0000_0001 // FS_SECRM_FL        s
     | 0x0000_8000 // FS_NOTAIL_FL       t
     | 0x0001_0000 // FS_DIRSYNC_FL      D
     | 0x0002_0000 // FS_TOPDIR_FL       T
-    | 0x0080_0000 // FS_NOCOW_FL        C
+    | FS_NOCOW_FL //                    C
     | 0x2000_0000 // FS_PROJINHERIT_FL  P
     | FS_CASEFOLD_FL; //                F
 
@@ -60,7 +64,7 @@ const FS_CASEFOLD_FL: u32 = 0x4000_0000;
 
 /// The flags a file system only takes while a file is empty: btrfs ignores
 /// `FS_NOCOW_FL` on a file with data, without an error.
-pub(super) const FLAGS_BEFORE_DATA: u32 = 0x0080_0000; // FS_NOCOW_FL
+pub(super) const FLAGS_BEFORE_DATA: u32 = FS_NOCOW_FL;
 
 /// The flags a file system only takes while a directory is empty: ext4 and
 /// f2fs refuse to change `FS_CASEFOLD_FL` on one with entries.
@@ -95,12 +99,6 @@ const FS_IOC_FSSETXATTR: libc::Ioctl = libc::_IOW::<FsXattr>(0x58, 32); // 'X'
 // fsxattr's xflags for FS_IMMUTABLE_FL and FS_APPEND_FL.
 const FS_XFLAG_IMMUTABLE: u32 = 0x0000_0008;
 const FS_XFLAG_APPEND: u32 = 0x0000_0010;
-
-/// statfs's `f_type` for ZFS.
-const ZFS_SUPER_MAGIC: u32 = 0x2fc1_2fc1;
-
-/// statfs's `f_type` for bcachefs.
-const BCACHEFS_SUPER_MAGIC: u32 = 0xca45_1a4e;
 
 /// The extended attribute that shows a bcachefs file's project ID.
 const BCACHEFS_PROJECT: &str = "bcachefs_effective.project";
@@ -225,15 +223,6 @@ pub(super) fn open_for_attrs(path: &Path, typ: &NodeType, m: &Metadata) -> Optio
         .ok()
 }
 
-fn get_flags(f: &File) -> io::Result<u32> {
-    let mut flags: libc::c_int = 0;
-    // SAFETY: FS_IOC_GETFLAGS writes an int to the pointer.
-    if unsafe { libc::ioctl(f.as_raw_fd(), libc::FS_IOC_GETFLAGS, &raw mut flags) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(u32::from_ne_bytes(flags.to_ne_bytes()))
-}
-
 fn set_flags(f: &File, flags: u32) -> io::Result<()> {
     let flags = libc::c_int::from_ne_bytes(flags.to_ne_bytes());
     // SAFETY: FS_IOC_SETFLAGS reads an int from the pointer.
@@ -261,16 +250,9 @@ fn set_fsxattr(f: &File, attr: &FsXattr) -> io::Result<()> {
 }
 
 /// Whether the file `f` is on the file system whose statfs `f_type` is
-/// `magic`.
+/// `magic` ([`statfs_type`]).
 fn is_on(f: &File, magic: u32) -> io::Result<bool> {
-    let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: fstatfs writes a struct statfs to the pointer.
-    if unsafe { libc::fstatfs(f.as_raw_fd(), st.as_mut_ptr()) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fstatfs succeeded, so it wrote the struct.
-    let st = unsafe { st.assume_init() };
-    Ok(u32::try_from(st.f_type).is_ok_and(|t| t == magic))
+    Ok(statfs_type(f)? == magic)
 }
 
 /// Whether the file `f` is on ZFS: the DOS flag ioctls go to no other file
@@ -295,25 +277,12 @@ fn file_projid(f: &File, attr: &FsXattr) -> u32 {
         .unwrap_or(attr.projid)
 }
 
-/// The value of the extended attribute `name` of the file `f`.
+/// The value of the extended attribute `name` of the file `f`, whole
+/// ([`read_whole`]).
 fn get_xattr(f: &File, name: &str) -> io::Result<Vec<u8>> {
     let name = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::from)?;
-    let mut value = vec![0_u8; 64];
-    loop {
-        // SAFETY: name is a C string, value a buffer of its length.
-        let n = unsafe {
-            libc::fgetxattr(f.as_raw_fd(), name.as_ptr(), value.as_mut_ptr().cast(), value.len())
-        };
-        if let Ok(n) = usize::try_from(n) {
-            value.truncate(n);
-            return Ok(value);
-        }
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::ERANGE) || value.len() >= 1 << 16 {
-            return Err(err);
-        }
-        value.resize(value.len() * 4, 0);
-    }
+    // SAFETY: name is a C string, and value has room for size bytes.
+    read_whole(|value, size| unsafe { libc::fgetxattr(f.as_raw_fd(), name.as_ptr(), value, size) })
 }
 
 fn get_dos_flags(f: &File) -> io::Result<u64> {
@@ -1131,17 +1100,7 @@ fn set_projid(path: &Path, f: &File, projid: u32) -> io::Result<()> {
 
 /// Whether `path` (followed, if a symlink) is on bcachefs.
 fn is_bcachefs_path(path: &Path) -> bool {
-    let Ok(path) = super::c_path(path) else {
-        return false;
-    };
-    let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: path is a C string; statfs writes a struct statfs to the pointer.
-    if unsafe { libc::statfs(path.as_ptr(), st.as_mut_ptr()) } < 0 {
-        return false;
-    }
-    // SAFETY: statfs succeeded, so it wrote the struct.
-    let st = unsafe { st.assume_init() };
-    u32::try_from(st.f_type).is_ok_and(|t| t == BCACHEFS_SUPER_MAGIC)
+    statfs_type_path(path).is_ok_and(|t| t == BCACHEFS_SUPER_MAGIC)
 }
 
 /// Whether the extended attribute `name` is one of a bcachefs file's own
@@ -1289,7 +1248,7 @@ mod tests {
     const EXTENTS: u32 = 0x0008_0000; // FS_EXTENT_FL, ext4's own
     const COMPR: u32 = 0x0000_0004;
     const NODUMP: u32 = 0x0000_0040;
-    const NOCOW: u32 = 0x0080_0000;
+    const NOCOW: u32 = FS_NOCOW_FL;
 
     #[test]
     fn fsxattr_ioctls() {

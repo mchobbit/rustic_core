@@ -52,9 +52,7 @@ pub(super) fn decide(
     match first_hole() {
         Ok(hole) => hole < size,
         Err(err) => {
-            let no_answer = err.raw_os_error().is_some_and(|code| {
-                [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOTTY].contains(&code)
-            });
+            let no_answer = super::unsupported(&err);
             debug!("no SEEK_HOLE: {err}; the blocks decide: {no_answer}");
             no_answer
         }
@@ -127,30 +125,63 @@ fn generic_seek_hole(f: &File) -> bool {
 /// if that fails.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn fs_type(f: &File) -> Option<u32> {
+    statfs_type(f).inspect_err(|err| debug!("fstatfs: {err}")).ok()
+}
+
+/// A file system's magic number (`ZFS_SUPER_MAGIC` and the like) from
+/// statfs(2)'s `f_type`: its low 32 bits. `f_type` is a signed 32-bit word
+/// on 32-bit glibc, where btrfs's and bcachefs's magic numbers (bit 31 set)
+/// come out negative; a signed 64-bit one on 64-bit glibc, and unsigned on
+/// musl and Android. The one place that reads an `f_type`, for
+/// [`statfs_type`] and [`statfs_type_path`].
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn magic(f_type: i128) -> u32 {
+    // Masked to 32 bits, it fits.
+    u32::try_from(f_type & 0xffff_ffff).unwrap_or_default()
+}
+
+/// The magic number ([`magic`]) of the file system of `f`, by `fstatfs(2)`
+/// (`fstatfs64` where plain `fstatfs` may fail with `EOVERFLOW`: [`lfs`]).
+///
+/// # Errors
+///
+/// * `fstatfs(2)`'s.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(super) fn statfs_type(f: &File) -> io::Result<u32> {
     use std::os::fd::AsRawFd;
 
-    let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let mut st = std::mem::MaybeUninit::<lfs::statfs>::uninit();
     // SAFETY: f is an open file, and st is written by fstatfs.
-    if unsafe { libc::fstatfs(f.as_raw_fd(), st.as_mut_ptr()) } != 0 {
-        debug!("fstatfs: {}", io::Error::last_os_error());
-        return None;
+    if unsafe { lfs::fstatfs(f.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
     }
-    // SAFETY: fstatfs succeeded.
+    // SAFETY: fstatfs succeeded, so it wrote the struct.
     let st = unsafe { st.assume_init() };
-    // Its low 32 bits: f_type is a signed 32-bit word on 32-bit glibc, where
-    // btrfs's and bcachefs's magic numbers (bit 31 set) come out negative.
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::unnecessary_cast,
-        trivial_numeric_casts
-    )]
-    Some(st.f_type as u32)
+    Ok(magic(i128::from(st.f_type)))
+}
+
+/// The magic number ([`magic`]) of the file system `path` is on (followed,
+/// if a symlink), by `statfs(2)`.
+///
+/// # Errors
+///
+/// * `statfs(2)`'s, or a path with a NUL byte.
+#[cfg(target_os = "linux")]
+pub(super) fn statfs_type_path(path: &Path) -> io::Result<u32> {
+    let path = super::c_path(path)?;
+    let mut st = std::mem::MaybeUninit::<lfs::statfs>::uninit();
+    // SAFETY: path is a C string, and st is written by statfs.
+    if unsafe { lfs::statfs(path.as_ptr(), st.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: statfs succeeded, so it wrote the struct.
+    let st = unsafe { st.assume_init() };
+    Ok(magic(i128::from(st.f_type)))
 }
 
 /// statfs(2)'s `f_type` of ZFS (`ZFS_SUPER_MAGIC`).
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
-const ZFS_SUPER_MAGIC: u32 = 0x2fc1_2fc1;
+pub(super) const ZFS_SUPER_MAGIC: u32 = 0x2fc1_2fc1;
 
 /// Whether holes can be filled on the file system whose statfs(2) `f_type`
 /// is `f_type`: not on ZFS, where `fallocate(2)` succeeds and allocates
@@ -168,11 +199,30 @@ const BTRFS_SUPER_MAGIC: u32 = 0x9123_683e;
 
 /// statfs(2)'s `f_type` of bcachefs (`BCACHEFS_SUPER_MAGIC`).
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
-const BCACHEFS_SUPER_MAGIC: u32 = 0xca45_1a4e;
+pub(super) const BCACHEFS_SUPER_MAGIC: u32 = 0xca45_1a4e;
 
-/// btrfs's no-copy-on-write file flag (`FS_NOCOW_FL`, `C`).
+/// btrfs's no-copy-on-write file flag (`FS_NOCOW_FL`, `C`), from
+/// `<linux/fs.h>`.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-const FS_NOCOW_FL: u32 = 0x0080_0000;
+pub(super) const FS_NOCOW_FL: u32 = 0x0080_0000;
+
+/// The inode flags of the file `f` (`FS_IOC_GETFLAGS`), `chattr(1)`'s and
+/// the file system's own.
+///
+/// # Errors
+///
+/// * The ioctl's.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(super) fn get_flags(f: &File) -> io::Result<u32> {
+    use std::os::fd::AsRawFd;
+
+    let mut flags: libc::c_int = 0;
+    // SAFETY: FS_IOC_GETFLAGS writes an int to the pointer.
+    if unsafe { libc::ioctl(f.as_raw_fd(), libc::FS_IOC_GETFLAGS, &raw mut flags) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u32::from_ne_bytes(flags.to_ne_bytes()))
+}
 
 /// Whether `fallocate(2)` is to allocate a file (preallocate it, or fill its
 /// holes) on the file system whose statfs(2) `f_type` is `f_type`, `nocow`
@@ -203,12 +253,7 @@ pub(super) fn allocates_on(f: &File) -> bool {
 /// `FS_IOC_GETFLAGS` fails.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn is_nocow(f: &File) -> bool {
-    use std::os::fd::AsRawFd;
-
-    let mut flags: libc::c_int = 0;
-    // SAFETY: FS_IOC_GETFLAGS writes an int to the pointer.
-    let got = unsafe { libc::ioctl(f.as_raw_fd(), libc::FS_IOC_GETFLAGS, &raw mut flags) };
-    got == 0 && u32::from_ne_bytes(flags.to_ne_bytes()) & FS_NOCOW_FL != 0
+    get_flags(f).is_ok_and(|flags| flags & FS_NOCOW_FL != 0)
 }
 
 /// Whether holes of the file `f` can be filled: [`fills_holes_type`], and
@@ -453,7 +498,9 @@ impl Extents for File {
 /// `off_t` and the calls that take one, with 64-bit offsets where `off_t`
 /// may have 32 bits (32-bit glibc and Android), which would leave a file
 /// over 2 GiB unread by its extents ([`lseek`]) or unallocated
-/// (`os_preallocate`).
+/// (`os_preallocate`); and on Linux and Android `statfs(2)` and
+/// `fstatfs(2)` with their struct, the 64-bit ones there too: the plain
+/// ones can fail with `EOVERFLOW` on a large file system.
 #[cfg(any(
     target_os = "linux",
     target_os = "android",
@@ -466,12 +513,15 @@ pub(super) mod lfs {
         target_os = "android",
         all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))
     ))]
-    pub(in super::super) use libc::{fallocate64 as fallocate, lseek64 as lseek, off64_t as off_t};
+    pub(in super::super) use libc::{
+        fallocate64 as fallocate, fstatfs64 as fstatfs, lseek64 as lseek, off64_t as off_t,
+        statfs64 as statfs,
+    };
     #[cfg(all(
         target_os = "linux",
         not(any(target_env = "gnu", target_env = "musl"))
     ))]
-    pub(in super::super) use libc::fallocate;
+    pub(in super::super) use libc::{fallocate, fstatfs, statfs};
     #[cfg(not(any(
         target_os = "android",
         all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))
@@ -1004,6 +1054,38 @@ mod tests {
             return;
         }
         assert!(!has_holes(&path, &m, Some(&File::open(&path).unwrap())));
+    }
+
+    /// BackOtter (ForkAudit1 G3-03): a magic number with bit 31 set
+    /// (bcachefs's, btrfs's) is the same number whatever `f_type`'s type: a
+    /// signed 32-bit word on 32-bit glibc, where it is negative and
+    /// `u32::try_from` took it for no file system at all; signed 64-bit on
+    /// 64-bit glibc; unsigned on musl and Android.
+    #[test]
+    fn magic_is_f_types_low_32_bits() {
+        for (name, want) in [
+            ("bcachefs", BCACHEFS_SUPER_MAGIC),
+            ("btrfs", BTRFS_SUPER_MAGIC),
+            ("ZFS", ZFS_SUPER_MAGIC),
+        ] {
+            assert_eq!(magic(i128::from(want.cast_signed())), want, "{name}: i32");
+            assert_eq!(magic(i128::from(i64::from(want))), want, "{name}: i64");
+            assert_eq!(magic(i128::from(u64::from(want))), want, "{name}: unsigned long");
+        }
+        assert!(BCACHEFS_SUPER_MAGIC.cast_signed() < 0 && BTRFS_SUPER_MAGIC.cast_signed() < 0);
+    }
+
+    /// `fstatfs(2)` of a file and `statfs(2)` of its directory name the same
+    /// file system.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn statfs_type_of_a_file_and_of_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = File::create(dir.path().join("f")).unwrap();
+        let by_file = statfs_type(&f).unwrap();
+        assert_ne!(by_file, 0);
+        assert_eq!(statfs_type_path(dir.path()).unwrap(), by_file);
+        assert!(statfs_type_path(&dir.path().join("none")).is_err());
     }
 
     /// Holes are never filled on ZFS, where `fallocate(2)` allocates
