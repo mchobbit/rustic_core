@@ -167,7 +167,10 @@ impl LocalDestination {
 
     /// BackOtter: a file restored elsewhere that holds `content`, if any.
     pub(crate) fn clone_source(&self, content: &[crate::blob::DataId]) -> Option<PathBuf> {
-        self.clone_sources.as_ref()?.get(content).map(Path::to_path_buf)
+        self.clone_sources
+            .as_ref()?
+            .get(content)
+            .map(Path::to_path_buf)
     }
 
     /// Create a new [`LocalDestination`]
@@ -214,7 +217,11 @@ impl LocalDestination {
 
         // BackOtter: why paths past PATH_MAX can't be reached, if they can't.
         osattrs::warn_on_short_path_errors();
-        Ok(Self { path, is_file, clone_sources: None })
+        Ok(Self {
+            path,
+            is_file,
+            clone_sources: None,
+        })
     }
 
     /// Path to the given item (relative to the base path)
@@ -509,11 +516,15 @@ impl LocalDestination {
     // BackOtter's.
     /// Whether `err`, a failure to set an owner, extended attributes, the
     /// permissions or the times that the restore warned about, is one
-    /// BackOtter's restic counts as an error (exit 1): not, not running as
-    /// `root`, a permission refused (a change of owner, `trusted.*` or
-    /// `security.*` attributes, a file someone else owns), nor extended
-    /// attributes or times the file system doesn't support
-    /// ([`osattrs::XattrErrors::counts`], `osattrs::restore_error_counts`).
+    /// BackOtter's restic counts as an error (exit 1). These aren't:
+    ///
+    /// * a permission refused to a restore not running as `root` (a change
+    ///   of owner, `trusted.*` or `security.*` attributes, the permissions
+    ///   or times of a file someone else owns);
+    /// * extended attributes or times the file system doesn't support
+    ///   ([`osattrs::XattrErrors::counts`], `osattrs::restore_error_counts`).
+    ///
+    /// Any other failure is, as `root` or not.
     pub(crate) fn error_counts(err: &LocalDestinationErrorKind, root: bool) -> bool {
         match err {
             #[cfg(not(windows))]
@@ -616,9 +627,18 @@ impl LocalDestination {
         Ok(())
     }
 
-    #[cfg(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku"))]
+    #[cfg(any(
+        windows,
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "haiku"
+    ))]
     /// BackOtter: [`Self::set_extended_attributes`]; the SELinux label is
     /// Linux's only.
+    ///
+    /// # Errors
+    ///
+    /// * As [`Self::set_extended_attributes`].
     pub(crate) fn set_extended_attributes_all(
         &self,
         item: impl AsRef<Path>,
@@ -647,7 +667,12 @@ impl LocalDestination {
             .map_err(LocalDestinationErrorKind::XattrsNotSet)
     }
 
-    #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+    #[cfg(not(any(
+        windows,
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "haiku"
+    )))]
     /// Set extended attributes for `item` (relative to the base path)
     ///
     /// # Arguments
@@ -678,9 +703,20 @@ impl LocalDestination {
         self.set_extended_attributes_all(item, extended_attributes, stock_names, false)
     }
 
-    #[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+    #[cfg(not(any(
+        windows,
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "haiku"
+    )))]
     /// BackOtter: [`Self::set_extended_attributes`]; with `remove_label`
     /// (`restore --exact`), an SELinux label the node doesn't have goes too.
+    ///
+    /// # Errors
+    ///
+    /// * As [`Self::set_extended_attributes`]; and the label, if it
+    ///   couldn't be removed (but one an active SELinux keeps, which is
+    ///   one error for the whole restore: `osattrs::label_refused`).
     pub(crate) fn set_extended_attributes_all(
         &self,
         item: impl AsRef<Path>,
@@ -695,8 +731,14 @@ impl LocalDestination {
             return Ok(());
         }
         let bsd_stock = stock_names && cfg!(any(target_os = "freebsd", target_os = "netbsd"));
-        set_xattrs_all(&SystemXattrs, &filename, extended_attributes, bsd_stock, remove_label)
-            .map_err(LocalDestinationErrorKind::XattrsNotSet)
+        set_xattrs_all(
+            &SystemXattrs,
+            &filename,
+            extended_attributes,
+            bsd_stock,
+            remove_label,
+        )
+        .map_err(LocalDestinationErrorKind::XattrsNotSet)
     }
 
     /// Set length of `item` (relative to the base path)
@@ -823,7 +865,7 @@ impl LocalDestination {
     ) -> LocalDestinationResult<()> {
         // BackOtter: waits for the exit once XFS options are put back for it.
         let _making = crate::commands::restore::making_entries();
-        let filename = self.sys_path(item)?;
+        let filename = self.sys_path(&item)?;
 
         match &node.node_type {
             NodeType::Symlink { .. } => {
@@ -831,7 +873,9 @@ impl LocalDestination {
                 symlink(linktarget, &filename).map_err(|err| {
                     LocalDestinationErrorKind::SymlinkingFailed {
                         linktarget: linktarget.to_path_buf(),
-                        filename,
+                        // BackOtter: named by its own path, not the short
+                        // one through this process's links (R6-01).
+                        filename: self.path(&item).unwrap_or(filename),
                         source: err,
                     }
                 })?;
@@ -1077,16 +1121,18 @@ impl LocalDestination {
     ) -> LocalDestinationResult<()> {
         // BackOtter: waits for the exit once XFS options are put back for it.
         let _making = crate::commands::restore::making_entries();
-        let source_path = self.sys_path(source_item)?;
-        let filename = self.sys_path(item)?;
+        let source_path = self.sys_path(&source_item)?;
+        let filename = self.sys_path(&item)?;
         let dir = filename
             .parent()
             .ok_or_else(|| LocalDestinationErrorKind::FileDoesNotHaveParent(filename.clone()))?;
         fs::create_dir_all(dir).map_err(LocalDestinationErrorKind::DirectoryCreationFailed)?;
         link_over_existing(&source_path, &filename).map_err(|err| {
+            // BackOtter: both named by their own paths, not the short ones
+            // through this process's links (R6-01).
             LocalDestinationErrorKind::HardLinkingFailed {
-                source_path,
-                filename,
+                source_path: self.path(&source_item).unwrap_or(source_path),
+                filename: self.path(&item).unwrap_or(filename),
                 source: err,
             }
         })?;
@@ -1099,7 +1145,12 @@ impl LocalDestination {
 // fork's own (local_destination/bko.rs).
 mod bko;
 pub(crate) use bko::is_zero;
-#[cfg(not(any(windows, target_os = "openbsd", target_os = "illumos", target_os = "haiku")))]
+#[cfg(not(any(
+    windows,
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "haiku"
+)))]
 use bko::{SystemXattrs, set_xattrs_all};
 use bko::{open_reading, open_to_verify, sparse_writes, write_all_at};
 

@@ -383,10 +383,12 @@ that either program restores what the other backed up.
   long", for each path, which hid .16 to .18's XFS failure (above). Only the system calls
   take the short paths: the walk's entries, the restore's comparisons with
   what the destination holds (`--delete`), its aliases and the messages
-  keep the long ones, but for errors from `LocalDestination`'s own calls
-  (`sys_path`) and those the system modules make of their calls' errors
-  (`osattrs/linux.rs`: an ioctl's error naming the file, its debug
-  messages), which name the short one. 0.13.0+backotter.16 to .20 named
+  keep the long ones, but for the errors the system modules make of their
+  calls' errors (`osattrs/linux.rs`: an ioctl's error naming the file, its
+  debug messages), which name the short one. `LocalDestination`'s own
+  errors that hold a path (a symlink or a hard link that couldn't be made)
+  name the long one since 0.14.0+backotter.2 (RustAudit1 R6-01); to .1
+  they named the short one. 0.13.0+backotter.16 to .20 named
   the short one, under `$TMPDIR/.bko-longpath-PID-N` (gone at exit), in a
   few more: a backup's warnings about flags, attributes and extended
   attributes and its symlink errors, `--delete`'s "entries not removed",

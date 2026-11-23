@@ -46,6 +46,7 @@ pub(super) trait XattrCalls {
     target_os = "illumos",
     target_os = "haiku"
 )))]
+#[derive(Debug)]
 pub(super) struct SystemXattrs;
 
 #[cfg(not(any(
@@ -128,6 +129,13 @@ fn set_xattrs_with(
 
 /// BackOtter: [`set_xattrs_with`]; with `remove_label`, an SELinux label
 /// that isn't among `extended_attributes` is removed too (`restore --exact`).
+///
+/// # Errors
+///
+/// * Each extended attribute that couldn't be set or removed, and a failure
+///   to list them, all in one; not a label an active SELinux keeps
+///   ([`osattrs::label_refused`]), nor bcachefs's casefolding refused on a
+///   directory with entries, which is a warning.
 #[cfg(not(any(
     windows,
     target_os = "openbsd",
@@ -292,6 +300,10 @@ pub(super) fn sparse_writes(offset: u64, data: &[u8], block: u64) -> Vec<std::op
 /// BackOtter: writes all of `data` at `offset` of `file`, without moving
 /// its position, which threads writing other parts of the file through the
 /// same handle share.
+///
+/// # Errors
+///
+/// * If a write fails, or writes nothing (`WriteZero`).
 #[cfg(not(windows))]
 pub(super) fn write_all_at(file: &File, data: &[u8], offset: u64) -> std::io::Result<()> {
     std::os::unix::fs::FileExt::write_all_at(file, data, offset)
@@ -302,6 +314,10 @@ pub(super) fn write_all_at(file: &File, data: &[u8], offset: u64) -> std::io::Re
 /// file through the same handle share (`seek_write` moves it, but no write
 /// here goes by it). As std's `write_all_at` on Unix: again after a short
 /// write or an interrupt, an error for a write of nothing.
+///
+/// # Errors
+///
+/// * If a write fails, or writes nothing (`WriteZero`).
 #[cfg(windows)]
 pub(super) fn write_all_at(file: &File, mut data: &[u8], mut offset: u64) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt;
@@ -972,6 +988,66 @@ mod tests {
         dest.set_extended_attributes("f", &[], false).unwrap();
         let names: Vec<_> = xattr::list(&file).unwrap().collect();
         assert_eq!(names, ["security.selinux"]);
+    }
+
+    /// BackOtter (RustAudit1 R6-08, R6-01): past `PATH_MAX`, directories,
+    /// a file, a hard link, a FIFO and a change of owner are made through
+    /// [`LocalDestination::sys_path`]'s short paths, and an error names
+    /// the path itself, not the short one through this process's links.
+    #[test]
+    fn past_path_max_links_specials_and_owners() {
+        use std::ffi::OsStr;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        use std::path::PathBuf;
+
+        use crate::backend::node::{Node, NodeType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = LocalDestination::new(dir.path().to_str().unwrap(), false, false).unwrap();
+        // Each directory below the one before, as a restore makes them.
+        let mut deep = PathBuf::new();
+        for i in 0..120 {
+            deep.push(format!("d{i:03}{}", "x".repeat(36)));
+            dest.create_dir(&deep).unwrap();
+        }
+        let long = dir.path().join(&deep);
+        assert!(long.as_os_str().len() > 4096);
+        let lstat = |name: &str| fs::symlink_metadata(walkdir::short_path(&long.join(name)));
+
+        drop(dest.set_length(deep.join("file"), 3, false).unwrap());
+        dest.hard_link(deep.join("file"), deep.join("link"))
+            .unwrap();
+        let (file, link) = (lstat("file").unwrap(), lstat("link").unwrap());
+        assert_eq!((file.ino(), file.nlink(), file.len()), (link.ino(), 2, 3));
+
+        let fifo = Node::new_node(OsStr::new("fifo"), NodeType::Fifo, Metadata::default());
+        dest.create_special(deep.join("fifo"), &fifo).unwrap();
+        assert!(lstat("fifo").unwrap().file_type().is_fifo());
+        let own = Metadata {
+            uid: Some(nix::unistd::geteuid().as_raw()),
+            gid: Some(nix::unistd::getegid().as_raw()),
+            ..Default::default()
+        };
+        dest.set_uid_gid(deep.join("fifo"), &own).unwrap();
+
+        // A symlink where the FIFO is, and a hard link where a directory
+        // is, fail: by the names the snapshot has for them.
+        let target = NodeType::from_link(Path::new("target"));
+        let symlink = Node::new_node(OsStr::new("fifo"), target, Metadata::default());
+        let err = dest
+            .create_special(deep.join("fifo"), &symlink)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&*long.join("fifo").to_string_lossy()), "{err}");
+        assert!(!err.contains(".bko-longpath-"), "{err}");
+        dest.create_dir(deep.join("sub")).unwrap();
+        let err = dest
+            .hard_link(deep.join("file"), deep.join("sub"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&*long.join("file").to_string_lossy()), "{err}");
+        assert!(err.contains(&*long.join("sub").to_string_lossy()), "{err}");
+        assert!(!err.contains(".bko-longpath-"), "{err}");
     }
 
     /// BackOtter: a file restored sparse, blob by blob, has the blobs'
