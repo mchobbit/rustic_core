@@ -489,8 +489,10 @@ that either program restores what the other backed up.
   the node lacks (`xattr_restore_names` in `local_destination.rs`).
   BackOtter's snapshots keep the bare names.
 - On FreeBSD and NetBSD the user namespace is listed directly: the xattr
-  crate (1.6) names the last attribute of the system namespace as one of
-  the user namespace, which a restore then creates, empty. Both namespaces'
+  crate (1.6.1, and 1.7.0, which the lock has since 0.14.0: its
+  `sys/bsd.rs` is the same) names the last attribute of the system
+  namespace as one of the user namespace, which a restore then creates,
+  empty. Both namespaces'
   values are read by their names' bytes; a node keeps a name that isn't
   UTF-8 with U+FFFD for what isn't, as a Linux one and as BackOtter's
   restic's JSON keep it (0.13.0+backotter.18; before, such a name read a
@@ -735,8 +737,12 @@ that either program restores what the other backed up.
   project (reading it opens the file). One warning names it
   (`PATH: av_quarantined: contents not backed up (N bytes)`) and the backup
   exits 0. Any other file that can't be opened is left out, as before,
-  with `ignoring error: Failed to open ...`, and counts toward exit 3
-  under rustic's `--strict-exit`. The source's attribute is
+  reported as upstream's archiver reports it since 0.14.0 (#561: `error:
+  archival PATH: ...` through `Progress::error`, a JSON `error` line under
+  rustic's `--json`; 0.13.0 logged `ignoring error: Failed to open ...`),
+  and counted in `error_count` and `items_incomplete`: the backup exits 3
+  under rustic's `--strict-exit` and, since rustic v0.12.0, without it
+  too. The source's attribute is
   never cleared or changed. A restore makes such a file empty, a new one
   in place of any file there (which may be quarantined, its contents and
   extended attributes closed to the restore too), as BackOtter's restic
@@ -1049,12 +1055,15 @@ that either program restores what the other backed up.
   there, not in value.
 - Extended attributes are read whole, however large, on Linux
   (`osattrs::xattr_get`, `xattr_list`: `lgetxattr(2)` and `llistxattr(2)`
-  with the size they give, again on `ERANGE`). The xattr crate (1.6, on
-  rustix 1.1) reads a first 4 KiB and asks rustix for a larger value's
+  with the size they give, again on `ERANGE`). The xattr crate 1.6 (1.6.1,
+  on rustix 1.1) reads a first 4 KiB and asks rustix for a larger value's
   size with an empty buffer, which rustix 1.1 answers with 0: every value
   over 4 KiB was backed up empty (a 15000-byte `user.*` on btrfs, 60000
-  bytes on XFS), and so were ACLs that long. Elsewhere the xattr crate
-  reads them (its BSD code has no such step).
+  bytes on XFS), and so were ACLs that long. xattr 1.7.0, which the lock
+  has since 0.14.0, asks rustix's `*_query` functions for the size
+  instead. The fork's own reader stays: Cargo.toml takes any `xattr = "1"`,
+  1.6 included, and nothing here tests the crate on a large value.
+  Elsewhere the xattr crate reads them (its BSD code has no such step).
 - A restore never removes a file's SELinux label (`security.selinux`)
   where its node has none (`osattrs::xattr_never_removed`): the system
   gives every new file one, and SELinux lets nobody remove it (`EACCES`,
@@ -1179,8 +1188,11 @@ that either program restores what the other backed up.
   tree IDs and all (see BACKOTTER.md in rustic, "Building").
 - What a backup left out, and what a restore couldn't do, are counted, for
   rustic's `--strict-exit` to exit as BackOtter's restic does (3 for an
-  incomplete backup, 1 for a restore with errors); without it nothing
-  changes, the counts are only there. `SnapshotSummary::items_incomplete`
+  incomplete backup, 1 for a restore with errors); without it a restore
+  changes nothing, the counts are only there, and a backup exits as stock
+  rustic does: since v0.12.0 that is 3 too where upstream's own
+  `error_count` (#561, below) isn't 0, which counts fewer things.
+  `SnapshotSummary::items_incomplete`
   (not saved in the snapshot: `#[serde(skip)]`, so snapshot files and
   `--json` stay as they were) counts the entries, or parts of their
   metadata, a backup left out because they couldn't be read, each warned
@@ -1246,8 +1258,9 @@ that either program restores what the other backed up.
   Eight copies of it written in restic's blob ranges, with a sync every
   3-20 ms: per blob, 43 of 320 files past their size and up to 8 extents;
   through one handle, none, and at most 2.
-- `restore --exact` and `--clone-from` (`commands/restore/exact.rs`; the
-  options are rustic's, its BACKOTTER.md), for bko-holt load's shared btrfs
+- `restore --exact` (`RestoreOptions::exact`) and rustic's `--clone-from`
+  (its BACKOTTER.md; `Repository::clone_sources` and
+  `commands/restore/exact.rs` here), for bko-holt load's shared btrfs
   snapshots (backotter `docs/design/btrfs-snapshots.md`), as in BackOtter's
   restic 0.19.1+backotter.12. `--exact` makes a destination that is there
   already exactly the snapshot, writing only what differs:
@@ -1424,11 +1437,22 @@ that either program restores what the other backed up.
 - The version reads `X.Y.Z+backotter.N`.
 
 The system calls need `unsafe`, which the workspace lints now deny (not
-forbid), so that `backend/osattrs.rs` can allow it there alone. Each
-system's module (`osattrs/linux.rs`, `freebsd.rs`, `netbsd.rs`,
-`openbsd.rs`, `dragonfly.rs`, `illumos.rs`, and `other.rs` for the rest)
-defines the same functions and constants, those of `other.rs`, which does
-nothing; `osattrs.rs` calls them without `cfg`s.
+forbid), so that the system-call code under `backend/osattrs` can allow
+it; one helper of the Linux integration tests
+(`tests/integration/restore.rs`) allows it too. The vendored walkdir is
+no workspace member, so the lints don't reach its `unsafe` (`noatime.rs`,
+`longpath.rs`). Each system's module (`osattrs/linux.rs`, `freebsd.rs`,
+`netbsd.rs`, `openbsd.rs`, `dragonfly.rs`, `illumos.rs`, `haiku.rs`, and
+`other.rs` for the rest) defines the same functions and constants, those
+of `other.rs`, which does nothing; `osattrs.rs` calls them without
+`cfg`s. Beside them are helper modules. Three are built only on their
+systems and make system calls: `bsd_held.rs` (the four BSDs),
+`freebsd_netbsd.rs` and `illumos_idmap.rs`; so does `sparse.rs` (holes,
+on Unix). The others hold formats and maps, with no `unsafe`, and are
+built everywhere (`bsd_extattr.rs` on Unix), so that they are tested on
+any system: `bsd_flags.rs`, `freebsd_acl.rs`, `illumos_acl.rs`,
+`illumos_project.rs`, `illumos_sysattr.rs`, `illumos_xattrmeta.rs` and
+`haiku_attrs.rs`.
 
 `SEEK_HOLE` and `SEEK_DATA` take 64-bit offsets (`lseek64`) on Linux
 (glibc and musl) and Android: on a 32-bit glibc or Android system `off_t`
@@ -1452,7 +1476,11 @@ commit but for these:
   dependency pins (0.14.0's lock has the same or newer releases: zstd
   0.14.3, zstd-safe 8.3.0, zstd-sys 2.1.3, still zstd 1.5.7, so the same
   compressed bytes; rustls 0.23.46, rustls-webpki 0.103.17, ctutils 0.4.8,
-  chacha20 0.10.2; suppaftp 10.0.2 with opendal 0.59.5). Of #590's and
+  chacha20 0.10.2; suppaftp 10.0.2 with opendal 0.59.5). One line of
+  them is left: tempfile's dependency list has `getrandom 0.4.3` where
+  0.14.0's lock has `0.3.4`, from 708f1c9, which undid a side effect of
+  the pins (ForkAudit1 G9-06; tempfile 3.27.0 takes either, and only this
+  workspace's own tests build with this lock). Of #590's and
   #634's picks, which had conflicts, the fork's own part stays, as its own
   commit: the paths the fork's restore code touches are checked, and
   `hard_link`'s note.
@@ -1486,7 +1514,8 @@ Fixes from rustic_core's `main` after the 0.13.0 release, cherry-picked
   named in the error.
 - 35aef00 (#547) the local backend's delete hook runs when a file is
   replaced. In `crates/backend`, which rustic-bko doesn't build: rustic
-  takes rustic_backend 0.7.0 from crates.io.
+  takes rustic_backend from crates.io (0.7.0 then; 0.8.0, which has the
+  fix, since rustic v0.12.0).
 - 9d9e478 (#546) tree workers stop once the receiver is gone.
 - d7e097c (#585) no underflow in `BlobLocation::data_length`.
 - 4589ea7 (#586) `repair snapshots` handles a file node without contents.
@@ -1519,8 +1548,9 @@ Fixes from rustic_core's `main` after the 0.13.0 release, cherry-picked
 - 01fe284 (#640) the OpenDAL backend passes on an error from checking for
   the config file instead of taking it as "no repository". Taken after
   0.13.0+backotter.5 with no new version: it is in `crates/backend`, which
-  rustic-bko doesn't build (rustic takes rustic_backend 0.7.0 from
-  crates.io), so rustic-bko is unchanged by it.
+  rustic-bko doesn't build (rustic took rustic_backend 0.7.0 from
+  crates.io, without it; v0.12.0 takes 0.8.0, with it), so rustic-bko was
+  unchanged by it.
 
 Dependencies on 0.13.0 (Cargo.lock only, semver-compatible, each to its
 first release that RustSec lists as patched; dropped with the rebase,
@@ -1581,7 +1611,9 @@ takes; in the fork since the rebase:
   repositories and rustic's default have 512 KiB.
 - 8fe6703 (#639) prune with concurrent runs and recovered packs: a fix,
   breaking (`keep-delete` becomes `keep-marked`), a rewrite of
-  `commands/prune.rs` (where only the cherry-picked #587 differs here).
+  `commands/prune.rs`. At 0.14.0+backotter.1 the fork's `prune.rs` is
+  upstream's, with no hunk of ours: #587, which was cherry-picked onto
+  0.13.0, is in the rewrite.
 - 269f9dc (#653) dependency updates: newer releases of the pins above.
 - 40152f3 (#648) CI only.
 
@@ -1595,5 +1627,33 @@ F9-01); rustic's `backotter` branch moves to v0.12.0 with it.
     # set crates/core/Cargo.toml's version to "NEW+backotter.1"
     git push --force-with-lease origin backotter
 
-Then move rustic's `backotter` branch to the rustic release that uses
-rustic_core NEW (see BACKOTTER.md there).
+In the rebase (what the move to 0.14.0 needed; "Base: rustic_core 0.14.0"
+above has it as history):
+
+- Drop each cherry-pick the release has (`git cherry-pick -x` names
+  upstream's commit in the message), and each BackOtter patch that
+  upstream now does itself, keeping its test where that checks upstream's
+  code against restic (`chunk_like_restic`). Where a pick had conflicts
+  and carries a part that is the fork's own (#590's path checks, #634's
+  `hard_link` note), keep that part, as a commit of its own.
+- Take the release's Cargo.lock wherever ours conflicts, and drop the
+  commits that only pinned dependencies once its lock has the same or
+  newer releases. The fork's lock should then differ from the release's
+  (`git diff rustic_core-vNEW backotter -- Cargo.lock`) only in
+  rustic_core's version and its `libc` dependency, and in walkdir, which
+  has no source or checksum (it is `vendor/walkdir`) and takes `libc`.
+- Give a conflicting version line `NEW+backotter.N`, with the commit's
+  own N; the commit that ends the rebase sets `NEW+backotter.1`.
+- `vendor/walkdir` is crates.io's walkdir 2.5.0 with the fork's patch
+  (its README.md): if the release's lock has a newer walkdir, redo the
+  patch on that one.
+- Write a "Base: rustic_core NEW" section as the one above (what was
+  dropped, and which of upstream's changes touch what the fork does), and
+  bring "What it adds" into line with upstream's new messages, counts and
+  exit codes.
+
+Then run both test suites on a host, the new release's own first
+(backotter's `testvm/audit/stock-baseline.sh`, then
+`testvm/audit/fork-tests.sh`): no test may fail on the fork that passes
+on the stock release. After that move rustic's `backotter` branch to the
+rustic release that uses rustic_core NEW (see BACKOTTER.md there).
