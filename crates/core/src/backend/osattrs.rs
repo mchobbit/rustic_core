@@ -745,6 +745,7 @@ pub(crate) fn preallocate(f: &File, len: u64) {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn os_preallocate(f: &File, len: u64) -> io::Result<()> {
+    use sparse::lfs::{fallocate, off_t};
     use std::os::fd::AsRawFd;
 
     // Not on btrfs but for a NOCOW file, nor on bcachefs: they never
@@ -752,11 +753,11 @@ fn os_preallocate(f: &File, len: u64) -> io::Result<()> {
     if !sparse::allocates_on(f) {
         return Ok(());
     }
-    let len = libc::off_t::try_from(len).map_err(io::Error::other)?;
+    let len = off_t::try_from(len).map_err(io::Error::other)?;
     loop {
         // SAFETY: f is an open file. Mode 0 allocates holes and unwritten
         // space, and leaves data as it is.
-        if unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, len) } == 0 {
+        if unsafe { fallocate(f.as_raw_fd(), 0, 0, len) } == 0 {
             return Ok(());
         }
         let err = io::Error::last_os_error();

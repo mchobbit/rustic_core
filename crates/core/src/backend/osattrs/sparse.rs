@@ -450,6 +450,42 @@ impl Extents for File {
     }
 }
 
+/// `off_t` and the calls that take one, with 64-bit offsets where `off_t`
+/// may have 32 bits (32-bit glibc and Android), which would leave a file
+/// over 2 GiB unread by its extents ([`lseek`]) or unallocated
+/// (`os_preallocate`).
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "illumos",
+    target_vendor = "apple"
+))]
+pub(super) mod lfs {
+    #[cfg(any(
+        target_os = "android",
+        all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))
+    ))]
+    pub(in super::super) use libc::{fallocate64 as fallocate, lseek64 as lseek, off64_t as off_t};
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_env = "gnu", target_env = "musl"))
+    ))]
+    pub(in super::super) use libc::fallocate;
+    #[cfg(not(any(
+        target_os = "android",
+        all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))
+    )))]
+    pub(in super::super) use libc::{lseek, off_t};
+
+    // Every system but 32-bit uClibc Linux has 64-bit offsets here.
+    #[cfg(not(all(
+        target_os = "linux",
+        not(any(target_env = "gnu", target_env = "musl"))
+    )))]
+    const _: () = assert!(size_of::<off_t>() == 8);
+}
+
 /// `lseek(2)` of `f` to `off` from `whence`.
 #[cfg(any(
     target_os = "linux",
@@ -459,20 +495,8 @@ impl Extents for File {
     target_vendor = "apple"
 ))]
 fn lseek(f: &File, off: u64, whence: libc::c_int) -> io::Result<u64> {
+    use lfs::{lseek, off_t};
     use std::os::fd::AsRawFd;
-
-    // 64-bit offsets where `off_t` may have 32 bits (32-bit glibc and
-    // Android), which would leave a file over 2 GiB unread by its extents.
-    #[cfg(any(
-        target_os = "android",
-        all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))
-    ))]
-    use libc::{lseek64 as lseek, off64_t as off_t};
-    #[cfg(not(any(
-        target_os = "android",
-        all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))
-    )))]
-    use libc::{lseek, off_t};
 
     let off = off_t::try_from(off).map_err(io::Error::other)?;
     // SAFETY: f is an open file.
