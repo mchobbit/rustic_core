@@ -643,8 +643,9 @@ that either program restores what the other backed up.
   (0.13.0+backotter.13; before, every entry found lost them as the walk
   reached it): a directory that was there keeps them, and on XFS its
   options, until an entry is made, removed or renamed in it
-  (`commands/restore.rs`, `DirChanges`) or its metadata set; a file until
-  it is written, cloned over, its holes filled or its metadata set. So an
+  (`commands/restore/prepare.rs`, `DirChanges`) or its metadata set; a
+  file until it is written, cloned over, its holes filled or its metadata
+  set. So an
   immutable file or directory whose contents and metadata match keeps
   them, and its inode its change time, under `--exact`. A file whose name
   the restore removes or renames another file over (replacing it by
@@ -736,7 +737,23 @@ that either program restores what the other backed up.
   metadata, then fails (`The contents of N files could not be restored`,
   exit 1), as BackOtter's restic exits 1 for it. Stock rustic panicked at
   the first (an `unwrap` of the open), aborting the restore and leaving
-  every file still pending stale.
+  every file still pending stale. Such a file, and each other name of it
+  (a hard link), gets its metadata but for its times (the birth time too,
+  which FreeBSD and NetBSD set as an mtime): a restore trusts a size and
+  an mtime that match (unless `--verify-existing`), so with the snapshot's
+  mtime the next restore left the wrong contents and exited 0, a file
+  sized in full before a write failed on a full target as well
+  (0.14.0+backotter.2; before, the metadata pass gave it the node's times;
+  stock rustic's panic came before that pass, so its second run repaired
+  the file).
+- An owner, a mode or times that can't be set are warned of as in stock
+  rustic, to the letter (`restore PATH: setting UID/GID failed.`,
+  `setting User/Group failed.`, `chmod failed.`, `setting file times
+  failed.`): bko-holt matches those lines whole for the root of a FreeBSD
+  msdosfs, which takes none of the three, and counts them against the
+  errors `--strict-exit` reports. Since 0.14.0+backotter.2 a second
+  warning right after gives the cause, which neither said (`restore PATH:
+  chmod: setting file permissions failed: ...`).
 - illumos ZFS project IDs are restored with the extended attributes'
   metadata, before the flags, as each node's own ID and inheritance,
   whatever a file got from the directory it was created in; on another file
@@ -1442,7 +1459,8 @@ that either program restores what the other backed up.
   making special files, by restic's rules (above, under metadata the target
   file system doesn't support).
 - A restore's memory is bounded (`commands/restore.rs`,
-  `restore_contents`): at most 256 MiB of pack data
+  `restore_contents`; `restore/budget.rs`, `ByteBudget`): at most 256 MiB
+  of pack data
   (`MAX_RESTORE_BYTES_IN_FLIGHT`), counted as read plus decrypted, is held
   at once, taken before a pack's reader task is spawned and given back when
   the last write of it is done; a larger read goes alone. The pool has 4
@@ -1496,7 +1514,12 @@ that either program restores what the other backed up.
     owner names, contents, holes: `unix.sparse`), and the owner's IDs
     only as root (with ownership by name, the default, as root nothing
     matches: use `--numeric-id`). The mtime stands for an atime the node
-    hasn't got, as the restore sets it. A generic attribute the node lacks
+    hasn't got, as the restore sets it, and so does the mode: a node
+    without one matches a file of mode 0 where that is what the restore
+    sets (a regular file in a snapshot that leaves a mode of 0 out:
+    `/etc/shadow` from BackOtter's restic), and any mode where the restore
+    sets none (0.14.0+backotter.2; before, it matched nothing, and every
+    run set such a file's metadata again). A generic attribute the node lacks
     counts only in a snapshot of BackOtter's (where it was none); in
     another it is unknown, and left as the file has it. A birth time
     counts only where both have one: FreeBSD and NetBSD record one for
@@ -1559,7 +1582,10 @@ that either program restores what the other backed up.
   file of its size, not the file cloned onto by any name: S11). A
   directory to clone from that is inside the restore's destination is
   refused before anything is written (`clone_sources`): the restore
-  changes what is there, so a later clone could take what it wrote. Only
+  changes what is there, so a later clone could take what it wrote. A
+  node of the `--clone-from` tree whose path would leave the directory
+  (`..`, an absolute path: a damaged or crafted snapshot) names no source
+  (0.14.0+backotter.2), as the restore itself refuses such a path. Only
   Linux clones; elsewhere nothing is tried, the file is written, and a
   hard link is broken by removing the name.
 
@@ -1840,6 +1866,15 @@ F9-01); rustic's `backotter` branch moves to v0.12.0 with it.
 In the rebase (what the move to 0.14.0 needed; "Base: rustic_core 0.14.0"
 above has it as history):
 
+- `commands/restore.rs` is upstream's file: its `collect_and_prepare`
+  keeps upstream's loop and closures, and what the fork does there is in
+  `commands/restore/prepare.rs` (`Prepare`, whose methods the loop and
+  closures call), with the fork's other parts of the restore in
+  `restore/{exact,files_writer,fresh,budget}.rs`. Where upstream changed
+  the function, take its lines and keep the calls into `Prepare`
+  (`target_of`, `found_under_another_name`, `existing_dir`, `created_dir`,
+  `later_link_name`, `plan_node_file` in place of the match on
+  `add_file`, `replace_existing`, `finish`, `into_plan`).
 - Drop each cherry-pick the release has (`git cherry-pick -x` names
   upstream's commit in the message), and each BackOtter patch that
   upstream now does itself, keeping its test where that checks upstream's
