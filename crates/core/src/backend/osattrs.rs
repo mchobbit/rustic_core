@@ -1282,13 +1282,26 @@ pub(crate) fn same_generic_attribute(
 /// Restores the ACLs. This goes after the mode: `chmod(2)` rewrites an
 /// NFSv4 ACL, and setting an ACL sets the mode's permission bits.
 ///
+/// On illumos a node without an ACL had a trivial one in a snapshot of
+/// BackOtter's (`known_bko`): the file gets its mode's then, in place of any
+/// other it has, which `chmod(2)` doesn't always take off. In any other
+/// snapshot the file keeps the ACL it has.
+///
 /// # Errors
 ///
 /// * If an ACL couldn't be set.
-pub(crate) fn restore_acls(path: &Path, node: &Node) -> io::Result<()> {
+pub(crate) fn restore_acls(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
     // BackOtter: past PATH_MAX, through a short path to it.
     let path = &*walkdir::short_path(path);
-    os::restore_acls(path, node)
+    #[cfg(target_os = "illumos")]
+    {
+        os::restore_acls(path, node, known_bko)
+    }
+    #[cfg(not(target_os = "illumos"))]
+    {
+        let _ = known_bko;
+        os::restore_acls(path, node)
+    }
 }
 
 /// Sets the birth time of the file at `path`, where the system keeps one

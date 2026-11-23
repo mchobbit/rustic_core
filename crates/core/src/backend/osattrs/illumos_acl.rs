@@ -24,8 +24,12 @@ const TYPE_FLAGS: u16 = OWNER | GROUP | EVERYONE | IDENTIFIER_GROUP;
 const INHERITANCE_FLAGS: u16 = FILE_INHERIT | DIRECTORY_INHERIT | NO_PROPAGATE | INHERIT_ONLY;
 
 // a_access_mask
+const READ_DATA: u32 = 0x0000_0001;
 const WRITE_DATA: u32 = 0x0000_0002;
+const APPEND_DATA: u32 = 0x0000_0004;
+const READ_NAMED_ATTRS: u32 = 0x0000_0008;
 const WRITE_NAMED_ATTRS: u32 = 0x0000_0010;
+const EXECUTE: u32 = 0x0000_0020;
 const DELETE_CHILD: u32 = 0x0000_0040;
 const READ_ATTRIBUTES: u32 = 0x0000_0080;
 const WRITE_ATTRIBUTES: u32 = 0x0000_0100;
@@ -33,6 +37,7 @@ const DELETE: u32 = 0x0001_0000;
 const READ_ACL: u32 = 0x0002_0000;
 const WRITE_ACL: u32 = 0x0004_0000;
 const WRITE_OWNER: u32 = 0x0008_0000;
+const SYNCHRONIZE: u32 = 0x0010_0000;
 const OWNER_ONLY_ALLOWED: u32 = WRITE_OWNER | WRITE_ACL | WRITE_ATTRIBUTES | WRITE_NAMED_ATTRS;
 const NEVER_DENIED_BY_MODE: u32 = READ_ACL | READ_ATTRIBUTES;
 
@@ -116,9 +121,129 @@ pub(super) fn is_trivial(acl: &[AceEntry]) -> bool {
     true
 }
 
+/// `acl_trivial_create()` from illumos' `acl_common.c`: the trivial ACL of
+/// a file (a directory, if `dir`) with the permission bits `mode`, which
+/// says what the mode says and no more. It's what `acl_strip(3SEC)` and
+/// `chmod A-` give a file, and ZFS a new one: owner@, group@ and everyone@
+/// allowed what their bits say, before them owner@ allowed and then owner@
+/// and group@ denied what a later class has and they don't. A restore
+/// writes it over the ACL of a file whose node has none.
+pub(super) fn trivial(mode: u32, dir: bool) -> Vec<AceEntry> {
+    let read = READ_DATA;
+    let write = WRITE_DATA | APPEND_DATA | if dir { DELETE_CHILD } else { 0 };
+    let execute = EXECUTE;
+    // The bits of one class (the owner's are shifted by 6, the group's by
+    // 3) as a mask.
+    let class = |shift: u32| {
+        let bit = |b: u32, mask: u32| if mode >> shift & b == 0 { 0 } else { mask };
+        bit(4, read) | bit(2, write) | bit(1, execute)
+    };
+    let (owner, group, everyone) = (class(6), class(3), class(0));
+    // What the group has that everyone has not is no reason for an entry:
+    // group@ comes before everyone@. What everyone has and the group hasn't
+    // is denied the group, and allowed the owner first, where he has it.
+    let allow0 = owner & !group & everyone;
+    let deny1 = !owner & (group | everyone);
+    let deny2 = !group & everyone;
+    let basic = READ_ACL | READ_ATTRIBUTES | READ_NAMED_ATTRS | SYNCHRONIZE;
+    let ace = |mask, flags, ace_type| AceEntry {
+        who: u32::MAX,
+        mask,
+        flags,
+        ace_type,
+        sid: None,
+    };
+    let mut acl = Vec::with_capacity(6);
+    if allow0 != 0 {
+        acl.push(ace(allow0, OWNER, ACCESS_ALLOWED));
+    }
+    if deny1 != 0 {
+        acl.push(ace(deny1, OWNER, ACCESS_DENIED));
+    }
+    if deny2 != 0 {
+        acl.push(ace(deny2, GROUP | IDENTIFIER_GROUP, ACCESS_DENIED));
+    }
+    acl.push(ace(owner | basic | OWNER_ONLY_ALLOWED, OWNER, ACCESS_ALLOWED));
+    acl.push(ace(group | basic, GROUP | IDENTIFIER_GROUP, ACCESS_ALLOWED));
+    acl.push(ace(everyone | basic, EVERYONE, ACCESS_ALLOWED));
+    acl
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ForkAudit1 G5-02: the trivial ACL of a mode, as illumos'
+    /// `acl_trivial_create()` builds it (`ls -V` of new files on OmniOS).
+    #[test]
+    fn trivial_of_modes() {
+        let ace = |mask, flags, ace_type| AceEntry {
+            who: u32::MAX,
+            mask,
+            flags,
+            ace_type,
+            sid: None,
+        };
+        let group = GROUP | IDENTIFIER_GROUP;
+        // rw-p--aARWcCos, r-----a-R-c--s, r-----a-R-c--s
+        assert_eq!(
+            trivial(0o644, false),
+            [
+                ace(0x001e_019f, OWNER, ACCESS_ALLOWED),
+                ace(0x0012_0089, group, ACCESS_ALLOWED),
+                ace(0x0012_0089, EVERYONE, ACCESS_ALLOWED),
+            ]
+        );
+        assert_eq!(
+            trivial(0o600, false),
+            [
+                ace(0x001e_019f, OWNER, ACCESS_ALLOWED),
+                ace(0x0012_0088, group, ACCESS_ALLOWED),
+                ace(0x0012_0088, EVERYONE, ACCESS_ALLOWED),
+            ]
+        );
+        // A directory's write is add_file, add_subdirectory and delete_child.
+        assert_eq!(
+            trivial(0o755, true),
+            [
+                ace(0x001e_01ff, OWNER, ACCESS_ALLOWED),
+                ace(0x0012_00a9, group, ACCESS_ALLOWED),
+                ace(0x0012_00a9, EVERYONE, ACCESS_ALLOWED),
+            ]
+        );
+        // The group has less than everyone: denied first. The owner has
+        // what the group lacks: allowed before that.
+        assert_eq!(
+            trivial(0o604, false),
+            [
+                ace(READ_DATA, OWNER, ACCESS_ALLOWED),
+                ace(READ_DATA, group, ACCESS_DENIED),
+                ace(0x001e_019f, OWNER, ACCESS_ALLOWED),
+                ace(0x0012_0088, group, ACCESS_ALLOWED),
+                ace(0x0012_0089, EVERYONE, ACCESS_ALLOWED),
+            ]
+        );
+        // The owner has less than the others: denied.
+        assert_eq!(
+            trivial(0o077, false),
+            [
+                ace(READ_DATA | WRITE_DATA | APPEND_DATA | EXECUTE, OWNER, ACCESS_DENIED),
+                ace(0x001e_0198, OWNER, ACCESS_ALLOWED),
+                ace(0x0012_00af, group, ACCESS_ALLOWED),
+                ace(0x0012_00af, EVERYONE, ACCESS_ALLOWED),
+            ]
+        );
+        assert_eq!(trivial(0o206, false).len(), 6);
+        // The setuid, setgid and sticky bits and the file's type say nothing.
+        assert_eq!(trivial(0o104_755, false), trivial(0o755, false));
+        // Every one of them is trivial to `is_trivial`, so a file a restore
+        // gave one has no `illumos.acl` in its next backup.
+        for mode in 0..0o1000 {
+            for dir in [false, true] {
+                assert!(is_trivial(&trivial(mode, dir)), "{mode:o} {dir}");
+            }
+        }
+    }
 
     #[test]
     fn trivial_acls() {

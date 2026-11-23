@@ -53,6 +53,21 @@ that either program restores what the other backed up.
     `owner@`, `group@` or `everyone@`) has the SID too, in `"sid"`, which
     older readers ignore:
     `{"who":2147483650,"mask":1,"sid":"S-1-5-21-1111-2222-3333-1004"}`.
+    An ACL that says no more than the mode (a trivial one, what `ls(1)`
+    shows no `+` for) is not kept. So in a snapshot of BackOtter's a node
+    without `illumos.acl` had a trivial ACL, and a restore gives its file
+    the trivial ACL of its mode (as `acl_strip(3SEC)` builds it: `owner@`,
+    `group@` and `everyone@`, with deny entries where a class has less than
+    a later one) wherever the file has another: named or deny entries
+    added since the backup, or handed down by the directory it is restored
+    into. `chmod(2)` takes those off only under ZFS's default
+    `aclmode=discard`; under `passthrough` and `groupmask` they stay, and
+    under `restricted` it fails. The same for an attribute file whose
+    `illumos.xattr_meta` has no `"acl"`. In any other snapshot the ACL is
+    unknown, and the file keeps the one it has (0.14.0+backotter.2; before,
+    nothing took such an ACL off, access the snapshot never granted stayed
+    without a warning, and `--exact` set such a file's metadata again on
+    every run).
   - `illumos.owner_sid`, `illumos.group_sid`: the SID a file's owner or
     group is, as a string (`"S-1-5-21-1111-2222-3333-1001"`), when its uid
     or gid is ephemeral. See "SIDs on illumos" below.

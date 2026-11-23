@@ -1778,7 +1778,8 @@ fn set_metadata(
     if !cfg!(target_os = "haiku") {
         set_attributes(tally);
     }
-    osattrs::restore_acls(&target, node).unwrap_or_else(|err| tally.io(path, &err, true));
+    osattrs::restore_acls(&target, node, known_bko)
+        .unwrap_or_else(|err| tally.io(path, &err, true));
     if contents_failed {
         debug!(
             "restore {}: times not set, its contents were not restored",

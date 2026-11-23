@@ -590,15 +590,57 @@ pub(super) fn restore_attributes(path: &Path, node: &Node, owners: bool) -> io::
     restore_zfs_project(path, node).and(xattr_meta)
 }
 
+/// Gives `of`, which has no ACL to restore, the trivial ACL of `mode` (a
+/// directory's, if `dir`), unless the one it has is trivial already: what
+/// `acl_strip(3SEC)` does. `chmod(2)` can't be left to do it: under ZFS's
+/// `aclmode=passthrough` or `groupmask` it keeps the named and deny entries
+/// of a file found at the destination, and those a new file inherited from
+/// its directory, and under `restricted` it fails. Setting an ACL sets the
+/// mode's permission bits to what it says, which are `mode`'s, and leaves
+/// the setuid, setgid and sticky bits. A file system without NFSv4 ACLs
+/// (UFS, tmpfs) is left alone.
+fn strip_acl(of: AclOf<'_>, mode: u32, dir: bool) -> io::Result<()> {
+    let entries = match get_ace(of) {
+        Ok(entries) => entries,
+        Err(err) if unsupported(&err) => {
+            debug!("no ACL for {}: {err}", of.path().display());
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(path_error(&format!("{} ACE_GETACL", of.op()), of.path(), &err));
+        }
+    };
+    if entries.is_empty() || illumos_acl::is_trivial(&entries) {
+        return Ok(());
+    }
+    set_ace(of, &illumos_acl::trivial(mode, dir))
+}
+
 /// Restores the ACL, after the mode, since `chmod(2)` rewrites a ZFS ACL,
 /// with the ids its SIDs have here. A SID idmap can't map gives nobody
 /// (60001), with a [`SidUnmapped`] error.
-pub(super) fn restore_acls(path: &Path, node: &Node) -> io::Result<()> {
+///
+/// A node without an ACL had a trivial one in a snapshot of BackOtter's
+/// (`known_bko`), which records every other: the file then gets the trivial
+/// ACL of its mode, where it has another ([`strip_acl`]). In any other
+/// snapshot the ACL is unknown, and the file keeps the one it has.
+pub(super) fn restore_acls(path: &Path, node: &Node, known_bko: bool) -> io::Result<()> {
     if node.is_symlink() {
         return Ok(());
     }
     let Some(entries) = node.meta.generic_attributes.get::<Vec<AceEntry>>(ILLUMOS_ACL) else {
-        return Ok(());
+        if !known_bko {
+            return Ok(());
+        }
+        // The node's mode, which the restore has just set; the file's own
+        // where the node has none.
+        let mode = match node.meta.mode {
+            Some(mode) => mode,
+            None => std::fs::symlink_metadata(path)
+                .map_err(|err| path_error("lstat", path, &err))?
+                .mode(),
+        };
+        return strip_acl(AclOf::Path(path), mode, node.is_dir());
     };
     let mut entries = entries.map_err(io::Error::other)?;
     let unmapped = aces_with_ids(ILLUMOS_ACL, &mut entries);
@@ -957,8 +999,9 @@ fn restore_xattr_meta(path: &Path, node: &Node, owners: bool) -> io::Result<()> 
 
 /// Gives the attribute `name` in `dir`, the attribute directory of `path`,
 /// the metadata `meta`: the owner and group `owner`, if any (none: they are
-/// left as they are), mode, ACL (after the mode, which rewrites it), then
-/// the times, last, as for the file itself. Each is tried even when one
+/// left as they are), mode, ACL (after the mode, which rewrites it; without
+/// one, the trivial ACL of the mode, where it has another: [`strip_acl`]),
+/// then the times, last, as for the file itself. Each is tried even when one
 /// before it failed; the error is the first. A warning about a SID in the
 /// ACL that idmap couldn't map goes to `unmapped`. A change of owner refused
 /// to a restore not running as root is no error, as for the file itself.
@@ -1001,17 +1044,21 @@ fn restore_one_xattr_meta(
         Err(err) if gone(&err) => return Ok(()),
         r => r.map(drop).map_err(|err| path_error("fchmodat", &at, &err)),
     };
-    let acl = if meta.acl.is_empty() {
-        Ok(())
-    } else {
-        let mut entries = meta.acl.clone();
-        if let Some(err) = aces_with_ids(ILLUMOS_XATTR_META, &mut entries) {
-            _ = unmapped.get_or_insert(err);
-        }
-        open_attr(dir, name, libc::O_RDONLY | libc::O_NONBLOCK)
-            .map_err(|err| path_error("openat", &at, &err))
-            .and_then(|f| set_ace(AclOf::File(&f, &at), &entries))
-    };
+    // No ACL kept: it was trivial ([`read_xattr_meta`]).
+    let mut entries = meta.acl.clone();
+    if let Some(err) = aces_with_ids(ILLUMOS_XATTR_META, &mut entries) {
+        _ = unmapped.get_or_insert(err);
+    }
+    let acl = open_attr(dir, name, libc::O_RDONLY | libc::O_NONBLOCK)
+        .map_err(|err| path_error("openat", &at, &err))
+        .and_then(|f| {
+            let of = AclOf::File(&f, &at);
+            if entries.is_empty() {
+                strip_acl(of, meta.mode, false)
+            } else {
+                set_ace(of, &entries)
+            }
+        });
     let timespec = |t| {
         let (sec, nsec) = unix_time(t);
         libc::timespec {
@@ -1198,5 +1245,131 @@ mod tests {
         restore_xattr_meta(&file, &node, true).unwrap();
         assert_eq!(attr_owner(&file, "mine"), (1001, 1001));
         assert_eq!(attr_owner(&file, "other"), (1002, 1001));
+    }
+
+    /// A named user's entry, as `chmod A+user:nobody:read_data:allow`.
+    fn nobody_reads() -> AceEntry {
+        AceEntry {
+            who: NOBODY,
+            mask: 1,
+            ..AceEntry::default()
+        }
+    }
+
+    /// ForkAudit1 G5-02: what ZFS gives a file as its ACL when its mode is
+    /// set is `illumos_acl::trivial` of that mode (the ACL a restore writes
+    /// in place of one the snapshot hasn't got). On ZFS, with the default
+    /// `aclmode=discard`.
+    #[test]
+    fn trivial_acl_is_what_chmod_gives() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (file, sub) = (dir.path().join("f"), dir.path().join("d"));
+        std::fs::write(&file, b"").unwrap();
+        std::fs::create_dir(&sub).unwrap();
+        if get_ace(AclOf::Path(&file)).is_err() {
+            eprintln!("no NFSv4 ACLs in {}", dir.path().display());
+            return;
+        }
+        for mode in [0o644, 0o600, 0o640, 0o755, 0o604, 0o046, 0o077, 0o206, 0o000, 0o777, 0o4755] {
+            for (path, is_dir) in [(&file, false), (&sub, true)] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+                assert_eq!(
+                    get_ace(AclOf::Path(path)).unwrap(),
+                    illumos_acl::trivial(mode, is_dir),
+                    "{mode:o} {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// ForkAudit1 G5-02: a file whose node has no ACL, in a snapshot of
+    /// BackOtter's, loses the named entry it has at the destination (added
+    /// after the backup, or inherited): it gets the trivial ACL of its
+    /// mode, and keeps its mode, the setuid bit too. In another snapshot it
+    /// keeps what it has. Before, nothing took it off (`chmod(2)` only
+    /// under `aclmode=discard`). On ZFS.
+    #[test]
+    fn restore_acls_strips_an_acl_the_node_has_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"secret").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o4750)).unwrap();
+        let Ok(mut acl) = get_ace(AclOf::Path(&file)) else {
+            eprintln!("no NFSv4 ACLs in {}", dir.path().display());
+            return;
+        };
+        acl.insert(0, nobody_reads());
+        set_ace(AclOf::Path(&file), &acl).unwrap();
+        assert!(!illumos_acl::is_trivial(&get_ace(AclOf::Path(&file)).unwrap()));
+        let node = file_node(0o104_750, 0, 0);
+
+        // Not BackOtter's snapshot: unknown, left.
+        restore_acls(&file, &node, false).unwrap();
+        assert!(!illumos_acl::is_trivial(&get_ace(AclOf::Path(&file)).unwrap()));
+
+        restore_acls(&file, &node, true).unwrap();
+        assert_eq!(get_ace(AclOf::Path(&file)).unwrap(), illumos_acl::trivial(0o750, false));
+        assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o7777, 0o4750);
+
+        // A node without a mode: the file's own.
+        set_ace(AclOf::Path(&file), &acl).unwrap();
+        let mut no_mode = node;
+        no_mode.meta.mode = None;
+        restore_acls(&file, &no_mode, true).unwrap();
+        assert!(illumos_acl::is_trivial(&get_ace(AclOf::Path(&file)).unwrap()));
+
+        // A symlink has no ACL of its own: its target's is left.
+        set_ace(AclOf::Path(&file), &acl).unwrap();
+        let link = dir.path().join("l");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let link_node = Node::new_node(
+            std::ffi::OsStr::new("l"),
+            NodeType::Symlink {
+                linktarget: "f".to_string(),
+                linktarget_raw: None,
+            },
+            crate::backend::node::Metadata::default(),
+        );
+        restore_acls(&link, &link_node, true).unwrap();
+        assert!(!illumos_acl::is_trivial(&get_ace(AclOf::Path(&file)).unwrap()));
+    }
+
+    /// ForkAudit1 G5-02: an attribute file whose metadata has no ACL loses
+    /// the entry it has at the destination, as its file does. On ZFS.
+    #[test]
+    fn xattr_meta_strips_an_acl_it_has_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"").unwrap();
+        let attrs = [xattr("note", b"n")];
+        if get_ace(AclOf::Path(&file)).is_err() || set_xattrs(&file, &attrs).is_err() {
+            eprintln!("no NFSv4 ACLs or extended attributes in {}", dir.path().display());
+            return;
+        }
+        let adir = attr_dir(&file).unwrap().unwrap();
+        let attr_file = open_attr(&adir, "note", libc::O_RDONLY).unwrap();
+        let at = attr_path(&file, "note");
+        let mut acl = get_ace(AclOf::File(&attr_file, &at)).unwrap();
+        acl.insert(0, nobody_reads());
+        set_ace(AclOf::File(&attr_file, &at), &acl).unwrap();
+        let t = Timestamp::new(1_000_000_000, 0).unwrap();
+        let meta = XattrMeta {
+            uid: 0,
+            gid: 0,
+            mode: 0o600,
+            mtime: t,
+            atime: t,
+            acl: Vec::new(),
+        };
+        let mut node = file_node(0o644, 0, 0);
+        node.meta.extended_attributes = attrs.to_vec();
+        let metas = BTreeMap::from([("note".to_string(), meta)]);
+        node.meta.generic_attributes.set(ILLUMOS_XATTR_META, &metas).unwrap();
+        restore_xattr_meta(&file, &node, false).unwrap();
+        assert_eq!(get_ace(AclOf::File(&attr_file, &at)).unwrap(), illumos_acl::trivial(0o600, false));
+        assert_eq!(attr_file.metadata().unwrap().mode() & 0o7777, 0o600);
     }
 }
