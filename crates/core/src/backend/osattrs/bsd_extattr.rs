@@ -81,4 +81,30 @@ mod tests {
         );
         assert_eq!(node_name(b"plain"), "plain");
     }
+
+    /// BackOtter (ForkAudit1 F2): a list cut short gives the names before
+    /// the cut, never one cut short; with any bit flipped, names that fit in
+    /// it, a length byte each. Neither panics.
+    #[test]
+    fn list_names_malformed() {
+        use crate::backend::osattrs::malformed::{Found, every_mutation};
+
+        let list = b"\x01\xff\x03abc\x00\x10security.selinux\x05user1\x02\xc3\xa9";
+        let full = list_names(list);
+        assert_eq!(full.len(), 6);
+        _ = every_mutation("extattr list", list, |input, cut| {
+            let names = list_names(input);
+            let bytes: usize = names.iter().map(|n| n.len() + 1).sum();
+            if bytes > input.len() {
+                Found::Wrong(format!(
+                    "{bytes} bytes of names in a list of {}",
+                    input.len()
+                ))
+            } else if cut && full.get(..names.len()) != Some(&names[..]) {
+                Found::Wrong(format!("not the names before the cut: {names:?}"))
+            } else {
+                Found::Decoded
+            }
+        });
+    }
 }

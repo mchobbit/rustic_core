@@ -453,4 +453,44 @@ mod tests {
             r#"[{"tag":1,"id":4294967295,"perm":6},{"tag":2,"id":1001,"perm":24,"type":256}]"#
         );
     }
+
+    /// BackOtter (ForkAudit1 F2): FreeBSD's and NetBSD's ACLs from another
+    /// machine, cut short or with any bit flipped: refused, or read into
+    /// entries that the mode and triviality rules take without a panic, and
+    /// that keep_acl keeps as they are.
+    #[test]
+    fn acls_malformed() {
+        use crate::backend::osattrs::malformed::every_json_mutation;
+
+        for (what, json) in [
+            (
+                "acl_nfs4",
+                r#"[{"tag":1,"id":4294967295,"perm":1,"type":256},{"tag":2,"id":1001,"perm":24,"type":512,"flags":8},{"tag":64,"id":4294967295,"perm":7,"type":256}]"#,
+            ),
+            (
+                "acl_access",
+                r#"[{"tag":1,"id":4294967295,"perm":6},{"tag":2,"id":1001,"perm":7},{"tag":4,"id":4294967295,"perm":4},{"tag":16,"id":4294967295,"perm":5},{"tag":32,"id":4294967295,"perm":4}]"#,
+            ),
+        ] {
+            _ = every_json_mutation::<Vec<AclEntry>>(what, json, |acl| {
+                _ = nfs4_mode_from_acl(acl);
+                _ = nfs4_is_trivial(acl);
+                if let Some(p) = posix_owning_group_perms(acl)
+                    && p > POSIX_PERMS
+                {
+                    return Err(format!("owning group perms {p:#o}"));
+                }
+                for typ in [AclType::Access, AclType::Default, AclType::Nfs4] {
+                    let mut attrs = GenericAttributes::default();
+                    keep_acl(&FREEBSD, &mut attrs, typ, acl).map_err(|e| e.to_string())?;
+                    if let Some(kept) = attrs.get::<Vec<AclEntry>>(FREEBSD.attribute(typ))
+                        && kept.as_deref().ok() != Some(&acl[..])
+                    {
+                        return Err(format!("{typ:?} kept as {kept:?}"));
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
 }
