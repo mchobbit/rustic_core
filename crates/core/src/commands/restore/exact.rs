@@ -28,6 +28,7 @@ use crate::{
         osattrs,
     },
     blob::DataId,
+    commands::restore::SnapshotOrigin,
 };
 
 /// Files already restored, by their contents (the blobs a snapshot lists
@@ -345,11 +346,14 @@ pub(super) fn same_type(target: &Path, node: &Node) -> bool {
         .is_ok_and(|now| now.node_type == node.node_type)
 }
 
-/// Whether `a` and `b` are the same file.
-pub(super) fn same_file(a: &Path, b: &Path) -> bool {
+/// Whether `a` and `b` are the same entry, by device and inode, not
+/// following a symlink (a directory too); `off_unix` where there is no such
+/// thing to compare. For [`same_file`] and [`same_entry`].
+fn same_inode(a: &Path, b: &Path, off_unix: bool) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        _ = off_unix;
         // BackOtter: past PATH_MAX, through short paths to them.
         match (
             std::fs::symlink_metadata(walkdir::short_path(a)),
@@ -362,28 +366,52 @@ pub(super) fn same_file(a: &Path, b: &Path) -> bool {
     #[cfg(not(unix))]
     {
         _ = (a, b);
-        false
+        off_unix
     }
+}
+
+/// Whether `a` and `b` are the same file: two names of one hard-linked
+/// file. Never off Unix, where the restore makes no hard link.
+pub(super) fn same_file(a: &Path, b: &Path) -> bool {
+    same_inode(a, b, false)
+}
+
+/// Whether `a` and `b` are the same entry, a directory too: one entry under
+/// two names, as in a case-insensitive directory. Off Unix, only the same
+/// path.
+pub(super) fn same_entry(a: &Path, b: &Path) -> bool {
+    same_inode(a, b, a == b)
+}
+
+/// How a restore sets what [`already_matches`] compares: by its options and
+/// the snapshot it restores (the restore's `compared`).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Compared {
+    /// Owners are set by ID (`--numeric-id`). By name, the IDs on this
+    /// system may differ from the node's, so with `ownership` no entry
+    /// matches.
+    pub(super) numeric: bool,
+    /// Owners are set, and so compared: by root, unless `--no-ownership`.
+    /// Not root, the restore leaves them as they are (as BackOtter's
+    /// restic).
+    pub(super) ownership: bool,
+    /// What wrote the snapshot: whether an attribute the node hasn't got
+    /// means none ([`SnapshotOrigin::known_bko`]), and a missing mode 0.
+    pub(super) origin: SnapshotOrigin,
 }
 
 /// Whether what is at `target` already has `node`'s metadata: what a
 /// backup would record for it now is `node`'s, as a restore sets it
 /// ([`same_metadata`]), but for what a restore can't set or doesn't (the
 /// change time, the inode, the device, the link count, the owner's names).
-/// `numeric` says the owner is by ID; by name, the IDs on this system may
-/// differ from the node's, and it never matches. `known_bko`: the snapshot
-/// is BackOtter's. Anything that can't be read doesn't match.
-pub(super) fn already_matches(
-    target: &Path,
-    node: &Node,
-    numeric: bool,
-    ownership: bool,
-    known_bko: bool,
-) -> bool {
-    if ownership && !numeric {
+/// `how` says how the restore sets it ([`Compared`]): where it sets owners
+/// (`ownership`) by name (not `numeric`), nothing matches, and nothing is
+/// read. Anything that can't be read doesn't match.
+pub(super) fn already_matches(target: &Path, node: &Node, how: Compared) -> bool {
+    if how.ownership && !how.numeric {
         return false;
     }
-    node_now(target).is_some_and(|now| same_metadata(&now, node, ownership, known_bko))
+    node_now(target).is_some_and(|now| same_metadata(&now, node, how))
 }
 
 /// Whether what is at `target` has `node`'s metadata ([`already_matches`])
@@ -396,20 +424,13 @@ pub(super) fn already_matches(
 /// restricting flag), nor elsewhere, where setting any time moves the
 /// change time (and Linux reads with `O_NOATIME`): the restore then sets
 /// the metadata whole.
-pub(super) fn atime_put_back(
-    target: &Path,
-    node: &Node,
-    numeric: bool,
-    ownership: bool,
-    known_bko: bool,
-) -> bool {
+pub(super) fn atime_put_back(target: &Path, node: &Node, how: Compared) -> bool {
     #[cfg(target_os = "netbsd")]
     {
-        if ownership && !numeric {
+        if how.ownership && !how.numeric {
             return false;
         }
-        let Some(atime) =
-            node_now(target).and_then(|now| atime_alone_differs(&now, node, ownership, known_bko))
+        let Some(atime) = node_now(target).and_then(|now| atime_alone_differs(&now, node, how))
         else {
             return false;
         };
@@ -419,7 +440,7 @@ pub(super) fn atime_put_back(
     }
     #[cfg(not(target_os = "netbsd"))]
     {
-        _ = (target, node, numeric, ownership, known_bko);
+        _ = (target, node, how);
         false
     }
 }
@@ -430,12 +451,7 @@ pub(super) fn atime_put_back(
 /// a read moved. None when it matches, when more differs, or when `node`
 /// has no mtime (no times compared).
 #[cfg_attr(not(any(test, target_os = "netbsd")), allow(dead_code))]
-fn atime_alone_differs(
-    now: &Node,
-    node: &Node,
-    ownership: bool,
-    known_bko: bool,
-) -> Option<Timestamp> {
+fn atime_alone_differs(now: &Node, node: &Node, how: Compared) -> Option<Timestamp> {
     let mtime = node.meta.mtime?;
     let atime = node.meta.atime.unwrap_or(mtime);
     if now.meta.atime == Some(atime) {
@@ -443,33 +459,50 @@ fn atime_alone_differs(
     }
     let mut put_back = now.clone();
     put_back.meta.atime = Some(atime);
-    same_metadata(&put_back, node, ownership, known_bko).then_some(atime)
+    same_metadata(&put_back, node, how).then_some(atime)
 }
 
 /// The comparison [`already_matches`] makes: the type (a symlink's target,
-/// a device), mode, times (the mtime in place of a missing atime, as the
-/// restore sets it; none when `node` has no mtime), the owner's IDs with
-/// `ownership`, size, extended attributes in any order, and generic
-/// attributes as [`same_generic_attributes`] compares them. As in
-/// BackOtter's restic (`sameMetadata`).
-fn same_metadata(now: &Node, node: &Node, ownership: bool, known_bko: bool) -> bool {
-    let (a, b) = (&now.meta, &node.meta);
-    let sorted = |x: &[ExtendedAttribute]| {
-        let mut v: Vec<(String, Option<Vec<u8>>)> =
-            x.iter().map(|e| (e.name.clone(), e.value.clone())).collect();
-        v.sort();
+/// a device), mode (as the restore sets it, [`same_mode`]), times (the
+/// mtime in place of a missing atime, as the restore sets it; none when
+/// `node` has no mtime), the owner's IDs with `how.ownership`, size,
+/// extended attributes in any order, and generic attributes as
+/// [`same_generic_attributes`] compares them. As in BackOtter's restic
+/// (`sameMetadata`).
+fn same_metadata(now: &Node, node: &Node, how: Compared) -> bool {
+    /// The names and values, borrowed, in one order.
+    fn sorted(x: &[ExtendedAttribute]) -> Vec<(&str, Option<&[u8]>)> {
+        let mut v: Vec<_> = x.iter().map(|e| (e.name.as_str(), e.value.as_deref())).collect();
+        v.sort_unstable();
         v
-    };
+    }
+    let (a, b) = (&now.meta, &node.meta);
     let times = b
         .mtime
         .is_none_or(|mtime| a.mtime == Some(mtime) && a.atime == Some(b.atime.unwrap_or(mtime)));
     now.node_type == node.node_type
-        && a.mode == b.mode
+        && same_mode(now, node, how.origin)
         && times
-        && (!ownership || (a.uid == b.uid && a.gid == b.gid))
+        && (!how.ownership || (a.uid == b.uid && a.gid == b.gid))
         && a.size == b.size
         && sorted(&a.extended_attributes) == sorted(&b.extended_attributes)
-        && same_generic_attributes(now, node, known_bko)
+        && same_generic_attributes(now, node, how.origin.known_bko())
+}
+
+/// Whether `now`, what a backup would record for a file, has the mode a
+/// restore of `node` leaves it with: `node`'s; for a node without one, 0
+/// where the restore sets that (a regular file of a snapshot that leaves a
+/// mode of 0 out, the restore's `missing_mode_is_zero`: /etc/shadow in a
+/// snapshot of BackOtter's restic), and any otherwise, since the restore
+/// then sets none. A backup always records one, so comparing the two as
+/// they are never matched such a file, and every `--exact` run set its
+/// metadata again (ForkAudit1 G6-08).
+fn same_mode(now: &Node, node: &Node, origin: SnapshotOrigin) -> bool {
+    match node.meta.mode {
+        Some(mode) => now.meta.mode == Some(mode),
+        None if super::missing_mode_is_zero(origin, node) => now.meta.mode == Some(0),
+        None => true,
+    }
 }
 
 /// Whether `now`, what a backup would record for a file, holds `node`'s
@@ -525,6 +558,14 @@ mod tests {
     use super::*;
     use crate::backend::node::{Metadata, NodeType};
 
+    /// How a restore by root with `--numeric-id` compares, with owners
+    /// (`ownership`) or not, a snapshot of BackOtter's (`known_bko`) or of
+    /// stock rustic's.
+    fn how(ownership: bool, known_bko: bool) -> Compared {
+        let origin = if known_bko { SnapshotOrigin::BackOtter } else { SnapshotOrigin::Other };
+        Compared { numeric: true, ownership, origin }
+    }
+
     fn node(mode: u32, xattrs: &[(&str, &[u8])]) -> Node {
         Node::new_node(
             OsStr::new("f"),
@@ -554,24 +595,24 @@ mod tests {
         b.meta.device_id = 9;
         b.meta.links = 2;
         b.meta.user = Some("root".into());
-        assert!(same_metadata(&a, &b, true, true));
+        assert!(same_metadata(&a, &b, how(true, true)));
         b.meta.uid = Some(1);
-        assert!(!same_metadata(&a, &b, true, true));
-        assert!(same_metadata(&a, &b, false, true));
+        assert!(!same_metadata(&a, &b, how(true, true)));
+        assert!(same_metadata(&a, &b, how(false, true)));
     }
 
     #[test]
     fn same_metadata_sees_every_difference() {
         let a = node(0o644, &[("user.a", b"1")]);
-        assert!(!same_metadata(&a, &node(0o600, &[("user.a", b"1")]), true, true));
-        assert!(!same_metadata(&a, &node(0o644, &[("user.a", b"2")]), true, true));
-        assert!(!same_metadata(&a, &node(0o644, &[]), true, true));
+        assert!(!same_metadata(&a, &node(0o600, &[("user.a", b"1")]), how(true, true)));
+        assert!(!same_metadata(&a, &node(0o644, &[("user.a", b"2")]), how(true, true)));
+        assert!(!same_metadata(&a, &node(0o644, &[]), how(true, true)));
         let mut b = node(0o644, &[("user.a", b"1")]);
         b.meta.atime = Some(Timestamp::from_second(1_700_000_200).unwrap());
-        assert!(!same_metadata(&a, &b, true, true));
+        assert!(!same_metadata(&a, &b, how(true, true)));
         let mut b = node(0o644, &[("user.a", b"1")]);
         b.meta.mtime = Some(Timestamp::from_second(1_700_000_001).unwrap());
-        assert!(!same_metadata(&a, &b, true, true));
+        assert!(!same_metadata(&a, &b, how(true, true)));
     }
 
     /// D9: a node without an atime matches a file whose atime is its mtime,
@@ -582,11 +623,45 @@ mod tests {
         node_.meta.atime = None;
         let mut now = node(0o644, &[]);
         now.meta.atime = now.meta.mtime;
-        assert!(same_metadata(&now, &node_, true, true));
+        assert!(same_metadata(&now, &node_, how(true, true)));
         now.meta.atime = Some(Timestamp::from_second(1_700_000_100).unwrap());
-        assert!(!same_metadata(&now, &node_, true, true));
+        assert!(!same_metadata(&now, &node_, how(true, true)));
         node_.meta.mtime = None;
-        assert!(same_metadata(&now, &node_, true, true));
+        assert!(same_metadata(&now, &node_, how(true, true)));
+    }
+
+    /// ForkAudit1 G6-08: the mode is compared as the restore sets it. A
+    /// regular file without one, read from a Unix file system (an inode
+    /// number), had mode 0 in a snapshot that leaves 0 out (restic's,
+    /// BackOtter's): a file of mode 0 matches it, no other. Where the
+    /// restore sets no mode (stock rustic's snapshot, a file from stdin),
+    /// any mode matches.
+    #[test]
+    fn same_metadata_missing_mode_as_the_restore_sets_it() {
+        let by = |origin| Compared { numeric: true, ownership: true, origin };
+        let mut shadow = node(0, &[]);
+        shadow.meta.mode = None;
+        shadow.meta.inode = 1234;
+        let (zero, other) = (node(0, &[]), node(0o644, &[]));
+        for origin in [SnapshotOrigin::BackOtter, SnapshotOrigin::Restic] {
+            assert!(same_metadata(&zero, &shadow, by(origin)), "{origin:?}");
+            assert!(!same_metadata(&other, &shadow, by(origin)), "{origin:?}");
+        }
+        assert!(same_metadata(&zero, &shadow, by(SnapshotOrigin::Other)));
+        assert!(same_metadata(&other, &shadow, by(SnapshotOrigin::Other)));
+        // Read from stdin: no inode number, its mode unknown everywhere.
+        let mut stdin = shadow.clone();
+        stdin.meta.inode = 0;
+        assert!(same_metadata(&other, &stdin, by(SnapshotOrigin::BackOtter)));
+        // A directory without a mode gets none either.
+        let mut dir = shadow;
+        dir.node_type = NodeType::Dir;
+        let mut there = node(0o755, &[]);
+        there.node_type = NodeType::Dir;
+        assert!(same_metadata(&there, &dir, by(SnapshotOrigin::BackOtter)));
+        // A node with a mode matches that mode alone, 0 too.
+        assert!(same_metadata(&zero, &node(0, &[]), by(SnapshotOrigin::Other)));
+        assert!(!same_metadata(&other, &node(0, &[]), by(SnapshotOrigin::Other)));
     }
 
     /// An atime a read moved (NetBSD) is put back alone: only where the
@@ -596,29 +671,29 @@ mod tests {
         let ts = |s| Timestamp::from_second(s).unwrap();
         let node_ = node(0o644, &[("user.a", b"1")]);
         let mut now = node(0o644, &[("user.a", b"1")]);
-        assert_eq!(atime_alone_differs(&now, &node_, true, true), None);
+        assert_eq!(atime_alone_differs(&now, &node_, how(true, true)), None);
         now.meta.atime = Some(ts(1_800_000_000));
-        assert_eq!(atime_alone_differs(&now, &node_, true, true), Some(ts(1_700_000_100)));
+        assert_eq!(atime_alone_differs(&now, &node_, how(true, true)), Some(ts(1_700_000_100)));
         // The mtime in place of a missing atime; no mtime, no times compared.
         let mut no_atime = node_.clone();
         no_atime.meta.atime = None;
-        assert_eq!(atime_alone_differs(&now, &no_atime, true, true), Some(ts(1_700_000_000)));
+        assert_eq!(atime_alone_differs(&now, &no_atime, how(true, true)), Some(ts(1_700_000_000)));
         no_atime.meta.mtime = None;
-        assert_eq!(atime_alone_differs(&now, &no_atime, true, true), None);
+        assert_eq!(atime_alone_differs(&now, &no_atime, how(true, true)), None);
         // Anything else that differs: the metadata are set whole.
         let mut more = now.clone();
         more.meta.mtime = Some(ts(1_700_000_001));
-        assert_eq!(atime_alone_differs(&more, &node_, true, true), None);
+        assert_eq!(atime_alone_differs(&more, &node_, how(true, true)), None);
         let mut more = now.clone();
         more.meta.mode = Some(0o600);
-        assert_eq!(atime_alone_differs(&more, &node_, true, true), None);
+        assert_eq!(atime_alone_differs(&more, &node_, how(true, true)), None);
         let mut more = now.clone();
         more.meta.uid = Some(1);
-        assert_eq!(atime_alone_differs(&more, &node_, true, true), None);
-        assert_eq!(atime_alone_differs(&more, &node_, false, true), Some(ts(1_700_000_100)));
+        assert_eq!(atime_alone_differs(&more, &node_, how(true, true)), None);
+        assert_eq!(atime_alone_differs(&more, &node_, how(false, true)), Some(ts(1_700_000_100)));
         let mut more = node(0o644, &[("user.a", b"2")]);
         more.meta.atime = now.meta.atime;
-        assert_eq!(atime_alone_differs(&more, &node_, true, true), None);
+        assert_eq!(atime_alone_differs(&more, &node_, how(true, true)), None);
     }
 
     /// D9: `unix.sparse` and the birth time aren't compared as other
@@ -629,19 +704,19 @@ mod tests {
         let node_ = node(0o644, &[]);
         let mut now = node(0o644, &[]);
         now.meta.generic_attributes.set_true(UNIX_SPARSE);
-        assert!(same_metadata(&now, &node_, true, true));
+        assert!(same_metadata(&now, &node_, how(true, true)));
         now.meta.generic_attributes.set_number("linux.inode_flags", 0x10);
-        assert!(!same_metadata(&now, &node_, true, true));
-        assert!(same_metadata(&now, &node_, true, false));
+        assert!(!same_metadata(&now, &node_, how(true, true)));
+        assert!(same_metadata(&now, &node_, how(true, false)));
         let mut want = node_.clone();
         want.meta.generic_attributes.set_number("linux.inode_flags", 0x10);
-        assert!(same_metadata(&now, &want, true, true));
+        assert!(same_metadata(&now, &want, how(true, true)));
         want.meta.generic_attributes.set_number("linux.inode_flags", 0x30);
-        assert!(!same_metadata(&now, &want, true, false));
+        assert!(!same_metadata(&now, &want, how(true, false)));
         // One the node has that the file hasn't never matches.
         let mut want = node_;
         want.meta.generic_attributes.set_number("linux.project_id", 3);
-        assert!(!same_metadata(&now, &want, true, false));
+        assert!(!same_metadata(&now, &want, how(true, false)));
     }
 
     /// D9: where a restore can only lower a birth time (FreeBSD, NetBSD),

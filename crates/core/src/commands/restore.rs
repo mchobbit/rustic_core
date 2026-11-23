@@ -573,10 +573,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
     if !dry_run && std::fs::symlink_metadata(&dest_path).is_ok_and(|m| m.is_dir()) {
         dirs.borrow_mut().note(&dest_path, Path::new(""), false);
     }
-    let numeric = ownership(opts) == Ownership::Numeric;
-    // BackOtter: --exact compares owners only as root, who sets them (as
-    // BackOtter's restic): not root, the restore leaves them as they are.
-    let owned = ownership(opts) != Ownership::None && osattrs::is_root();
+    let how = compared(opts);
 
     let mut additional_existing = false;
     // BackOtter: failures restic counts as errors (RestoreStats::errors); a
@@ -987,8 +984,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         && is_dir
                         && std::fs::read_dir(walkdir::short_path(&target))
                             .is_ok_and(|mut dir| dir.next().is_none())
-                        && !(opts.exact
-                            && exact::already_matches(&target, node, numeric, owned, known_bko))
+                        && !(opts.exact && exact::already_matches(&target, node, how))
                     {
                         dirs.borrow_mut().change(&target);
                         if let Err(err) = osattrs::prepare_dir(&target, node, known_bko) {
@@ -1283,10 +1279,7 @@ fn restore_metadata(
     // (on illumos) refuses having them set again. ZFS's DOS flags (Linux)
     // just before them.
     let mut late = LatePass::default();
-    let numeric = ownership(opts) == Ownership::Numeric;
-    // BackOtter: --exact compares owners only as root, who sets them (as
-    // BackOtter's restic): not root, the restore leaves them as they are.
-    let owned = ownership(opts) != Ownership::None && osattrs::is_root();
+    let how = compared(opts);
     let known_bko = opts.origin.known_bko();
     let finish = |late: &mut LatePass,
                   dirs: &mut DirChanges,
@@ -1308,8 +1301,8 @@ fn restore_metadata(
         // leaves its change time.
         let attrs = if opts.exact
             && dest.path(path).is_ok_and(|t| {
-                exact::already_matches(&t, node, numeric, owned, known_bko)
-                    || exact::atime_put_back(&t, node, numeric, owned, known_bko)
+                exact::already_matches(&t, node, how)
+                    || exact::atime_put_back(&t, node, how)
             })
         {
             trace!("metadata already matches: {}", path.display());
@@ -1624,6 +1617,17 @@ const fn ownership(opts: RestoreOptions) -> Ownership {
     }
 }
 
+/// BackOtter: how `--exact` compares an entry with its node under `opts`
+/// ([`exact::Compared`]): owners only where the restore sets them, which is
+/// as root (as BackOtter's restic); not root, it leaves them as they are.
+fn compared(opts: RestoreOptions) -> exact::Compared {
+    exact::Compared {
+        numeric: ownership(opts) == Ownership::Numeric,
+        ownership: ownership(opts) != Ownership::None && osattrs::is_root(),
+        origin: opts.origin,
+    }
+}
+
 /// BackOtter: whether the regular file `node`, which has no mode, had mode
 /// 0 (permissions `0000`, as /etc/shadow has): when it was read from a Unix
 /// file system (it has an inode number; a file read from stdin or made on
@@ -1632,10 +1636,16 @@ const fn ownership(opts: RestoreOptions) -> Ownership {
 /// unknown, and the file keeps the one it was created with, as in stock
 /// rustic.
 const fn mode_zero_if_missing(opts: RestoreOptions, node: &Node) -> bool {
+    missing_mode_is_zero(opts.origin, node)
+}
+
+/// BackOtter: [`mode_zero_if_missing`] by the snapshot's origin, for
+/// `--exact`'s comparison too (`exact::same_mode`).
+const fn missing_mode_is_zero(origin: SnapshotOrigin, node: &Node) -> bool {
     matches!(node.node_type, NodeType::File)
         && node.meta.mode.is_none()
         && node.meta.inode != 0
-        && opts.origin.omits_zero_mode()
+        && origin.omits_zero_mode()
 }
 
 fn hardlink_key(node: &Node) -> Option<HardlinkKey> {
@@ -2449,7 +2459,7 @@ impl Aliases {
         self.0
             .get(&Self::key(path))
             .map(PathBuf::as_path)
-            .filter(|target| same_entry(path, target))
+            .filter(|target| exact::same_entry(path, target))
     }
 }
 
@@ -2463,26 +2473,6 @@ fn no_symlink_below(dest: &Path, rel: &Path) -> bool {
         matches!(c, std::path::Component::Normal(_))
             && std::fs::symlink_metadata(walkdir::short_path(&path)).is_ok_and(|m| m.is_dir())
     })
-}
-
-/// BackOtter: whether `a` and `b` are the same entry, the same device and
-/// inode, not following a symlink; a directory too.
-fn same_entry(a: &Path, b: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        match (
-            std::fs::symlink_metadata(walkdir::short_path(a)),
-            std::fs::symlink_metadata(walkdir::short_path(b)),
-        ) {
-            (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
-            _ => false,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        a == b
-    }
 }
 
 /// BackOtter: removes what `--delete` removes at `path` (a directory if
