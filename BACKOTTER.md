@@ -1019,8 +1019,8 @@ that either program restores what the other backed up.
     with data, which btrfs keeps without an error ("no-copy-on-write (C)
     not cleared on FILE: the file has data"). `--exact` goes on counting
     those as differences. Casefolding the file system has of its own and
-    takes no change of stays without a warning (FAT, after
-    0.14.0+backotter.3: below, with casefolding). So a file the restore
+    takes no change of stays without a warning (FAT, since
+    0.14.0+backotter.4: below, with casefolding). So a file the restore
     makes in a directory that is there with `C`, and whose node has none,
     comes back no-copy-on-write (its checksums and compression off): not
     when the directory is restored with it (a directory gets its flags last);
@@ -1229,7 +1229,7 @@ that either program restores what the other backed up.
   0.14.0+backotter.3 every restore onto FAT warned for each directory
   whose node came from another file system (the destination's `/mnt`
   above a FAT source, say), rustic's own snapshots and BackOtter's
-  restic's alike; after 0.14.0+backotter.3 it doesn't. A node that has
+  restic's alike; since 0.14.0+backotter.4 it doesn't. A node that has
   casefolding where the directory hasn't is the warning as before, and so
   is any other flag it has that the file system refuses (FAT refuses
   them all). A backup there records `F` for each file and directory, as
@@ -1857,6 +1857,11 @@ symlink's ACL attributes, the SIDs of an illumos attribute's owner).
 "0.14.0+backotter.3" above: a restore on Linux takes off the inode flags,
 ZFS DOS flags and FAT attributes a BackOtter node hasn't got. Backups,
 the repository format and the nodes are as in .2.
+0.14.0+backotter.4 is .3 with the fix of its regression on FAT, named
+"0.14.0+backotter.4" above: casefolding that a file system has of its own
+and takes no change of (FAT on Linux 7.2) is no longer a warning on every
+directory whose node hasn't got it. Backups, the repository format and the
+nodes are as in .3.
 
 Upstream's changes that came with 0.14.0 and touch what the fork does:
 #561's `error_count` (above, beside `items_incomplete`); #563, backup
