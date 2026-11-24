@@ -993,8 +993,8 @@ that either program restores what the other backed up.
   a node without the attribute, `restorer.go` queues flags only for a node
   that has them): it needs the same for the two to restore alike.
 - On Linux a restore acts on a missing `linux.inode_flags`,
-  `linux.zfs_dos_flags` and `linux.fat_attrs` the same way (after
-  0.14.0+backotter.2; before, the late flags pass set only what a node
+  `linux.zfs_dos_flags` and `linux.fat_attrs` the same way (since
+  0.14.0+backotter.3; before, the late flags pass set only what a node
   holds, so a flag the node lacks stayed, exit 0, and `--exact` set such a
   file's metadata again on every run: ForkAudit1 G4-03), in a snapshot of
   BackOtter's only, for regular files and directories (symlinks and
@@ -1832,6 +1832,10 @@ with the fixes of ForkAudit1's re-run of 2026-11-23, each named
 restore does. The repository format is unchanged, and what is new in a
 node is optional and ignored by a reader that doesn't know it (a FreeBSD
 symlink's ACL attributes, the SIDs of an illumos attribute's owner).
+0.14.0+backotter.3 is .2 with the Linux half of ForkAudit1 G4-03, named
+"0.14.0+backotter.3" above: a restore on Linux takes off the inode flags,
+ZFS DOS flags and FAT attributes a BackOtter node hasn't got. Backups,
+the repository format and the nodes are as in .2.
 
 Upstream's changes that came with 0.14.0 and touch what the fork does:
 #561's `error_count` (above, beside `items_incomplete`); #563, backup

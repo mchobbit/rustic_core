@@ -4054,7 +4054,7 @@ version = "0.2.5"
 
 [[package]]
 name = "rustic_core"
-version = "0.14.0+backotter.2"
+version = "0.14.0+backotter.3"
 dependencies = [
  "aes256ctr_poly1305aes",
  "anyhow",
