@@ -47,7 +47,7 @@ pub(crate) use prepare::making_entries;
 pub use prepare::put_back_xfs_options;
 use prepare::{DirChanges, Prepare, Replaced, remove_held};
 #[cfg(test)]
-mod test_log;
+pub(crate) mod test_log;
 
 pub(crate) mod constants {
     /// The maximum number of reader threads to use for restoring.

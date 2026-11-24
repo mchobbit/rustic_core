@@ -1018,10 +1018,12 @@ that either program restores what the other backed up.
     warning, above), and btrfs's no-copy-on-write (`C`) on a regular file
     with data, which btrfs keeps without an error ("no-copy-on-write (C)
     not cleared on FILE: the file has data"). `--exact` goes on counting
-    those as differences. So a file the restore makes in a directory that
-    is there with `C`, and whose node has none, comes back
-    no-copy-on-write (its checksums and compression off): not when the
-    directory is restored with it (a directory gets its flags last);
+    those as differences. Casefolding the file system has of its own and
+    takes no change of stays without a warning (FAT, after
+    0.14.0+backotter.3: below, with casefolding). So a file the restore
+    makes in a directory that is there with `C`, and whose node has none,
+    comes back no-copy-on-write (its checksums and compression off): not
+    when the directory is restored with it (a directory gets its flags last);
   - a node without `linux.zfs_dos_flags` had archive alone: on ZFS a file
     with other kept DOS flags (hidden, system, read-only, offline, sparse,
     nounlink set since the backup; archive cleared) gets archive alone,
@@ -1212,7 +1214,26 @@ that either program restores what the other backed up.
   leaves casefolding as the directory has it, and warns once per directory
   where it still differs from the node ("casefolding (F) not restored on
   DIR: directory not empty or not supported"). The destination of a whole
-  snapshot has no node, and is left as it is.
+  snapshot has no node, and is left as it is. Where a directory has it
+  and its node hasn't, in a snapshot of BackOtter's or with flags, the
+  late pass first tries to take it off (`FS_IOC_SETFLAGS`, the other
+  flags as they are, which takes on an empty directory): a refusal where the
+  file system could change it (a directory with entries, `ENOTEMPTY`, or
+  `EPERM`) is the warning; a file system that has it of its own and takes
+  no change of it, refusing as it refuses a flag it hasn't got (`ENOTTY`,
+  `EOPNOTSUPP`/`ENOTSUP`, `EINVAL`) or keeping it without an error, is
+  passed over silently (debug log only), since nothing a restore does can
+  make such a directory case-sensitive. Linux 7.2 (Debian's, Fedora's,
+  MicroOS's and Aeon's) reports `F` on every file and directory of
+  FAT and refuses `FS_IOC_SETFLAGS` there with `ENOTTY`, so in
+  0.14.0+backotter.3 every restore onto FAT warned for each directory
+  whose node came from another file system (the destination's `/mnt`
+  above a FAT source, say), rustic's own snapshots and BackOtter's
+  restic's alike; after 0.14.0+backotter.3 it doesn't. A node that has
+  casefolding where the directory hasn't is the warning as before, and so
+  is any other flag it has that the file system refuses (FAT refuses
+  them all). A backup there records `F` for each file and directory, as
+  BackOtter's restic does, and the nodes are as before.
 - On bcachefs the same directories (those created, or found empty) get
   their own options then too, before anything goes in: their `bcachefs.*`
   extended attributes and their project ID, 0 where the node has none in a

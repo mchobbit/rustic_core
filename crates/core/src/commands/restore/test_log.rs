@@ -1,5 +1,6 @@
 //! BackOtter: the warnings and errors the unit tests log, for the tests of
-//! what a restore says (ForkAudit1 G6-02, G6-03): one logger for the test
+//! what a restore says (ForkAudit1 G6-02, G6-03; `osattrs`' casefolding on
+//! FAT): one logger for the test
 //! binary, whose tests run on threads of one process, so that a test looks
 //! for lines with a name only it uses.
 
@@ -30,7 +31,7 @@ impl Log for Capture {
 }
 
 /// Keeps what is logged at `Warn` and above from now on, for [`lines`].
-pub(super) fn capture() {
+pub(crate) fn capture() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         log::set_logger(&Capture).expect("the unit tests set no other logger");
@@ -40,7 +41,7 @@ pub(super) fn capture() {
 
 /// The lines kept so far that contain `needle`, each with its level, in
 /// the order they were logged.
-pub(super) fn lines(needle: &str) -> Vec<(Level, String)> {
+pub(crate) fn lines(needle: &str) -> Vec<(Level, String)> {
     LINES
         .lock()
         .unwrap_or_else(PoisonError::into_inner)

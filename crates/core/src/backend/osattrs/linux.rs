@@ -730,7 +730,7 @@ pub(super) fn restore_file_flags(
     xattrs: &[ExtendedAttribute],
 ) -> io::Result<()> {
     let f = open_for_flags(path, typ, None)?;
-    let current = get_flags(&f).map_err(|err| {
+    let mut current = get_flags(&f).map_err(|err| {
         if unsupported(&err) {
             Unsupported::error(LINUX_INODE_FLAGS, (flags & INODE_FLAGS).into(), err)
         } else {
@@ -738,12 +738,90 @@ pub(super) fn restore_file_flags(
         }
     })?;
     if casefold_differs(typ, current, flags) {
-        warn!(
-            "casefolding (F) not restored on {}: directory not empty or not supported",
-            path.display()
-        );
+        if flags & FS_CASEFOLD_FL == 0 {
+            // BackOtter: one the node hasn't got, which the file system may
+            // have of its own (FAT).
+            current = casefold_off(&f, path, current);
+        } else {
+            warn_casefold(path);
+        }
     }
     restore_flags_open(&f, path, current, flags, btrfs_compression(xattrs))
+}
+
+/// The warning for a directory whose casefolding (`F`) the restore couldn't
+/// make its node's.
+fn warn_casefold(path: &Path) {
+    warn!(
+        "casefolding (F) not restored on {}: directory not empty or not supported",
+        path.display()
+    );
+}
+
+/// What [`clear_casefold_with`] made of casefolding (`F`) on a directory
+/// that has it, whose node hasn't.
+#[derive(Debug)]
+enum CasefoldOff {
+    /// Taken off: the directory has these flags now.
+    Cleared(u32),
+    /// The file system's own, which it takes no change of: it refuses one
+    /// as it does every flag it lacks (`ENOTTY`, `EOPNOTSUPP`/`ENOTSUP`,
+    /// `EINVAL`), or keeps the flag without an error. Linux 7.2 (Debian's,
+    /// Fedora's) reports `F` on every file and directory of FAT, and
+    /// `FS_IOC_SETFLAGS` there is `ENOTTY`: a FAT directory is
+    /// case-insensitive whatever its node says, and nothing on it can be
+    /// restored otherwise.
+    Fixed,
+    /// Refused where the file system could take it off: a directory with
+    /// entries (`ENOTEMPTY` on ext4, f2fs and tmpfs), or not permitted.
+    Refused(io::Error),
+}
+
+/// BackOtter: takes casefolding (`F`) off a directory that has the flags
+/// `current`, with `set` (`FS_IOC_SETFLAGS`), its other flags as they are,
+/// and reads them back with `get` (`FS_IOC_GETFLAGS`). The restore gives a
+/// directory its node's casefolding before anything goes in
+/// ([`prepare_dir_for_flags`]); where that didn't take, this says whether
+/// the file system can change it at all ([`CasefoldOff::Fixed`]).
+fn clear_casefold_with(
+    current: u32,
+    set: impl FnOnce(u32) -> io::Result<()>,
+    get: impl FnOnce() -> io::Result<u32>,
+) -> CasefoldOff {
+    match set(current & !FS_CASEFOLD_FL) {
+        Ok(()) => match get() {
+            Ok(now) if now & FS_CASEFOLD_FL != 0 => CasefoldOff::Fixed,
+            Ok(now) => CasefoldOff::Cleared(now),
+            // Taken: the rest, as it was set, is what the next step changes.
+            Err(_) => CasefoldOff::Cleared(current & !FS_CASEFOLD_FL),
+        },
+        Err(err) if unsupported(&err) => CasefoldOff::Fixed,
+        Err(err) => CasefoldOff::Refused(err),
+    }
+}
+
+/// [`clear_casefold_with`] for the directory open as `f`, at `path`, which
+/// has the flags `current`, casefolding among them, and its node not: the
+/// flags it has then. A file system whose casefolding can't change (FAT) is
+/// passed over silently, as a backup there records the flag for every
+/// directory alike; a directory the file system could change it on but
+/// didn't (one with entries) is the warning, as for a node that has it.
+fn casefold_off(f: &File, path: &Path, current: u32) -> u32 {
+    match clear_casefold_with(current, |flags| set_flags(f, flags), || get_flags(f)) {
+        CasefoldOff::Cleared(now) => now,
+        CasefoldOff::Fixed => {
+            debug!(
+                "casefolding (F) left on {}: the file system's own",
+                path.display()
+            );
+            current
+        }
+        CasefoldOff::Refused(err) => {
+            debug!("casefolding (F) of {}: {err}", path.display());
+            warn_casefold(path);
+            current
+        }
+    }
 }
 
 /// The value of btrfs's compression property among the extended attributes
@@ -982,7 +1060,8 @@ fn restore_dos_flags_with(
 /// Whether the directory [`restore_file_flags`] gives `flags` has other
 /// casefolding than `flags` say, which the restore only sets on an empty
 /// directory ([`prepare_dir_for_flags`]): one that had entries already, or a
-/// file system without casefolding.
+/// file system without casefolding, or one that has it of its own (FAT,
+/// [`casefold_off`]).
 const fn casefold_differs(typ: &NodeType, current: u32, flags: u32) -> bool {
     matches!(typ, NodeType::Dir) && (current ^ flags) & FS_CASEFOLD_FL != 0
 }
@@ -1238,7 +1317,9 @@ fn restore_project_id(path: &Path, node: &Node, known_bko: bool) -> io::Result<(
 /// Two flags can't change here, and stay with a warning each: casefolding
 /// (`F`), which only an empty directory takes ([`prepare_dir_for_flags`]
 /// cleared it on one), and btrfs's no-copy-on-write (`C`) on a file with
-/// data, which btrfs keeps without an error.
+/// data, which btrfs keeps without an error. Casefolding that the file
+/// system has of its own and takes no change of (FAT on Linux 7.2) stays
+/// without a warning ([`casefold_off`]).
 ///
 /// # Errors
 ///
@@ -1308,7 +1389,7 @@ fn restore_no_flags(
     typ: &NodeType,
     compression: Option<&[u8]>,
 ) -> io::Result<()> {
-    let current = match get_flags(f) {
+    let mut current = match get_flags(f) {
         Ok(current) => current,
         // A backup records none for such a file either (`file_flags`): a
         // file system without flags, which is nothing to say of each file.
@@ -1320,10 +1401,7 @@ fn restore_no_flags(
         }
     };
     if casefold_differs(typ, current, 0) {
-        warn!(
-            "casefolding (F) not restored on {}: directory not empty or not supported",
-            path.display()
-        );
+        current = casefold_off(f, path, current);
     }
     if current & KEPT_LATE == 0 {
         return Ok(());
@@ -2798,6 +2876,126 @@ mod tests {
         assert_eq!(flags_of(&n, &NodeType::Dir), 0);
     }
 
+    /// rel15's FAT regression: taking casefolding off a directory whose
+    /// node hasn't got it says whether it went, whether the file system
+    /// can't change it at all (refused as unsupported, or kept without an
+    /// error), or whether it refused where it could (entries, permission).
+    /// The directory's other flags are set as they are.
+    #[test]
+    fn clear_casefold_says_what_the_file_system_did() {
+        let current = FS_CASEFOLD_FL | EXTENTS | NODUMP;
+        let set_ok = |flags: u32| {
+            assert_eq!(flags, EXTENTS | NODUMP);
+            Ok(())
+        };
+        let eio = || Err(io::Error::from_raw_os_error(libc::EIO));
+        for (now, what) in [
+            (Ok(EXTENTS | NODUMP), "read back"),
+            (eio(), "not read back"),
+        ] {
+            assert!(
+                matches!(
+                    clear_casefold_with(current, set_ok, || now),
+                    CasefoldOff::Cleared(flags) if flags == EXTENTS | NODUMP
+                ),
+                "{what}"
+            );
+        }
+        // Taken without an error and kept: the file system's own.
+        assert!(matches!(
+            clear_casefold_with(current, set_ok, || Ok(current)),
+            CasefoldOff::Fixed
+        ));
+        let refused = |errno| {
+            clear_casefold_with(
+                current,
+                |_| Err(io::Error::from_raw_os_error(errno)),
+                || panic!("read back after a refusal"),
+            )
+        };
+        // FAT on Linux 7.2: ENOTTY; others refuse a flag they lack so.
+        for errno in [libc::ENOTTY, libc::EOPNOTSUPP, libc::ENOTSUP, libc::EINVAL] {
+            assert!(matches!(refused(errno), CasefoldOff::Fixed), "{errno}");
+        }
+        for errno in [libc::ENOTEMPTY, libc::EPERM, libc::EACCES, libc::EIO] {
+            assert!(
+                matches!(
+                    refused(errno),
+                    CasefoldOff::Refused(err) if err.raw_os_error() == Some(errno)
+                ),
+                "{errno}"
+            );
+        }
+    }
+
+    /// rel15's FAT regression, with root, on a loop vfat: where the kernel
+    /// reports casefolding on FAT (Linux 7.2: every file and directory),
+    /// which FAT can't take off, a restore of a node that hasn't got it
+    /// leaves it, without a warning and without writing to the directory,
+    /// with or without entries, whether the node has no flags in a snapshot
+    /// of BackOtter's or flags without casefolding (those are refused as
+    /// FAT refuses them: the node has them). A node with casefolding gets
+    /// no warning either.
+    #[test]
+    fn restore_leaves_fat_casefolding_quietly() {
+        let Some(mnt) = LoopMount::new(64 << 20, "mkfs.vfat", &[]) else {
+            return;
+        };
+        let mnt = mnt.path();
+        let (full, empty, file) = (mnt.join("full"), mnt.join("empty"), mnt.join("file"));
+        std::fs::create_dir(&full).unwrap();
+        std::fs::write(full.join("entry"), "x").unwrap();
+        std::fs::create_dir(&empty).unwrap();
+        std::fs::write(&file, "x").unwrap();
+        if flags_of(&full, &NodeType::Dir) & FS_CASEFOLD_FL == 0 {
+            eprintln!(
+                "restore_leaves_fat_casefolding_quietly: no casefolding on FAT here: nothing tested"
+            );
+            return;
+        }
+        crate::commands::restore::test_log::capture();
+        let warned = |p: &Path| {
+            crate::commands::restore::test_log::lines(&format!(
+                "casefolding (F) not restored on {}:",
+                p.display()
+            ))
+            .len()
+        };
+        let dir_node = Node::new_node(OsStr::new("n"), NodeType::Dir, NodeMetadata::default());
+        for d in [&full, &empty, &mnt] {
+            let f = open_for_flags(d, &NodeType::Dir, None).unwrap();
+            assert!(
+                matches!(
+                    clear_casefold_with(
+                        get_flags(&f).unwrap(),
+                        |x| set_flags(&f, x),
+                        || get_flags(&f)
+                    ),
+                    CasefoldOff::Fixed
+                ),
+                "{}",
+                d.display()
+            );
+            drop(f);
+            let before = ctime_of(d);
+            prepare_dir_for_flags(d, 0).unwrap();
+            restore_attributes(d, &dir_node, true).unwrap();
+            restore_attributes(d, &dir_node, true).unwrap();
+            restore_file_flags(d, &NodeType::Dir, 0, &[]).unwrap();
+            restore_file_flags(d, &NodeType::Dir, FS_CASEFOLD_FL, &[]).unwrap();
+            // nodump, which FAT refuses: the node's own, an error.
+            let err = restore_file_flags(d, &NodeType::Dir, NODUMP, &[]).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
+            assert_eq!(flags_of(d, &NodeType::Dir), FS_CASEFOLD_FL);
+            assert_eq!(ctime_of(d), before, "{}: written to", d.display());
+            assert_eq!(warned(d), 0, "{}", d.display());
+        }
+        let file_node = Node::new_node(OsStr::new("n"), NodeType::File, NodeMetadata::default());
+        restore_attributes(&file, &file_node, true).unwrap();
+        restore_file_flags(&file, &NodeType::File, 0, &[]).unwrap();
+        assert_eq!(warned(&file), 0);
+    }
+
     /// G4-03, with root, on a loop ext4 that folds case: the flags a
     /// directory with entries has and its node doesn't go, but casefolding,
     /// which ext4 changes on no directory with entries: it stays (with a
@@ -2818,9 +3016,23 @@ mod tests {
         }
         std::fs::write(d.join("entry"), "x").unwrap();
         assert_eq!(flags_of(&d.join("entry"), &NodeType::File), NODUMP);
+        crate::commands::restore::test_log::capture();
+        let warned = |p: &Path| {
+            crate::commands::restore::test_log::lines(&format!(
+                "casefolding (F) not restored on {}:",
+                p.display()
+            ))
+            .len()
+        };
         let node = Node::new_node(OsStr::new("n"), NodeType::Dir, NodeMetadata::default());
         restore_attributes(&d, &node, true).unwrap();
         assert_eq!(flags_of(&d, &NodeType::Dir), FS_CASEFOLD_FL);
+        // ext4 could take it off, but not with entries: the warning stays.
+        assert_eq!(warned(&d), 1);
+        assert!(matches!(
+            clear_casefold_with(get_flags(&f).unwrap(), |x| set_flags(&f, x), || get_flags(&f)),
+            CasefoldOff::Refused(err) if err.raw_os_error() == Some(libc::ENOTEMPTY)
+        ));
         let after = ctime_of(&d);
         restore_attributes(&d, &node, true).unwrap();
         assert_eq!(
@@ -2828,6 +3040,22 @@ mod tests {
             after,
             "a second restore wrote to the directory"
         );
+        assert_eq!(warned(&d), 2, "a warning at every restore");
+        // An empty one that has it goes on losing it, without a warning.
+        let e = mnt.path().join("e");
+        std::fs::create_dir(&e).unwrap();
+        let g = open_for_flags(&e, &NodeType::Dir, None).unwrap();
+        set_flags(&g, get_flags(&g).unwrap() | FS_CASEFOLD_FL).unwrap();
+        drop(g);
+        restore_attributes(&e, &node, true).unwrap();
+        assert_eq!(flags_of(&e, &NodeType::Dir), 0);
+        assert_eq!(warned(&e), 0);
+        // Casefolding a node has and a directory with entries hasn't (only
+        // prepare_dir_for_flags sets it, before entries) is the warning.
+        std::fs::write(e.join("entry"), "x").unwrap();
+        restore_file_flags(&e, &NodeType::Dir, FS_CASEFOLD_FL, &[]).unwrap();
+        assert_eq!(flags_of(&e, &NodeType::Dir), 0);
+        assert_eq!(warned(&e), 1, "the node has it: a warning");
         // What it handed down goes from the file.
         let node = Node::new_node(OsStr::new("n"), NodeType::File, NodeMetadata::default());
         restore_attributes(&d.join("entry"), &node, true).unwrap();
